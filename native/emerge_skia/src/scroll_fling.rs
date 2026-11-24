@@ -9,9 +9,10 @@
 //! scene with an anchor: the container's offset as placed in that scene, the
 //! curve position it reflects, and the offsets the built content window can
 //! show (`ScrollFlingAnchor`). Each frame the render thread works out the
-//! offset for the frame's scanout from the anchor and the curve, and moves the
+//! offset for the frame's scanout from the anchor and the curve, and puts the
 //! container's content layer there (`place`), so a tree refresh that takes
-//! 80 ms no longer freezes the scroll. The tree keeps supplying content as
+//! 80 ms no longer freezes the scroll. A scroller nested in another's content
+//! (a list under a page that scrolls) is carried the same way. The tree keeps supplying content as
 //! before; the window it builds reaches well past the viewport, and the offset
 //! is clamped to it.
 
@@ -108,78 +109,121 @@ pub struct FlingAdvance {
     pub changed: bool,
 }
 
-/// The presenter's side: what the scene it holds shows, frame to frame.
+/// The presenter's side: moves the scene it holds, frame to frame.
 #[derive(Debug, Default)]
-pub struct Carrier {
-    /// (scene version, offset the scene now shows) once moved.
-    placed: Option<(u64, f32)>,
-}
+pub struct Carrier;
 
 impl Carrier {
-    /// Move the flinging container of `scene` (version `version`) to where
-    /// `fling` puts it at `at`. With no fling (it ended, or a touch cancelled
-    /// it), a scene this moved goes back to the offset the tree placed, which
-    /// is what the tree hit-tests against.
+    /// Put the flinging container of `scene` where `fling` puts it at `at`.
+    /// With no fling (it ended, or a touch cancelled it), it goes back to the
+    /// offset the tree placed, which is what the tree hit-tests against.
+    ///
+    /// The offset is set, not moved by a difference from what the scene was
+    /// built with: the renderer may hand the next scene content this already
+    /// moved (`adopt_advanced_scroll_content`), and a nested scroller's
+    /// placement is inside the content of the one around it.
     pub fn advance(
         &mut self,
         scene: &mut crate::render_scene::RenderScene,
-        version: u64,
         fling: Option<ScrollFling>,
         at: Instant,
     ) -> FlingAdvance {
         let Some(anchor) = scene.scroll_fling else {
-            self.placed = None;
             return FlingAdvance::default();
         };
-        let shown = match self.placed {
-            Some((placed_version, offset)) if placed_version == version => offset,
-            _ => anchor.offset,
+        let Some(shown) = shown_offset(&scene.nodes, anchor.node, anchor.axis_y) else {
+            return FlingAdvance::default();
         };
         let (target, active) = match fling.and_then(|fling| anchor.offset_at(&fling, at)) {
             Some(target) => (target, true),
             None => (anchor.offset, false),
         };
-        let delta = target - shown;
-        let changed = delta != 0.0 && place(&mut scene.nodes, anchor.node, anchor.axis_y, delta);
-        if changed
-            || self
-                .placed
-                .is_some_and(|(placed_version, _)| placed_version != version)
-        {
-            self.placed = Some((version, if changed { target } else { shown }));
-        }
+        let changed = shown != target && place(&mut scene.nodes, anchor.node, anchor.axis_y, target);
         // Past the end of its curve, a fling that moved nothing needs no more
         // frames.
         let finished = fling.is_none_or(|fling| fling.done(at)) && !changed;
         FlingAdvance {
-            active: active && !finished && (changed || delta == 0.0),
+            active: active && !finished,
             changed,
         }
     }
 }
 
-/// Move the content layer of scroll container `node` by `delta` px along the
-/// axis (positive moves the content toward its end, as the offset grows).
-/// Only the translation that places the layer changes; everything on the way
-/// to it is copied on write.
-pub fn place(nodes: &mut [RenderNode], node: u64, axis_y: bool, delta: f32) -> bool {
+/// Put the content layer of scroll container `node` at `offset` px along the
+/// axis. Only the translation that places the layer changes; everything on
+/// the way to it is copied on write.
+pub fn place(nodes: &mut [RenderNode], node: u64, axis_y: bool, offset: f32) -> bool {
     let id = PaintLayerId::new(node, PaintLayerReason::ScrollContent);
-    place_nodes(nodes, id, axis_y, delta)
+    place_nodes(nodes, id, axis_y, offset)
+}
+
+/// The offset the content layer of scroll container `node` is placed at.
+pub fn shown_offset(nodes: &[RenderNode], node: u64, axis_y: bool) -> Option<f32> {
+    let id = PaintLayerId::new(node, PaintLayerReason::ScrollContent);
+    nodes_offset(nodes, id, axis_y)
+}
+
+fn nodes_offset(nodes: &[RenderNode], id: PaintLayerId, axis_y: bool) -> Option<f32> {
+    nodes.iter().find_map(|node| match node {
+        RenderNode::Transform {
+            transform,
+            children,
+        } if matches!(children.as_slice(), [RenderNode::PaintLayer(layer)] if is_target(layer, id)) => {
+            Some(offset_of(transform, axis_y))
+        }
+        RenderNode::ShadowPass { children }
+        | RenderNode::Clip { children, .. }
+        | RenderNode::RelaxedClip { children, .. }
+        | RenderNode::Transform { children, .. }
+        | RenderNode::Alpha { children, .. } => nodes_offset(children, id, axis_y),
+        RenderNode::PaintLayer(layer) => content_offset(&layer.content.nodes, id, axis_y),
+        RenderNode::Primitive(_) => None,
+    })
+}
+
+fn content_offset(
+    nodes: &[RenderPaintLayerContentNode],
+    id: PaintLayerId,
+    axis_y: bool,
+) -> Option<f32> {
+    nodes.iter().find_map(|node| match node {
+        RenderPaintLayerContentNode::Transform {
+            transform,
+            children,
+        } if matches!(children.as_slice(), [RenderPaintLayerContentNode::Child(layer)] if is_target(layer, id)) => {
+            Some(offset_of(transform, axis_y))
+        }
+        RenderPaintLayerContentNode::Own(run) => nodes_offset(&run.nodes, id, axis_y),
+        RenderPaintLayerContentNode::Child(layer) => {
+            content_offset(&layer.content.nodes, id, axis_y)
+        }
+        RenderPaintLayerContentNode::ShadowPass { children }
+        | RenderPaintLayerContentNode::Clip { children, .. }
+        | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+        | RenderPaintLayerContentNode::Transform { children, .. }
+        | RenderPaintLayerContentNode::Alpha { children, .. } => {
+            content_offset(children, id, axis_y)
+        }
+    })
+}
+
+fn offset_of(transform: &crate::tree::transform::Affine2, axis_y: bool) -> f32 {
+    -if axis_y { transform.ty } else { transform.tx }
 }
 
 fn is_target(layer: &RenderPaintLayer, id: PaintLayerId) -> bool {
     layer.id == id
 }
 
-fn shift(transform: &mut crate::tree::transform::Affine2, axis_y: bool, delta: f32) {
+fn set_offset(transform: &mut crate::tree::transform::Affine2, axis_y: bool, offset: f32) {
     if axis_y {
-        transform.ty -= delta;
+        transform.ty = -offset;
     } else {
-        transform.tx -= delta;
+        transform.tx = -offset;
     }
 }
 
-fn place_nodes(nodes: &mut [RenderNode], id: PaintLayerId, axis_y: bool, delta: f32) -> bool {
+fn place_nodes(nodes: &mut [RenderNode], id: PaintLayerId, axis_y: bool, offset: f32) -> bool {
     for node in nodes.iter_mut() {
         let found = match node {
             RenderNode::Transform {
@@ -187,15 +231,15 @@ fn place_nodes(nodes: &mut [RenderNode], id: PaintLayerId, axis_y: bool, delta: 
                 children,
             } if matches!(children.as_slice(), [RenderNode::PaintLayer(layer)] if is_target(layer, id)) =>
             {
-                shift(transform, axis_y, delta);
+                set_offset(transform, axis_y, offset);
                 true
             }
             RenderNode::ShadowPass { children }
             | RenderNode::Clip { children, .. }
             | RenderNode::RelaxedClip { children, .. }
             | RenderNode::Transform { children, .. }
-            | RenderNode::Alpha { children, .. } => place_nodes(children, id, axis_y, delta),
-            RenderNode::PaintLayer(layer) => place_layer(layer, id, axis_y, delta),
+            | RenderNode::Alpha { children, .. } => place_nodes(children, id, axis_y, offset),
+            RenderNode::PaintLayer(layer) => place_layer(layer, id, axis_y, offset),
             RenderNode::Primitive(_) => false,
         };
         if found {
@@ -205,7 +249,7 @@ fn place_nodes(nodes: &mut [RenderNode], id: PaintLayerId, axis_y: bool, delta: 
     false
 }
 
-fn place_layer(layer: &mut RenderPaintLayer, id: PaintLayerId, axis_y: bool, delta: f32) -> bool {
+fn place_layer(layer: &mut RenderPaintLayer, id: PaintLayerId, axis_y: bool, offset: f32) -> bool {
     if is_target(layer, id) || !content_holds(&layer.content.nodes, id) {
         return false;
     }
@@ -213,7 +257,7 @@ fn place_layer(layer: &mut RenderPaintLayer, id: PaintLayerId, axis_y: bool, del
         &mut Arc::make_mut(&mut layer.content).nodes,
         id,
         axis_y,
-        delta,
+        offset,
     )
 }
 
@@ -221,7 +265,7 @@ fn place_content(
     nodes: &mut [RenderPaintLayerContentNode],
     id: PaintLayerId,
     axis_y: bool,
-    delta: f32,
+    offset: f32,
 ) -> bool {
     for node in nodes.iter_mut() {
         let found = match node {
@@ -230,7 +274,7 @@ fn place_content(
                 children,
             } if matches!(children.as_slice(), [RenderPaintLayerContentNode::Child(layer)] if is_target(layer, id)) =>
             {
-                shift(transform, axis_y, delta);
+                set_offset(transform, axis_y, offset);
                 true
             }
             RenderPaintLayerContentNode::Own(run) => {
@@ -239,16 +283,16 @@ fn place_content(
                         Arc::make_mut(&mut run.nodes).as_mut_slice(),
                         id,
                         axis_y,
-                        delta,
+                        offset,
                     )
             }
-            RenderPaintLayerContentNode::Child(layer) => place_layer(layer, id, axis_y, delta),
+            RenderPaintLayerContentNode::Child(layer) => place_layer(layer, id, axis_y, offset),
             RenderPaintLayerContentNode::ShadowPass { children }
             | RenderPaintLayerContentNode::Clip { children, .. }
             | RenderPaintLayerContentNode::RelaxedClip { children, .. }
             | RenderPaintLayerContentNode::Transform { children, .. }
             | RenderPaintLayerContentNode::Alpha { children, .. } => {
-                place_content(children, id, axis_y, delta)
+                place_content(children, id, axis_y, offset)
             }
         };
         if found {
@@ -275,11 +319,8 @@ fn nodes_hold(nodes: &[RenderNode], id: PaintLayerId) -> bool {
 fn content_holds(nodes: &[RenderPaintLayerContentNode], id: PaintLayerId) -> bool {
     nodes.iter().any(|node| match node {
         RenderPaintLayerContentNode::Own(run) => nodes_hold(&run.nodes, id),
-        // Scroll content is not searched: a nested scroller is not carried on.
         RenderPaintLayerContentNode::Child(layer) => {
-            is_target(layer, id)
-                || (layer.id.role != PaintLayerReason::ScrollContent
-                    && content_holds(&layer.content.nodes, id))
+            is_target(layer, id) || content_holds(&layer.content.nodes, id)
         }
         RenderPaintLayerContentNode::ShadowPass { children }
         | RenderPaintLayerContentNode::Clip { children, .. }
@@ -371,7 +412,8 @@ mod tests {
             PaintLayerReason::Root,
             vec![placed(41, 10.0), placed(42, 300.0)],
         )];
-        assert!(place(&mut nodes, 42, true, 25.0));
+        assert!(place(&mut nodes, 42, true, 325.0));
+        assert_eq!(shown_offset(&nodes, 42, true), Some(325.0));
         let translations: Vec<f32> = {
             let RenderNode::PaintLayer(root) = &nodes[0] else {
                 unreachable!()
@@ -409,6 +451,58 @@ mod tests {
         };
         assert_eq!(translations, vec![-10.0, -325.0]);
         assert!(!place(&mut nodes, 99, true, 5.0));
+        assert_eq!(shown_offset(&nodes, 99, true), None);
+    }
+
+    #[test]
+    fn a_scroller_in_the_content_of_another_is_carried() {
+        use crate::render_scene::{
+            PaintLayerPlacement, PaintLayerPolicy, RenderPaintLayerBuildParts,
+            RenderPaintLayerContent, RenderScene,
+        };
+        use crate::tree::geometry::Rect;
+        use crate::tree::transform::Affine2;
+        let layer = |node: u64, nodes: Vec<RenderNode>| {
+            RenderNode::PaintLayer(RenderPaintLayer::from_prepared_children(
+                RenderPaintLayerBuildParts {
+                    id: PaintLayerId::new(node, PaintLayerReason::ScrollContent),
+                    bounds: Rect::default(),
+                    placement: PaintLayerPlacement::ScrollMoving,
+                    policy: PaintLayerPolicy::Cacheable,
+                    content_generation: 0,
+                    visual_bounds: None,
+                },
+                RenderPaintLayerContent::from_composition_nodes(nodes),
+            ))
+        };
+        let inner = RenderNode::Transform {
+            transform: Affine2::translation(0.0, -100.0),
+            children: vec![layer(42, Vec::new())],
+        };
+        let mut scene = RenderScene {
+            scroll_fling: Some(anchor(100.0, 0.0)),
+            nodes: vec![RenderNode::Transform {
+                transform: Affine2::translation(0.0, 0.0),
+                children: vec![layer(41, vec![inner])],
+            }],
+            ..Default::default()
+        };
+        let fling = fling();
+        let at = fling.started_at + Duration::from_millis(300);
+        let expected = anchor(100.0, 0.0).offset_at(&fling, at).unwrap();
+        let mut carrier = Carrier::default();
+        let moved = carrier.advance(&mut scene, Some(fling), at);
+        assert!(moved.active && moved.changed);
+        assert_eq!(shown_offset(&scene.nodes, 42, true), Some(expected));
+        assert_eq!(shown_offset(&scene.nodes, 41, true), Some(0.0));
+        // A scene whose content already shows the carried offset (an adopted
+        // copy) is not moved twice.
+        let again = carrier.advance(&mut scene, Some(fling), at);
+        assert!(again.active && !again.changed);
+        assert_eq!(shown_offset(&scene.nodes, 42, true), Some(expected));
+        let stopped = carrier.advance(&mut scene, None, at);
+        assert!(!stopped.active && stopped.changed);
+        assert_eq!(shown_offset(&scene.nodes, 42, true), Some(100.0));
     }
 
     #[test]
@@ -445,15 +539,15 @@ mod tests {
         let fling = fling();
         let at = fling.started_at + Duration::from_millis(300);
         let mut carrier = Carrier::default();
-        let first = carrier.advance(&mut scene, 1, Some(fling), at);
+        let first = carrier.advance(&mut scene, Some(fling), at);
         assert!(first.active && first.changed);
         let expected = anchor(100.0, 0.0).offset_at(&fling, at).unwrap();
         assert_eq!(ty(&scene), -expected);
         // The same instant again: nothing to move.
-        let again = carrier.advance(&mut scene, 1, Some(fling), at);
+        let again = carrier.advance(&mut scene, Some(fling), at);
         assert!(again.active && !again.changed);
         // Cancelled: back to where the tree placed it.
-        let stopped = carrier.advance(&mut scene, 1, None, at);
+        let stopped = carrier.advance(&mut scene, None, at);
         assert!(!stopped.active && stopped.changed);
         assert_eq!(ty(&scene), -100.0);
     }

@@ -6009,6 +6009,13 @@ impl SceneRenderer {
         if clipped_eligibility.clip_empty && !paint_layer_content_has_shadow_pass(children) {
             return;
         }
+        // One Raven patch: nothing in a clip that lies wholly outside what
+        // the canvas can still draw is seen, except a shadow, which escapes
+        // it. Rasterizing a scroll tile walked, saved and clipped every row
+        // of the built window (40 rows for 3 shown): 6-8 ms a tile row.
+        if clips_rejected(canvas, clips, relaxed) && !paint_layer_content_has_shadow_pass(children) {
+            return;
+        }
         instrumentation.record_clip_scope(relaxed, clips);
         if clips.is_empty() {
             Self::render_paint_layer_content_in_mode(
@@ -6659,6 +6666,10 @@ impl SceneRenderer {
             eligibility
         };
         if clipped_eligibility.clip_empty && !render_nodes_have_shadow_pass(children) {
+            return;
+        }
+        // One Raven patch: as `render_layer_content_clip_in_mode`.
+        if clips_rejected(canvas, clips, relaxed) && !render_nodes_have_shadow_pass(children) {
             return;
         }
 
@@ -7578,6 +7589,23 @@ fn matrix_from_affine2(transform: Affine2) -> Matrix {
         0.0,
         1.0,
     )
+}
+
+/// One Raven patch: whether a strict clip scope lies wholly outside the
+/// canvas's clip, so nothing inside it but an escaping shadow can draw.
+fn clips_rejected(canvas: &skia_safe::Canvas, clips: &[ClipShape], relaxed: bool) -> bool {
+    if relaxed || clips.is_empty() {
+        return false;
+    }
+    let Some(bounds) = canvas.device_clip_bounds() else {
+        return true;
+    };
+    let bounds = Rect::from(bounds).with_outset((1.0, 1.0));
+    let matrix = canvas.local_to_device_as_3x3();
+    clips.iter().any(|clip| {
+        let rect = Rect::from_xywh(clip.rect.x, clip.rect.y, clip.rect.width, clip.rect.height);
+        !matrix.map_rect(rect).0.intersects(bounds)
+    })
 }
 
 fn apply_clip_shape(canvas: &skia_safe::Canvas, clip: &ClipShape) {

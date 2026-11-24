@@ -3953,7 +3953,6 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                             // frame's expected scanout.
                             let fling = fling_carrier.advance(
                                 &mut render_state.scene,
-                                render_state.render_version,
                                 crate::scroll_fling::current(&scroll_fling),
                                 now + frame_interval,
                             );
