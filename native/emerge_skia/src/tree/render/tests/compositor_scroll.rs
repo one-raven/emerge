@@ -106,6 +106,47 @@ fn a_scroll_within_the_window_reuses_the_content_layer() {
     assert!(render_scene_to_pixels(100, 60, after) == expected);
 }
 
+// One Raven patch: the window stays while the viewport is inside it and
+// moves ahead in the direction of travel, so a long scroll rebuilds rarely.
+#[test]
+fn the_window_moves_only_near_its_edge_and_then_ahead() {
+    let mut tree = super::pipeline::build_manual_scroll_row_tree(120);
+    let first = scroll_layer(&scene(&tree)).expect("scroll layer");
+    tree.clear_refresh_dirty();
+    // The window covers 398.5..612.5; a viewport 50 px tall stays inside it
+    // (12.5 px from its end) up to an offset of 549.5.
+    for offset in (505..=545).step_by(5) {
+        set_offset(&mut tree, rows_root(), offset as f32);
+        let layer = scroll_layer(&scene(&tree)).expect("scroll layer");
+        assert!(
+            std::sync::Arc::ptr_eq(&first.content, &layer.content),
+            "rebuilt at {offset}"
+        );
+        tree.clear_refresh_dirty();
+    }
+    set_offset(&mut tree, rows_root(), 560.0);
+    let moved = scroll_layer(&scene(&tree)).expect("scroll layer");
+    assert!(!std::sync::Arc::ptr_eq(&first.content, &moved.content));
+    tree.clear_refresh_dirty();
+    // It moved ahead, to 497..711: the next 80 px forward reuse it.
+    for offset in (570..=640).step_by(10) {
+        set_offset(&mut tree, rows_root(), offset as f32);
+        let layer = scroll_layer(&scene(&tree)).expect("scroll layer");
+        assert!(
+            std::sync::Arc::ptr_eq(&moved.content, &layer.content),
+            "rebuilt at {offset}"
+        );
+        tree.clear_refresh_dirty();
+    }
+    let expected = {
+        let mut tree = super::pipeline::build_manual_scroll_row_tree(120);
+        tree.compositor_scroll = false;
+        set_offset(&mut tree, rows_root(), 640.0);
+        pixels(&tree, 100, 60)
+    };
+    assert!(pixels(&tree, 100, 60) == expected);
+}
+
 #[test]
 fn moving_the_window_builds_only_what_enters_it() {
     let mut tree = super::pipeline::build_manual_scroll_row_tree(120);
@@ -114,8 +155,9 @@ fn moving_the_window_builds_only_what_enters_it() {
     let cold = super::super::take_render_traversal_diagnostics_for_benchmark();
     tree.clear_refresh_dirty();
 
-    // Two window steps (64 px each here): the window moves from rows 39..61
-    // to 52..74, so rows 53..60 stay wholly inside it.
+    // Past the window's end: it moves ahead to start a step (64 px here)
+    // behind the viewport, from rows 40..60 to 57..76, so rows 57..60 stay
+    // wholly inside it.
     set_offset(&mut tree, rows_root(), 628.0);
     super::super::reset_render_traversal_diagnostics_for_benchmark();
     let warm_scene = scene(&tree);
@@ -124,8 +166,8 @@ fn moving_the_window_builds_only_what_enters_it() {
     // Only the container, the column straddling the window and the rows that
     // entered it are built; rows that stay inside it are reused.
     let built = warm.element_visits - warm.fragment_reuses;
-    assert_eq!(warm.fragment_reuses, 8, "cold {cold:?}, warm {warm:?}");
-    assert!(built <= 17, "cold {cold:?}, warm {warm:?}");
+    assert_eq!(warm.fragment_reuses, 4, "cold {cold:?}, warm {warm:?}");
+    assert!(built <= 20, "cold {cold:?}, warm {warm:?}");
 
     let expected = {
         let mut tree = super::pipeline::build_manual_scroll_row_tree(120);

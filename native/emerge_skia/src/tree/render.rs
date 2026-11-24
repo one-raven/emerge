@@ -1480,9 +1480,11 @@ fn layer_with_stripped_child_layers(
             .collect()
     }
     RenderPaintLayer {
-        content: Arc::new(RenderPaintLayerContent {
-            nodes: map(&layer.content.nodes, clips, rewriter),
-        }),
+        content: Arc::new(RenderPaintLayerContent::new(map(
+            &layer.content.nodes,
+            clips,
+            rewriter,
+        ))),
         ..layer.clone()
     }
 }
@@ -1726,13 +1728,16 @@ fn is_declared_scroll_container(element: &Element) -> bool {
 // hub: 65 ms of tree and 45 ms of render per scroll step). Now the content is
 // built in content coordinates (as at offset zero), culled to a window that
 // reaches one viewport beyond each edge of the viewport along the scrolling
-// axes and moves in quarter-viewport steps, and the layer is placed with a
+// axes (and moves only as the viewport nears its edge), and the layer is placed with a
 // whole-pixel translation by the real offset. While the offset stays inside
 // the window and nothing in the content changed, the built layer is reused
 // as it is (`ScrollContentCache`); when the window moves, only elements that
 // straddle its edges or newly enter it are built, since a child wholly
 // inside the window is built without the window in its context.
 const COMPOSITOR_SCROLL_UNBOUNDED: f32 = 1.0e7;
+/// One Raven patch: how near the viewport may come to an edge of the
+/// window before the window moves.
+const COMPOSITOR_SCROLL_WINDOW_EDGE: f32 = 64.0;
 
 struct CompositorScroll {
     /// The children's scene state: no own scroll offset, culled to `window`.
@@ -1781,10 +1786,37 @@ impl CompositorScroll {
         );
         let overscroll = element.runtime.scroll_overscroll.map(f32::from_bits);
         let viewport = state.host_clip.rect;
-        let window_axis = |start: f32, len: f32, offset: f32| -> (f32, f32) {
+        // One Raven patch: the window stays put while the viewport is inside
+        // it, and when the viewport nears an edge it moves ahead in the
+        // direction of travel, keeping a quarter viewport behind. Re-anchoring
+        // every quarter viewport rebuilt the content (35-75 ms on the hub's
+        // Dashboard) every 420 px of a fling.
+        let prior = element
+            .refresh
+            .scroll_content_cache
+            .borrow()
+            .as_ref()
+            .map(|cache| cache.window);
+        let window_axis = |start: f32, len: f32, offset: f32, prior: Option<(f32, f32)>| {
             let step = (len / 4.0).max(64.0);
-            let anchor = (offset / step).floor() * step;
-            (start + anchor - len, len * 3.0 + step)
+            let size = len * 3.0 + step;
+            let top = start + offset;
+            match prior {
+                Some((at, prior_size)) if prior_size == size => {
+                    let edge = COMPOSITOR_SCROLL_WINDOW_EDGE.min(len / 4.0);
+                    if top < at + edge {
+                        ((top + len + step - size).round(), size)
+                    } else if top + len > at + size - edge {
+                        ((top - step).round(), size)
+                    } else {
+                        (at, size)
+                    }
+                }
+                _ => {
+                    let anchor = (offset / step).floor() * step;
+                    (start + anchor - len, size)
+                }
+            }
         };
         let unbounded = |start: f32, len: f32, scrolls: bool| -> (f32, f32) {
             if scrolls {
@@ -1794,12 +1826,12 @@ impl CompositorScroll {
             }
         };
         let (wx, ww) = if axes.0 {
-            window_axis(viewport.x, viewport.width, scroll.0)
+            window_axis(viewport.x, viewport.width, scroll.0, prior.map(|w| (w.x, w.width)))
         } else {
             (viewport.x, viewport.width)
         };
         let (wy, wh) = if axes.1 {
-            window_axis(viewport.y, viewport.height, scroll.1)
+            window_axis(viewport.y, viewport.height, scroll.1, prior.map(|w| (w.y, w.height)))
         } else {
             (viewport.y, viewport.height)
         };
@@ -2787,54 +2819,7 @@ fn split_shadow_escape(node: RenderNode) -> Vec<(bool, RenderNode)> {
 }
 
 fn render_node_has_shadow_escape(node: &RenderNode) -> bool {
-    match node {
-        RenderNode::ShadowPass { .. } => true,
-        RenderNode::PaintLayer(layer) => layer_content_contains_shadow_pass(&layer.content.nodes),
-        RenderNode::Clip { children, .. }
-        | RenderNode::RelaxedClip { children, .. }
-        | RenderNode::Transform { children, .. }
-        | RenderNode::Alpha { children, .. } => {
-            children.iter().any(render_node_contains_shadow_pass)
-        }
-        RenderNode::Primitive(_) => false,
-    }
-}
-
-fn render_node_contains_shadow_pass(node: &RenderNode) -> bool {
-    match node {
-        RenderNode::ShadowPass { .. } => true,
-        RenderNode::Clip { children, .. }
-        | RenderNode::RelaxedClip { children, .. }
-        | RenderNode::Transform { children, .. }
-        | RenderNode::Alpha { children, .. } => {
-            children.iter().any(render_node_contains_shadow_pass)
-        }
-        RenderNode::PaintLayer(layer) => layer_content_contains_shadow_pass(&layer.content.nodes),
-        RenderNode::Primitive(_) => false,
-    }
-}
-
-// One Raven patch: search a paint layer's content in place. Upstream called
-// `content_nodes()`, which copies the layer's whole content into new render
-// nodes, and every clip wrap on the path to a change asks this of everything
-// below it, so a one-text patch above a scroll list copied the list's layers
-// once per ancestor (29% of the tree actor's time on the hub's Stress screen).
-fn layer_content_contains_shadow_pass(content: &[RenderPaintLayerContentNode]) -> bool {
-    content.iter().any(|node| match node {
-        RenderPaintLayerContentNode::Own(run) => {
-            run.nodes.iter().any(render_node_contains_shadow_pass)
-        }
-        RenderPaintLayerContentNode::Child(layer) => {
-            layer_content_contains_shadow_pass(&layer.content.nodes)
-        }
-        RenderPaintLayerContentNode::ShadowPass { .. } => true,
-        RenderPaintLayerContentNode::Clip { children, .. }
-        | RenderPaintLayerContentNode::RelaxedClip { children, .. }
-        | RenderPaintLayerContentNode::Transform { children, .. }
-        | RenderPaintLayerContentNode::Alpha { children, .. } => {
-            layer_content_contains_shadow_pass(children)
-        }
-    })
+    crate::render_scene::render_node_has_shadow_pass(node)
 }
 
 fn push_clipped_group(

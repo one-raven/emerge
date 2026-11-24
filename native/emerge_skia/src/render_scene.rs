@@ -1497,19 +1497,27 @@ impl RenderPaintLayerMetrics {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RenderPaintLayerContent {
     pub nodes: Vec<RenderPaintLayerContentNode>,
+    /// One Raven patch: whether a shadow pass is anywhere in this content,
+    /// nested layers included, worked out once when the content is made.
+    /// Every clip wrap on the way up from a change asked this of everything
+    /// below it, walking whole scroll contents once per ancestor (22% of the
+    /// tree actor's time in a hard fling on the hub's Dashboard). The render
+    /// thread rewrites transforms and alphas in place, never shadow passes.
+    pub shadow_pass: bool,
 }
 
 impl RenderPaintLayerContent {
+    pub(crate) fn new(nodes: Vec<RenderPaintLayerContentNode>) -> Self {
+        let shadow_pass = layer_content_has_shadow_pass(&nodes);
+        Self { nodes, shadow_pass }
+    }
+
     pub(crate) fn from_nodes(nodes: Vec<RenderNode>) -> Self {
-        Self {
-            nodes: build_ordered_layer_content(nodes),
-        }
+        Self::new(build_ordered_layer_content(nodes))
     }
 
     pub(crate) fn from_composition_nodes(nodes: Vec<RenderNode>) -> Self {
-        Self {
-            nodes: build_composition_layer_content(nodes),
-        }
+        Self::new(build_composition_layer_content(nodes))
     }
 
     pub(crate) fn own_render_nodes(&self) -> Vec<RenderNode> {
@@ -1567,6 +1575,36 @@ pub struct RenderPaintRun {
     pub bounds: Rect,
     pub nodes: Arc<Vec<RenderNode>>,
     pub metrics: RenderPaintLayerMetrics,
+}
+
+/// One Raven patch: whether `nodes` hold a shadow pass, taking each nested
+/// layer's answer from its content.
+pub(crate) fn layer_content_has_shadow_pass(nodes: &[RenderPaintLayerContentNode]) -> bool {
+    nodes.iter().any(|node| match node {
+        RenderPaintLayerContentNode::Own(run) => run.nodes.iter().any(render_node_has_shadow_pass),
+        RenderPaintLayerContentNode::Child(layer) => layer.content.shadow_pass,
+        RenderPaintLayerContentNode::ShadowPass { .. } => true,
+        RenderPaintLayerContentNode::Clip { children, .. }
+        | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+        | RenderPaintLayerContentNode::Transform { children, .. }
+        | RenderPaintLayerContentNode::Alpha { children, .. } => {
+            layer_content_has_shadow_pass(children)
+        }
+    })
+}
+
+/// One Raven patch: whether `node` holds a shadow pass (see
+/// `RenderPaintLayerContent::shadow_pass`).
+pub(crate) fn render_node_has_shadow_pass(node: &RenderNode) -> bool {
+    match node {
+        RenderNode::ShadowPass { .. } => true,
+        RenderNode::PaintLayer(layer) => layer.content.shadow_pass,
+        RenderNode::Clip { children, .. }
+        | RenderNode::RelaxedClip { children, .. }
+        | RenderNode::Transform { children, .. }
+        | RenderNode::Alpha { children, .. } => children.iter().any(render_node_has_shadow_pass),
+        RenderNode::Primitive(_) => false,
+    }
 }
 
 impl RenderPaintRun {
