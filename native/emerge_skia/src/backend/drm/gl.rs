@@ -27,6 +27,7 @@ use libloading::Library;
 use skia_safe::{Paint, Rect, gpu::gl::FramebufferInfo};
 
 use crate::actors::{EventMsg, RenderMsg, TreeMsg};
+use crate::backend::loop_accounting::{LoopAccounting, LoopWork, classify_loop_wait};
 use crate::backend::production::{AnimationFrame, FrameProduction};
 use crate::backend::raster::{RasterBackend, RasterConfig};
 use crate::backend::skia_gpu::GlFrameSurface;
@@ -60,6 +61,7 @@ use super::core::{frame_interval_for_refresh_hz, precise_mode_refresh_hz};
 
 const EGL_PLATFORM_GBM_KHR: EGLenum = 0x31D7;
 const RENDER_PROFILE_INTERVAL: Duration = Duration::from_secs(1);
+const LOOP_ACCOUNTING_WINDOW: Duration = Duration::from_secs(2);
 const GL_QUERY_COUNTER_BITS_EXT: gl::types::GLenum = 0x8864;
 const GL_QUERY_RESULT_EXT: gl::types::GLenum = 0x8866;
 const GL_QUERY_RESULT_AVAILABLE_EXT: gl::types::GLenum = 0x8867;
@@ -3466,11 +3468,29 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                 // unchanged-frame optimization cannot consume the generation and strand a pending frame.
                 let mut video_sync_required = true;
                 let mut stop_requested = false;
+                // One Raven patch: with renderer stats logging, report where
+                // this thread's time goes (work vs. waiting, and for what).
+                let mut loop_accounting = config.renderer_stats_log.then(|| {
+                    native_log.info(
+                        "drm",
+                        format!(
+                            "presenter loop accounting every {} s; pipeline: one staged primary behind one in-flight commit, implicit GBM/KMS fences",
+                            LOOP_ACCOUNTING_WINDOW.as_secs()
+                        ),
+                    );
+                    LoopAccounting::new(LOOP_ACCOUNTING_WINDOW, Instant::now())
+                });
 
                 loop {
                     if stop.load(Ordering::Acquire) {
                         stop_requested = true;
                         break;
+                    }
+                    if let Some(report) = loop_accounting
+                        .as_mut()
+                        .and_then(|accounting| accounting.take_report(Instant::now()))
+                    {
+                        native_log.info("drm_loop", report);
                     }
                     gpu_render_timer.poll(&native_log);
 
@@ -3479,6 +3499,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                         presenter_wake_ready = false;
                     }
 
+                    let events_started_at = Instant::now();
                     if drm_ready {
                         drm_ready = false;
                         match card.receive_events() {
@@ -3634,6 +3655,9 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                             }
                         }
                     }
+                    if let Some(accounting) = loop_accounting.as_mut() {
+                        accounting.add_work(LoopWork::Events, events_started_at.elapsed());
+                    }
 
                     let now = Instant::now();
                     if next_hotplug_check.is_some_and(|t| now >= t) {
@@ -3666,6 +3690,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                         next_hotplug_check = hotplug_interval.map(|i| Instant::now() + i);
                     }
 
+                    let scenes_started_at = Instant::now();
                     for msg in render_rx.try_iter().take(64) {
                         match msg {
                             RenderMsg::Scene {
@@ -3722,6 +3747,9 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                 break;
                             }
                         }
+                    }
+                    if let Some(accounting) = loop_accounting.as_mut() {
+                        accounting.add_work(LoopWork::Scenes, scenes_started_at.elapsed());
                     }
 
                     if stop_requested {
@@ -3782,6 +3810,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                     // when an enter frame is initially visually unchanged (for example
                     // translated outside a clip), it still needs a committed primary so
                     // look-ahead can advance the animation clock.
+                    let skip_check_started_at = Instant::now();
                     if capture_request_generation.is_none()
                         && should_consider_unchanged_primary_skip(
                             frames.in_flight.is_some(),
@@ -3809,6 +3838,9 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                         render_state.pipeline_submitted_at = None;
                         render_state.pipeline_render_queued_at = None;
                     }
+                    if let Some(accounting) = loop_accounting.as_mut() {
+                        accounting.add_work(LoopWork::SkipCheck, skip_check_started_at.elapsed());
+                    }
                     let in_flight_primary_generation = frames
                         .in_flight
                         .as_ref()
@@ -3831,6 +3863,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                     {
                         desired_primary_generation = desired_primary_generation.wrapping_add(1);
                     }
+                    let mut gbm_buffer_starved = false;
                     if should_prepare_primary(
                         desired_primary_generation,
                         committed_primary_generation,
@@ -3839,6 +3872,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                     ) {
                         if gbm_surface.has_free_buffers() {
                             let now = Instant::now();
+                            let draw_started_at = now;
                             let sampled_diagnostics_due = (stats.is_some()
                                 || config.renderer_stats_log)
                                 && now >= next_render_profile_at;
@@ -3932,6 +3966,11 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                             frame.imported_video_frames > 0,
                                         );
                                     }
+                                    if let Some(accounting) = loop_accounting.as_mut() {
+                                        accounting
+                                            .add_work(LoopWork::Draw, draw_started_at.elapsed());
+                                        accounting.drew();
+                                    }
                                 }
                                 Err(err) => {
                                     native_log.error(
@@ -3942,8 +3981,11 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                     break;
                                 }
                             }
-                        } else if let Some(stats) = stats.as_deref() {
-                            stats.record_drm_gbm_no_free_buffer();
+                        } else {
+                            gbm_buffer_starved = true;
+                            if let Some(stats) = stats.as_deref() {
+                                stats.record_drm_gbm_no_free_buffer();
+                            }
                         }
                     }
 
@@ -3970,6 +4012,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                     }
 
                     if atomic_commit_ready(submit_primary, submit_cursor, defer_cursor_only, retry_commit_at, now) {
+                        let commit_started_at = Instant::now();
                         let present_submit_started_at = submit_primary.then(Instant::now);
                         let mut commit_req = atomic::AtomicModeReq::new();
                         let primary_fb = frames
@@ -4207,6 +4250,9 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                 break;
                             }
                         }
+                        if let Some(accounting) = loop_accounting.as_mut() {
+                            accounting.add_work(LoopWork::Commit, commit_started_at.elapsed());
+                        }
                     }
 
                     production.poll(Instant::now());
@@ -4255,7 +4301,18 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                         },
                     ];
 
-                    match poll_fds(&mut pollfds, timeout) {
+                    let wait = classify_loop_wait(
+                        frames.prepared.is_some(),
+                        frames.in_flight.is_some(),
+                        gbm_buffer_starved,
+                        retry_commit_at.is_some(),
+                    );
+                    let poll_started_at = Instant::now();
+                    let poll_result = poll_fds(&mut pollfds, timeout);
+                    if let Some(accounting) = loop_accounting.as_mut() {
+                        accounting.add_wait(wait, poll_started_at.elapsed());
+                    }
+                    match poll_result {
                         Ok(_) => {
                             drm_ready = (pollfds[0].revents & (libc::POLLIN | libc::POLLPRI)) != 0;
                             presenter_wake_ready = (pollfds[1].revents & libc::POLLIN) != 0;

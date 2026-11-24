@@ -10,6 +10,9 @@ pub(crate) mod cadence;
 #[cfg(all(feature = "drm", target_os = "linux"))]
 pub mod drm;
 pub mod headless;
+// One Raven patch: pure logic, so it is tested on every host.
+#[cfg(any(all(feature = "drm", feature = "opengl", target_os = "linux"), test))]
+pub(crate) mod loop_accounting;
 // The wire protocol is platform-independent and is exercised on Linux CI too.
 #[cfg(any(feature = "macos", test))]
 pub mod macos;
