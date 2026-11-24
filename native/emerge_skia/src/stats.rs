@@ -336,6 +336,11 @@ pub struct RendererPipelineStatsSnapshot {
     pub gpu_render_elapsed_stale_epoch_samples: u64,
     /// One Raven patch: intervals between presented scenes in this window.
     pub present_intervals: PresentIntervalSummary,
+    /// One Raven patch: intervals between all presented frames, including
+    /// frames that only advance the scene the presenter holds (renderer-driven
+    /// animations, a fling the render thread carries on). `present_intervals`
+    /// misses those, and reads a carried fling as stalled.
+    pub frame_intervals: PresentIntervalSummary,
 }
 
 /// One Raven patch: how evenly scenes reached the screen. Intervals of
@@ -895,6 +900,7 @@ struct RendererPipelineStatsWindow {
     gpu_render_elapsed_pool_saturated_sample_skips: u64,
     gpu_render_elapsed_stale_epoch_samples: u64,
     present_intervals: PresentIntervalHistogram,
+    frame_intervals: PresentIntervalHistogram,
 }
 
 impl RendererPipelineStatsWindow {
@@ -910,6 +916,7 @@ impl RendererPipelineStatsWindow {
                 .gpu_render_elapsed_pool_saturated_sample_skips,
             gpu_render_elapsed_stale_epoch_samples: self.gpu_render_elapsed_stale_epoch_samples,
             present_intervals: self.present_intervals.summary(),
+            frame_intervals: self.frame_intervals.summary(),
         }
     }
 }
@@ -1786,6 +1793,11 @@ impl RendererStatsCollector {
             pipeline.drm_scenes_selected_for_draw =
                 pipeline.drm_scenes_selected_for_draw.saturating_add(1);
         });
+    }
+
+    /// One Raven patch: any frame reached the screen (`frame_intervals`).
+    pub fn record_drm_frame_presented(&self) {
+        self.update_pipeline(|pipeline| pipeline.frame_intervals.record(Instant::now()));
     }
 
     pub fn record_drm_scene_presented(&self) {

@@ -3579,6 +3579,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                             let presented_at = Instant::now();
                                             if let Some(stats) = stats.as_ref() {
                                                 stats.record_frame_present();
+                                                stats.record_drm_frame_presented();
                                                 if frame.render_version > 0
                                                     && last_presented_scene_version
                                                         != Some(frame.render_version)

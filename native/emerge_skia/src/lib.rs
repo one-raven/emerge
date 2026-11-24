@@ -276,19 +276,40 @@ struct StatsPipelineSnapshotNif {
     drm_scenes_selected_for_draw: u64,
     drm_scenes_presented: u64,
     present_intervals: PresentIntervalsNif,
+    frame_intervals: PresentIntervalsNif,
 }
 
-// One Raven patch: spacing of presented scenes (see `PresentIntervalSummary`).
+// One Raven patch: spacing of presented scenes, or of all presented frames
+// (see `PresentIntervalSummary`).
 #[derive(Clone, Copy, Debug, rustler::NifMap)]
 struct PresentIntervalsNif {
     count: u64,
     idle: u64,
-    /// Presented scenes per second while scenes kept coming (idle gaps excluded).
+    /// Presented per second while they kept coming (idle gaps excluded).
     fps: f64,
     p50_ms: f64,
     p90_ms: f64,
     p99_ms: f64,
     max_ms: f64,
+}
+
+impl From<stats::PresentIntervalSummary> for PresentIntervalsNif {
+    fn from(p: stats::PresentIntervalSummary) -> Self {
+        let ms = |us: u32| f64::from(us) / 1000.0;
+        Self {
+            count: p.count,
+            idle: p.idle,
+            fps: if p.total_us == 0 {
+                0.0
+            } else {
+                p.count as f64 * 1.0e6 / p.total_us as f64
+            },
+            p50_ms: ms(p.p50_us),
+            p90_ms: ms(p.p90_us),
+            p99_ms: ms(p.p99_us),
+            max_ms: ms(p.max_us),
+        }
+    }
 }
 
 #[derive(Clone, Debug, rustler::NifMap)]
@@ -510,23 +531,8 @@ impl StatsSnapshotNif {
                     render_queue_overwrites: snapshot.pipeline.render_queue_overwrites,
                     drm_scenes_selected_for_draw: snapshot.pipeline.drm_scenes_selected_for_draw,
                     drm_scenes_presented: snapshot.pipeline.drm_scenes_presented,
-                    present_intervals: {
-                        let p = snapshot.pipeline.present_intervals;
-                        let ms = |us: u32| f64::from(us) / 1000.0;
-                        PresentIntervalsNif {
-                            count: p.count,
-                            idle: p.idle,
-                            fps: if p.total_us == 0 {
-                                0.0
-                            } else {
-                                p.count as f64 * 1.0e6 / p.total_us as f64
-                            },
-                            p50_ms: ms(p.p50_us),
-                            p90_ms: ms(p.p90_us),
-                            p99_ms: ms(p.p99_us),
-                            max_ms: ms(p.max_us),
-                        }
-                    },
+                    present_intervals: PresentIntervalsNif::from(snapshot.pipeline.present_intervals),
+                    frame_intervals: PresentIntervalsNif::from(snapshot.pipeline.frame_intervals),
                 },
                 video: StatsVideoSnapshotNif {
                     submitted: snapshot.video_pipeline.submitted,
