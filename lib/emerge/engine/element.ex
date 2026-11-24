@@ -32,7 +32,8 @@ defmodule Emerge.Engine.Element do
           attrs: map(),
           children: [t()],
           nearby: [{atom(), t()}],
-          frame: frame() | nil
+          frame: frame() | nil,
+          memo: {term(), term()} | nil
         }
 
   defstruct [
@@ -42,6 +43,9 @@ defmodule Emerge.Engine.Element do
     attrs: %{},
     children: [],
     nearby: [],
-    frame: nil
+    frame: nil,
+    # One Raven patch: `{id, deps}` on a subtree built by `Emerge.UI.lazy/3`;
+    # the differ reuses the previous subtree when the tag is unchanged.
+    memo: nil
   ]
 end

@@ -2,7 +2,6 @@ defmodule Emerge.UI.Internal.Builder do
   @moduledoc false
 
   alias Emerge.Engine.Element
-  alias Emerge.Engine.Tree.Attrs, as: TreeAttrs
   alias Emerge.UI.Internal.Validation
 
   @type attrs_map :: map()
@@ -19,8 +18,11 @@ defmodule Emerge.UI.Internal.Builder do
 
   @spec build_element(attrs_map(), nearby_mounts(), atom(), children()) :: Element.t()
   def build_element(attrs, nearby, type, children) when is_map(attrs) and is_list(nearby) do
+    # One Raven patch: no `:__attrs_hash`. Nothing reads it (it is a runtime
+    # attr, stripped before diffing and encoding; the native side hashes on
+    # its own), and computing it (`Map.drop` of 18 keys and `phash2`) was a
+    # tenth of building an element.
     {key, attrs} = Map.pop(attrs, :key)
-    attrs = Map.put(attrs, :__attrs_hash, TreeAttrs.attrs_hash(attrs))
 
     %Element{
       type: type,

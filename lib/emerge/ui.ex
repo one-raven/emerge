@@ -495,6 +495,25 @@ defmodule Emerge.UI do
   end
 
   @doc """
+  One Raven patch: a memoized subtree. `fun` builds it; while `deps` stay
+  equal (`===`) to the last render's for `id`, the last subtree is reused
+  without calling `fun`, and the differ skips it without walking it.
+
+  `id` names the cache entry and is separate from `key/1`: it only has to be
+  unique among the lazy subtrees of one render (a repeated `id` is correct,
+  just not cached). `deps` must cover everything `fun` reads, including the
+  current time or a pid if it uses them; an event handler binds `self()`,
+  which is stable within a viewport. Keys inside a lazy subtree still count
+  as the tree's keys.
+
+  ```elixir
+  for d <- rows, do: lazy({:row, d.id}, {d, d.id in selected, palette}, fn -> row_view(d) end)
+  ```
+  """
+  @spec lazy(term(), term(), (-> t())) :: t()
+  def lazy(id, deps, fun) when is_function(fun, 0), do: Emerge.UI.Lazy.lazy(id, deps, fun)
+
+  @doc """
   Provide a stable semantic key for identity in the tree.
 
   Keys must be globally unique across the full UI tree, including nearby mounts.

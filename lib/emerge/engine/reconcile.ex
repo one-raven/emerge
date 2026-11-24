@@ -10,12 +10,9 @@ defmodule Emerge.Engine.Reconcile do
   alias Emerge.Engine.Tree.Attrs, as: TreeAttrs
   alias Emerge.Engine.VNode
 
-  @type scope_ref :: :root | {:children, non_neg_integer()} | {:nearby, non_neg_integer()}
-
   @type ctx :: %{
           next_id: non_neg_integer(),
-          seen: MapSet.t(),
-          old_key_index: %{optional(term()) => %{scope: scope_ref(), vnode: VNode.t()}}
+          seen: MapSet.t()
         }
 
   @type result :: {VNode.t(), [Patch.patch()], Element.t()}
@@ -34,7 +31,7 @@ defmodule Emerge.Engine.Reconcile do
       when is_integer(next_id) and next_id > 0 do
     validate_viewport_root!(element)
 
-    ctx = %{next_id: next_id, seen: MapSet.new(), old_key_index: %{}}
+    ctx = %{next_id: next_id, seen: MapSet.new()}
     {vnode, assigned, ctx} = build_fresh_subtree(element, ctx)
     {vnode, assigned, ctx.next_id}
   end
@@ -54,7 +51,7 @@ defmodule Emerge.Engine.Reconcile do
       when is_integer(next_id) and next_id > 0 do
     validate_viewport_root!(element)
 
-    ctx = %{next_id: next_id, seen: MapSet.new(), old_key_index: %{}}
+    ctx = %{next_id: next_id, seen: MapSet.new()}
     {vnode, assigned, ctx} = build_fresh_subtree(element, ctx)
     {vnode, [], assigned, ctx.next_id}
   end
@@ -63,11 +60,7 @@ defmodule Emerge.Engine.Reconcile do
       when is_integer(next_id) and next_id > 0 do
     validate_viewport_root!(element)
 
-    ctx = %{
-      next_id: next_id,
-      seen: MapSet.new(),
-      old_key_index: build_old_key_index(old_vnode)
-    }
+    ctx = %{next_id: next_id, seen: MapSet.new()}
 
     if reusable_root?(old_vnode, element) do
       {vnode, patches, assigned, ctx} = reconcile_matched_node(old_vnode, element, ctx)
@@ -131,8 +124,7 @@ defmodule Emerge.Engine.Reconcile do
       %{
         next_id: next_id,
         seen: MapSet.new(),
-        assign_tree?: false,
-        old_key_index: if(is_nil(old_vnode), do: %{}, else: build_old_key_index(old_vnode))
+        assign_tree?: false
       }
       |> maybe_init_event_registry(event_registry)
 
@@ -166,6 +158,27 @@ defmodule Emerge.Engine.Reconcile do
 
   defp event_registry(%{event_registry: registry}), do: registry
   defp event_registry(_ctx), do: %{}
+
+  # One Raven patch: a subtree built by `Emerge.UI.lazy/3` whose tag (id and
+  # deps) is the one it was built with last time is the same subtree, so it
+  # is reused as it stands: no walk, no patches, no event registry changes.
+  # Its keys still count against the tree's (uniqueness, scroll targets).
+  # Only in the patch-only hot path, which builds no assigned tree; and never
+  # for a subtree with a keyed scroll position, whose target id can depend on
+  # nodes outside it.
+  defp reconcile_matched_node(
+         %VNode{memo: {tag, keys, true}} = old,
+         %Element{memo: tag},
+         %{assign_tree?: false} = ctx
+       )
+       when tag != nil do
+    ctx =
+      Enum.reduce(keys, ctx, fn {key, id}, ctx ->
+        ctx |> ensure_unique_key!(key) |> remember_key(key, id)
+      end)
+
+    {old, [], nil, ctx}
+  end
 
   defp reconcile_matched_node(%VNode{} = old, %Element{} = element, ctx) do
     key = element_key(element)
@@ -205,6 +218,8 @@ defmodule Emerge.Engine.Reconcile do
       nearby: nearby_vnodes
     }
 
+    vnode = put_memo(vnode, element.memo)
+
     assigned =
       maybe_assign_element(ctx, element, old.id, new_attrs, child_elements, nearby_elements)
 
@@ -218,14 +233,18 @@ defmodule Emerge.Engine.Reconcile do
     end
   end
 
+  # One Raven patch: a keyed child only ever matches an old child of the same
+  # parent, so look keys up among the old parent's children instead of in an
+  # index of the whole old tree, rebuilt (one more full walk) on every
+  # reconcile.
   defp reconcile_children_keyed(old_children, new_children, parent_node_id, ctx) do
-    scope = {:children, parent_node_id}
+    old_by_key = keyed_index(old_children)
 
     {vnodes_rev, elements_rev, patches_rev, used_old_ids, ctx} =
       do_reconcile_children_keyed(
         new_children,
         0,
-        scope,
+        old_by_key,
         parent_node_id,
         ctx,
         [],
@@ -256,7 +275,7 @@ defmodule Emerge.Engine.Reconcile do
   defp do_reconcile_children_keyed(
          [child | rest],
          index,
-         scope,
+         old_by_key,
          parent_node_id,
          ctx,
          vnodes_rev,
@@ -266,14 +285,14 @@ defmodule Emerge.Engine.Reconcile do
        ) do
     key = element_key(child)
 
-    case Map.get(ctx.old_key_index, key) do
-      %{scope: ^scope, vnode: %VNode{kind: kind} = old_child} when kind == child.type ->
+    case Map.get(old_by_key, key) do
+      %VNode{kind: kind} = old_child when kind == child.type ->
         {vnode, child_patches, assigned, ctx} = reconcile_matched_node(old_child, child, ctx)
 
         do_reconcile_children_keyed(
           rest,
           index + 1,
-          scope,
+          old_by_key,
           parent_node_id,
           ctx,
           [vnode | vnodes_rev],
@@ -288,7 +307,7 @@ defmodule Emerge.Engine.Reconcile do
         do_reconcile_children_keyed(
           rest,
           index + 1,
-          scope,
+          old_by_key,
           parent_node_id,
           ctx,
           [vnode | vnodes_rev],
@@ -427,13 +446,13 @@ defmodule Emerge.Engine.Reconcile do
   end
 
   defp reconcile_nearby_keyed(old_nearby, new_nearby, host_node_id, ctx) do
-    scope = {:nearby, host_node_id}
+    old_by_key = keyed_index(old_nearby)
 
     {vnodes_rev, elements_rev, patches_rev, used_old_ids, ctx} =
       do_reconcile_nearby_keyed(
         new_nearby,
         0,
-        scope,
+        old_by_key,
         host_node_id,
         ctx,
         [],
@@ -464,7 +483,7 @@ defmodule Emerge.Engine.Reconcile do
   defp do_reconcile_nearby_keyed(
          [{slot, element} | rest],
          index,
-         scope,
+         old_by_key,
          host_node_id,
          ctx,
          vnodes_rev,
@@ -474,14 +493,14 @@ defmodule Emerge.Engine.Reconcile do
        ) do
     key = element_key(element)
 
-    case Map.get(ctx.old_key_index, key) do
-      %{scope: ^scope, vnode: %VNode{kind: kind} = old_vnode} when kind == element.type ->
+    case Map.get(old_by_key, key) do
+      %VNode{kind: kind} = old_vnode when kind == element.type ->
         {vnode, mount_patches, assigned, ctx} = reconcile_matched_node(old_vnode, element, ctx)
 
         do_reconcile_nearby_keyed(
           rest,
           index + 1,
-          scope,
+          old_by_key,
           host_node_id,
           ctx,
           [{slot, vnode} | vnodes_rev],
@@ -496,7 +515,7 @@ defmodule Emerge.Engine.Reconcile do
         do_reconcile_nearby_keyed(
           rest,
           index + 1,
-          scope,
+          old_by_key,
           host_node_id,
           ctx,
           [{slot, vnode} | vnodes_rev],
@@ -715,6 +734,8 @@ defmodule Emerge.Engine.Reconcile do
       nearby: nearby_vnodes
     }
 
+    vnode = put_memo(vnode, element.memo)
+
     assigned = %{
       element
       | id: id,
@@ -724,6 +745,40 @@ defmodule Emerge.Engine.Reconcile do
 
     {vnode, assigned, ctx}
   end
+
+  # One Raven patch: a lazy subtree's vnode remembers its tag, every explicit
+  # key in it with its node id, and whether it can be reused (no keyed scroll
+  # position inside). A nested lazy subtree contributes its stored keys.
+  defp put_memo(vnode, nil), do: vnode
+
+  defp put_memo(%VNode{} = vnode, tag) do
+    {keys, reusable?} = memo_walk(vnode, {[], true})
+    %{vnode | memo: {tag, keys, reusable?}}
+  end
+
+  defp memo_walk(%VNode{} = vnode, {keys, reusable?}) do
+    keys = if is_nil(vnode.key), do: keys, else: [{vnode.key, vnode.id} | keys]
+    reusable? = reusable? and not keyed_scroll?(vnode.attrs)
+    acc = Enum.reduce(vnode.children, {keys, reusable?}, &memo_walk_child/2)
+    Enum.reduce(vnode.nearby, acc, fn {_slot, child}, acc -> memo_walk_child(child, acc) end)
+  end
+
+  defp memo_walk_child(%VNode{memo: {_tag, inner, inner_reusable?}}, {keys, reusable?}),
+    do: {inner ++ keys, reusable? and inner_reusable?}
+
+  defp memo_walk_child(%VNode{} = vnode, acc), do: memo_walk(vnode, acc)
+
+  defp keyed_scroll?(attrs),
+    do:
+      match?(%ScrollTarget{}, Map.get(attrs, :scroll_position_x)) or
+        match?(%ScrollTarget{}, Map.get(attrs, :scroll_position_y))
+
+  # One Raven patch: skip the per-axis closures for the common element with no
+  # scroll position (here and in resolve_scroll_attrs/3).
+  defp collect_scroll_keys(ctx, attrs)
+       when not is_map_key(attrs, :scroll_position_x) and
+              not is_map_key(attrs, :scroll_position_y),
+       do: ctx
 
   defp collect_scroll_keys(ctx, attrs) do
     if Enum.any?([:scroll_position_x, :scroll_position_y], fn axis ->
@@ -737,6 +792,11 @@ defmodule Emerge.Engine.Reconcile do
     do: Map.update(ctx, :new_key_ids, %{key => id}, &Map.put(&1, key, id))
 
   defp remember_key(ctx, _key, _id), do: ctx
+
+  defp resolve_scroll_attrs(attrs, _old, ctx)
+       when not is_map_key(attrs, :scroll_position_x) and
+              not is_map_key(attrs, :scroll_position_y),
+       do: {attrs, ctx}
 
   defp resolve_scroll_attrs(attrs, old, ctx) do
     Enum.reduce([:scroll_position_x, :scroll_position_y], {attrs, ctx}, fn axis, {attrs, ctx} ->
@@ -765,20 +825,12 @@ defmodule Emerge.Engine.Reconcile do
     end)
   end
 
-  defp build_old_key_index(%VNode{} = old_root) do
-    build_old_key_index(old_root, :root, %{})
-  end
-
-  defp build_old_key_index(%VNode{key: key, id: id} = vnode, scope, acc) do
-    acc = if is_nil(key), do: acc, else: Map.put(acc, key, %{scope: scope, vnode: vnode})
-
-    acc =
-      Enum.reduce(vnode.children, acc, fn child, next_acc ->
-        build_old_key_index(child, {:children, id}, next_acc)
-      end)
-
-    Enum.reduce(vnode.nearby, acc, fn {_slot, nearby_vnode}, next_acc ->
-      build_old_key_index(nearby_vnode, {:nearby, id}, next_acc)
+  defp keyed_index(old) do
+    Enum.reduce(old, %{}, fn
+      {_slot, %VNode{key: nil}}, acc -> acc
+      {_slot, %VNode{key: key} = vnode}, acc -> Map.put(acc, key, vnode)
+      %VNode{key: nil}, acc -> acc
+      %VNode{key: key} = vnode, acc -> Map.put(acc, key, vnode)
     end)
   end
 

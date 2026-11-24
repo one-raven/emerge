@@ -980,11 +980,14 @@ defmodule Emerge.Runtime.Viewport do
     |> render_frame(:initial_render)
   end
 
+  # One Raven patch: each render is one frame of the `Emerge.UI.lazy/3` cache.
   defp invoke_render(module, state) when is_atom(module) and is_map(state) do
-    case validate_render_callback_shape!(module) do
-      0 -> apply(module, :render, [])
-      1 -> apply(module, :render, [state])
-    end
+    Emerge.UI.Lazy.frame(fn ->
+      case validate_render_callback_shape!(module) do
+        0 -> apply(module, :render, [])
+        1 -> apply(module, :render, [state])
+      end
+    end)
   end
 
   defp validate_render_callback_shape!(module) when is_atom(module) do

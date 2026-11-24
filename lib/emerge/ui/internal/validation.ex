@@ -672,9 +672,15 @@ defmodule Emerge.UI.Internal.Validation do
     attrs
   end
 
-  defp attr_or_animation_key?(attrs, key) do
+  # One Raven patch: most elements carry no animation, so skip the keyframe
+  # scan (twelve lookups and closures per element) when there is none.
+  defp attr_or_animation_key?(attrs, key)
+       when is_map_key(attrs, :animate) or is_map_key(attrs, :animate_enter) or
+              is_map_key(attrs, :animate_exit) do
     Map.has_key?(attrs, key) or animation_keyframes_have_key?(attrs, key)
   end
+
+  defp attr_or_animation_key?(attrs, key), do: is_map_key(attrs, key)
 
   defp animation_keyframes_have_key?(attrs, key) do
     Enum.any?([:animate, :animate_enter, :animate_exit], fn animation_key ->
