@@ -17,6 +17,9 @@ pub(crate) mod loop_accounting;
 #[cfg(any(feature = "macos", test))]
 pub mod macos;
 pub mod present;
+// One Raven patch: pure logic, so it is tested on every host.
+#[cfg(any(all(feature = "drm", feature = "opengl", target_os = "linux"), test))]
+pub(crate) mod primary_pipeline;
 pub mod production;
 pub mod raster;
 #[cfg(feature = "opengl")]

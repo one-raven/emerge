@@ -28,6 +28,10 @@ use skia_safe::{Paint, Rect, gpu::gl::FramebufferInfo};
 
 use crate::actors::{EventMsg, RenderMsg, TreeMsg};
 use crate::backend::loop_accounting::{LoopAccounting, LoopWork, classify_loop_wait};
+use crate::backend::primary_pipeline::{
+    fingerprint_describes_drawn_primary, should_draw_behind_new_commit, should_prepare_primary,
+    should_submit_prepared_primary,
+};
 use crate::backend::production::{AnimationFrame, FrameProduction};
 use crate::backend::raster::{RasterBackend, RasterConfig};
 use crate::backend::skia_gpu::GlFrameSurface;
@@ -1264,28 +1268,6 @@ fn should_consider_unchanged_primary_skip(
         && !video_sync_required
         && !animate
         && (hw_cursor_enabled || !cursor_visible)
-}
-
-fn should_prepare_primary(
-    desired_generation: u64,
-    committed_generation: u64,
-    in_flight_generation: Option<u64>,
-    prepared_generation: Option<u64>,
-) -> bool {
-    desired_generation != committed_generation
-        && in_flight_generation != Some(desired_generation)
-        && prepared_generation.is_none()
-}
-
-fn should_submit_prepared_primary(
-    commit_in_flight: bool,
-    committed_generation: u64,
-    prepared_generation: Option<u64>,
-) -> bool {
-    !commit_in_flight
-        && prepared_generation
-            .map(|generation| generation != committed_generation)
-            .unwrap_or(false)
 }
 
 fn atomic_commit_ready(
@@ -3417,6 +3399,9 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                 let mut damage_history: std::collections::VecDeque<Option<crate::tree::geometry::Rect>> =
                     std::collections::VecDeque::new();
                 let mut last_drawn_scene_version: Option<u64> = None;
+                // One Raven patch: the generation the unchanged-frame
+                // fingerprint was last taken for (see `primary_pipeline`).
+                let mut fingerprinted_generation: Option<u64> = None;
                 render_state.animation_frame.observed(first_presented_at);
                 production.submitted(render_state.animation_frame.clone(), first_presented_at + frame_interval);
                 // The blocking modeset already displayed generation zero. Only
@@ -3811,7 +3796,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                     // translated outside a clip), it still needs a committed primary so
                     // look-ahead can advance the animation clock.
                     let skip_check_started_at = Instant::now();
-                    if capture_request_generation.is_none()
+                    let consider_skip = capture_request_generation.is_none()
                         && should_consider_unchanged_primary_skip(
                             frames.in_flight.is_some(),
                             primary_dirty,
@@ -3819,7 +3804,11 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                             hw_cursor_enabled,
                             cursor_visible,
                             render_state.animate,
-                        )
+                        );
+                    if consider_skip {
+                        fingerprinted_generation = Some(desired_primary_generation);
+                    }
+                    if consider_skip
                         && renderer.can_skip_unchanged_visible_frame(&render_state, dimensions)
                     {
                         committed_primary_generation = desired_primary_generation;
@@ -3925,6 +3914,16 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                 None
                             };
                             last_drawn_scene_version = Some(render_state.render_version);
+                            // One Raven patch: a primary drawn without its own
+                            // unchanged-frame check must not leave the fingerprint
+                            // describing an older frame.
+                            if !fingerprint_describes_drawn_primary(
+                                fingerprinted_generation,
+                                desired_primary_generation,
+                            ) {
+                                renderer.invalidate_visible_frame_fingerprint();
+                                fingerprinted_generation = None;
+                            }
                             match prepare_primary_frame(
                                 desired_primary_generation,
                                 config.rendering_api,
@@ -4011,6 +4010,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                         eprintln!("drm defer cursor-only commit waiting for follow-up primary");
                     }
 
+                    let mut committed_primary_this_pass = false;
                     if atomic_commit_ready(submit_primary, submit_cursor, defer_cursor_only, retry_commit_at, now) {
                         let commit_started_at = Instant::now();
                         let present_submit_started_at = submit_primary.then(Instant::now);
@@ -4109,6 +4109,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                         }
                         match atomic_commit_result {
                             Ok(()) => {
+                                committed_primary_this_pass = submit_primary;
                                 frames.submitted(
                                     submit_primary,
                                     if submit_cursor {
@@ -4283,6 +4284,21 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                         && (submit_primary || (submit_cursor && !defer_cursor_only))
                         && retry_commit_at.is_none()
                     {
+                        continue;
+                    }
+                    // One Raven patch: a scene taken while the just-committed
+                    // primary was staged is drawn behind it now, not after
+                    // the next page flip.
+                    if should_draw_behind_new_commit(
+                        committed_primary_this_pass,
+                        desired_primary_generation,
+                        committed_primary_generation,
+                        frames
+                            .in_flight
+                            .as_ref()
+                            .and_then(|commit| commit.primary.as_ref().map(|frame| frame.generation)),
+                        frames.prepared.as_ref().map(|frame| frame.generation),
+                    ) {
                         continue;
                     }
 
