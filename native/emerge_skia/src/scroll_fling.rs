@@ -22,6 +22,7 @@ use std::time::Instant;
 use crate::render_scene::{
     PaintLayerId, PaintLayerReason, RenderNode, RenderPaintLayer, RenderPaintLayerContentNode,
 };
+use crate::tree::geometry::ClipShape;
 
 /// `ADAPTIVE_SCROLL_DECELERATION_RATE` in events/runtime.rs.
 pub(crate) const DECELERATION_RATE: f32 = 2.358_201_7;
@@ -63,6 +64,9 @@ pub struct ScrollFlingAnchor {
     pub offset: f32,
     /// The curve position that offset reflects.
     pub sample: f32,
+    /// The clip the container's escapes (nearby elements of its content:
+    /// badges, popovers) are placed in, if it has any (`place_escapes`).
+    pub escapes: Option<ClipShape>,
     /// The offsets the scene can show: the built window and the scroll range.
     pub min: f32,
     pub max: f32,
@@ -139,6 +143,10 @@ impl Carrier {
             None => (anchor.offset, false),
         };
         let changed = shown != target && place(&mut scene.nodes, anchor.node, anchor.axis_y, target);
+        // Badges and other nearby elements of the content move with it.
+        let changed = anchor.escapes.is_some_and(|clip| {
+            place_escapes(&mut scene.nodes, clip, anchor.axis_y, target)
+        }) || changed;
         // Past the end of its curve, a fling that moved nothing needs no more
         // frames.
         let finished = fling.is_none_or(|fling| fling.done(at)) && !changed;
@@ -155,6 +163,141 @@ impl Carrier {
 pub fn place(nodes: &mut [RenderNode], node: u64, axis_y: bool, offset: f32) -> bool {
     let id = PaintLayerId::new(node, PaintLayerReason::ScrollContent);
     place_nodes(nodes, id, axis_y, offset)
+}
+
+/// Put the escapes of a scroll container (placed in `clip`, see
+/// `CompositorScroll::place_escapes`) at `offset` px along the axis. Returns
+/// whether anything moved.
+pub fn place_escapes(nodes: &mut [RenderNode], clip: ClipShape, axis_y: bool, offset: f32) -> bool {
+    let mut moved = false;
+    for node in nodes.iter_mut() {
+        match node {
+            RenderNode::Clip { clips, children }
+                if matches!(clips.as_slice(), [c] if *c == clip)
+                    && matches!(children.as_slice(), [RenderNode::Transform { .. }]) =>
+            {
+                if let [RenderNode::Transform { transform, .. }] = children.as_mut_slice()
+                    && offset_of(transform, axis_y) != offset
+                {
+                    set_offset(transform, axis_y, offset);
+                    moved = true;
+                }
+            }
+            RenderNode::ShadowPass { children }
+            | RenderNode::Clip { children, .. }
+            | RenderNode::RelaxedClip { children, .. }
+            | RenderNode::Transform { children, .. }
+            | RenderNode::Alpha { children, .. } => {
+                moved |= place_escapes(children, clip, axis_y, offset)
+            }
+            RenderNode::PaintLayer(layer) => {
+                if content_escapes_off(&layer.content.nodes, clip, axis_y, offset) {
+                    let content = Arc::make_mut(&mut layer.content);
+                    content.copy = crate::render_scene::ContentCopy::next();
+                    moved |= place_content_escapes(&mut content.nodes, clip, axis_y, offset);
+                }
+            }
+            RenderNode::Primitive(_) => {}
+        }
+    }
+    moved
+}
+
+fn place_content_escapes(
+    nodes: &mut [RenderPaintLayerContentNode],
+    clip: ClipShape,
+    axis_y: bool,
+    offset: f32,
+) -> bool {
+    let mut moved = false;
+    for node in nodes.iter_mut() {
+        match node {
+            RenderPaintLayerContentNode::Clip { clips, children }
+                if matches!(clips.as_slice(), [c] if *c == clip)
+                    && matches!(children.as_slice(), [RenderPaintLayerContentNode::Transform { .. }]) =>
+            {
+                if let [RenderPaintLayerContentNode::Transform { transform, .. }] =
+                    children.as_mut_slice()
+                    && offset_of(transform, axis_y) != offset
+                {
+                    set_offset(transform, axis_y, offset);
+                    moved = true;
+                }
+            }
+            RenderPaintLayerContentNode::Own(run) => {
+                if nodes_escapes_off(&run.nodes, clip, axis_y, offset) {
+                    moved |= place_escapes(
+                        Arc::make_mut(&mut run.nodes).as_mut_slice(),
+                        clip,
+                        axis_y,
+                        offset,
+                    );
+                }
+            }
+            RenderPaintLayerContentNode::Child(layer) => {
+                if content_escapes_off(&layer.content.nodes, clip, axis_y, offset) {
+                    let content = Arc::make_mut(&mut layer.content);
+                    content.copy = crate::render_scene::ContentCopy::next();
+                    moved |= place_content_escapes(&mut content.nodes, clip, axis_y, offset);
+                }
+            }
+            RenderPaintLayerContentNode::ShadowPass { children }
+            | RenderPaintLayerContentNode::Clip { children, .. }
+            | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+            | RenderPaintLayerContentNode::Transform { children, .. }
+            | RenderPaintLayerContentNode::Alpha { children, .. } => {
+                moved |= place_content_escapes(children, clip, axis_y, offset)
+            }
+        }
+    }
+    moved
+}
+
+/// Whether escapes in `clip` somewhere below are not at `offset` (so moving
+/// them copies only what holds them).
+fn nodes_escapes_off(nodes: &[RenderNode], clip: ClipShape, axis_y: bool, offset: f32) -> bool {
+    nodes.iter().any(|node| match node {
+        RenderNode::Clip { clips, children }
+            if matches!(clips.as_slice(), [c] if *c == clip)
+                && matches!(children.as_slice(), [RenderNode::Transform { .. }]) =>
+        {
+            matches!(children.as_slice(), [RenderNode::Transform { transform, .. }] if offset_of(transform, axis_y) != offset)
+        }
+        RenderNode::ShadowPass { children }
+        | RenderNode::Clip { children, .. }
+        | RenderNode::RelaxedClip { children, .. }
+        | RenderNode::Transform { children, .. }
+        | RenderNode::Alpha { children, .. } => nodes_escapes_off(children, clip, axis_y, offset),
+        RenderNode::PaintLayer(layer) => content_escapes_off(&layer.content.nodes, clip, axis_y, offset),
+        RenderNode::Primitive(_) => false,
+    })
+}
+
+fn content_escapes_off(
+    nodes: &[RenderPaintLayerContentNode],
+    clip: ClipShape,
+    axis_y: bool,
+    offset: f32,
+) -> bool {
+    nodes.iter().any(|node| match node {
+        RenderPaintLayerContentNode::Clip { clips, children }
+            if matches!(clips.as_slice(), [c] if *c == clip)
+                && matches!(children.as_slice(), [RenderPaintLayerContentNode::Transform { .. }]) =>
+        {
+            matches!(children.as_slice(), [RenderPaintLayerContentNode::Transform { transform, .. }] if offset_of(transform, axis_y) != offset)
+        }
+        RenderPaintLayerContentNode::Own(run) => nodes_escapes_off(&run.nodes, clip, axis_y, offset),
+        RenderPaintLayerContentNode::Child(layer) => {
+            content_escapes_off(&layer.content.nodes, clip, axis_y, offset)
+        }
+        RenderPaintLayerContentNode::ShadowPass { children }
+        | RenderPaintLayerContentNode::Clip { children, .. }
+        | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+        | RenderPaintLayerContentNode::Transform { children, .. }
+        | RenderPaintLayerContentNode::Alpha { children, .. } => {
+            content_escapes_off(children, clip, axis_y, offset)
+        }
+    })
 }
 
 /// The offset the content layer of scroll container `node` is placed at.
@@ -352,6 +495,7 @@ mod tests {
             axis_y: true,
             offset,
             sample,
+            escapes: None,
             min: 0.0,
             max: 2500.0,
         }
@@ -502,6 +646,73 @@ mod tests {
         let stopped = carrier.advance(&mut scene, None, at);
         assert!(!stopped.active && stopped.changed);
         assert_eq!(shown_offset(&scene.nodes, 42, true), Some(100.0));
+    }
+
+    #[test]
+    fn a_badge_placed_outside_the_content_moves_with_it() {
+        use crate::render_scene::{
+            PaintLayerPlacement, PaintLayerPolicy, RenderPaintLayerBuildParts,
+            RenderPaintLayerContent, RenderScene,
+        };
+        use crate::tree::geometry::Rect;
+        use crate::tree::transform::Affine2;
+        let content = RenderNode::PaintLayer(RenderPaintLayer::from_prepared_children(
+            RenderPaintLayerBuildParts {
+                id: PaintLayerId::new(42, PaintLayerReason::ScrollContent),
+                bounds: Rect::default(),
+                placement: PaintLayerPlacement::ScrollMoving,
+                policy: PaintLayerPolicy::Cacheable,
+                content_generation: 0,
+                visual_bounds: None,
+            },
+            RenderPaintLayerContent::default(),
+        ));
+        let clip = ClipShape {
+            rect: Rect { x: 0.0, y: 96.0, width: 1200.0, height: 1677.0 },
+            radii: None,
+        };
+        let other = ClipShape {
+            rect: Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 },
+            radii: None,
+        };
+        let escapes = |clip: ClipShape| RenderNode::Clip {
+            clips: vec![clip],
+            children: vec![RenderNode::Transform {
+                transform: Affine2::translation(0.0, -100.0),
+                children: Vec::new(),
+            }],
+        };
+        let mut scene = RenderScene {
+            scroll_fling: Some(ScrollFlingAnchor {
+                escapes: Some(clip),
+                ..anchor(100.0, 0.0)
+            }),
+            nodes: vec![
+                RenderNode::Transform {
+                    transform: Affine2::translation(0.0, -100.0),
+                    children: vec![content],
+                },
+                escapes(clip),
+                escapes(other),
+            ],
+            ..Default::default()
+        };
+        let ty = |node: &RenderNode| match node {
+            RenderNode::Clip { children, .. } => match &children[0] {
+                RenderNode::Transform { transform, .. } => transform.ty,
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        let fling = fling();
+        let at = fling.started_at + Duration::from_millis(300);
+        let expected = anchor(100.0, 0.0).offset_at(&fling, at).unwrap();
+        let moved = Carrier::default().advance(&mut scene, Some(fling), at);
+        assert!(moved.changed);
+        assert_eq!(shown_offset(&scene.nodes, 42, true), Some(expected));
+        assert_eq!(ty(&scene.nodes[1]), -expected);
+        // Another container's escapes stay.
+        assert_eq!(ty(&scene.nodes[2]), -100.0);
     }
 
     #[test]

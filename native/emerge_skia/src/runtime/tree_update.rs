@@ -1180,12 +1180,12 @@ impl TreeUpdateEngine {
     fn scroll_fling_anchor(&self) -> Option<crate::scroll_fling::ScrollFlingAnchor> {
         let (id, fling, sample) = self.fling_sample?;
         let element = self.tree.get(&id)?;
-        let (window, viewport) = element
+        let (window, viewport, escapes) = element
             .refresh
             .scroll_content_cache
             .borrow()
             .as_ref()
-            .map(|cache| (cache.window, cache.viewport))?;
+            .map(|cache| (cache.window, cache.viewport, cache.escape_clip))?;
         // As `CompositorScroll` places it.
         let overscroll = element.runtime.scroll_overscroll.map(f32::from_bits);
         let offset = (
@@ -1217,6 +1217,7 @@ impl TreeUpdateEngine {
             axis_y,
             offset,
             sample,
+            escapes,
             min: (window_start - start).max(0.0),
             max: (window_start + window_length - start - length).min(range.max(0.0)),
         })

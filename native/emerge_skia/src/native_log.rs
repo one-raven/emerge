@@ -27,12 +27,14 @@ impl NativeLogRelay {
         allow(dead_code)
     )]
     pub fn new(target: Option<LocalPid>) -> Self {
+        report_panics_to(target);
         Self {
             target: Mutex::new(target),
         }
     }
 
     pub fn set_target(&self, target: Option<LocalPid>) {
+        report_panics_to(target);
         let mut guard = self
             .target
             .lock()
@@ -71,4 +73,62 @@ impl NativeLogRelay {
     pub fn error(&self, source: &'static str, message: impl Into<String>) {
         self.log(NativeLogLevel::Error, source, message);
     }
+}
+
+/// One Raven patch: where a panic on any native thread is reported (the
+/// latest log target). A renderer thread's panic was caught and the renderer
+/// restarted with no trace of why: its message went to stderr, which a
+/// device usually discards.
+static PANIC_TARGET: Mutex<Option<LocalPid>> = Mutex::new(None);
+
+fn report_panics_to(target: Option<LocalPid>) {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    if target.is_none() {
+        return;
+    }
+    *PANIC_TARGET
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = target;
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let target = *PANIC_TARGET
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(pid) = target {
+                let thread = std::thread::current();
+                let payload = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "(no message)".into());
+                let location = info
+                    .location()
+                    .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                    .unwrap_or_default();
+                // Release builds are stripped: the load address lets the
+                // frames be resolved against an unstripped build.
+                let base = std::fs::read_to_string("/proc/self/maps")
+                    .ok()
+                    .and_then(|maps| {
+                        maps.lines()
+                            .find(|line| line.contains("emerge_skia") && line.contains("r-xp"))
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                send_log_event(
+                    pid,
+                    NativeLogLevel::Error,
+                    "panic",
+                    &format!(
+                        "thread {:?} panicked at {location}: {payload}\nmapped: {base}\n{}",
+                        thread.name().unwrap_or("?"),
+                        std::backtrace::Backtrace::force_capture()
+                    ),
+                );
+            }
+            previous(info);
+        }));
+    });
 }

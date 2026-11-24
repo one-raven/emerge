@@ -788,6 +788,10 @@ pub struct ScrollContentCache {
     pub offset: (f32, f32),
     pub content: Vec<RenderNode>,
     pub escapes: Vec<RenderNode>,
+    /// One Raven patch: the clip the content's escapes (its nearby
+    /// elements: badges, popovers) are placed in, when it has any. A fling
+    /// the render thread carries on moves them with the content.
+    pub escape_clip: Option<crate::tree::geometry::ClipShape>,
     pub text_input_focused: bool,
     pub text_input_cursor_area: Option<(f32, f32, f32, f32)>,
 }

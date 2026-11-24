@@ -867,6 +867,7 @@ fn build_element_subtree<R: RegistryTraversalSink>(
                             offset: plan.scroll,
                             content: content.clone(),
                             escapes: host_content.escapes.clone(),
+                            escape_clip: None,
                             text_input_focused: host_content.text_input_focused,
                             text_input_cursor_area: host_content.text_input_cursor_area,
                         },
@@ -880,6 +881,10 @@ fn build_element_subtree<R: RegistryTraversalSink>(
         // Escapes from the content were built in content coordinates too.
         host_content.escapes =
             plan.place_escapes(std::mem::take(&mut host_content.escapes), current_host_clip.clip);
+        if let Some(cache) = element.refresh.scroll_content_cache.borrow_mut().as_mut() {
+            cache.escape_clip =
+                (!host_content.escapes.is_empty()).then_some(current_host_clip.clip);
+        }
         normal_nodes.extend(wrap_with_host_clip(scrollbar_nodes, current_host_clip.clip));
     } else if scroll_content {
         normal_nodes.extend(wrap_semantic_scroll_content_layer(
@@ -1968,7 +1973,9 @@ impl CompositorScroll {
     }
 
     /// Escapes from the content (its nearby content) at the real offset. A
-    /// scroll container clips the nearby content of its content.
+    /// scroll container clips the nearby content of its content. One Raven
+    /// patch: the translation is there at offset zero too, for the render
+    /// thread to move (`scroll_fling::place_escapes`).
     fn place_escapes(&self, escapes: Vec<RenderNode>, host_clip: ClipShape) -> Vec<RenderNode> {
         if escapes.is_empty() {
             return escapes;
@@ -1976,7 +1983,10 @@ impl CompositorScroll {
         vec![clip_node(
             vec![host_clip],
             false,
-            wrap_with_transform(escapes, Affine2::translation(-self.offset.0, -self.offset.1)),
+            wrap_with_transform_forced(
+                escapes,
+                Affine2::translation(-self.offset.0, -self.offset.1),
+            ),
         )]
     }
 }

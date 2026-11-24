@@ -7825,13 +7825,13 @@ fn slot_scrollbar_thumb_press_y(
 ) -> Option<Listener> {
     let (_, scrollbar_y) = live_scrollbar_nodes_for_element(element, state?);
     let scrollbar = scrollbar_y?;
-    Some(scrollbar_press_listener(
+    scrollbar_press_listener(
         element,
         state,
         scrollbar,
         ScrollbarHitArea::Thumb,
         scrollbar.thumb_rect,
-    ))
+    )
 }
 
 fn slot_scrollbar_thumb_press_x(
@@ -7840,13 +7840,13 @@ fn slot_scrollbar_thumb_press_x(
 ) -> Option<Listener> {
     let (scrollbar_x, _) = live_scrollbar_nodes_for_element(element, state?);
     let scrollbar = scrollbar_x?;
-    Some(scrollbar_press_listener(
+    scrollbar_press_listener(
         element,
         state,
         scrollbar,
         ScrollbarHitArea::Thumb,
         scrollbar.thumb_rect,
-    ))
+    )
 }
 
 fn slot_scrollbar_track_press_y(
@@ -7855,13 +7855,13 @@ fn slot_scrollbar_track_press_y(
 ) -> Option<Listener> {
     let (_, scrollbar_y) = live_scrollbar_nodes_for_element(element, state?);
     let scrollbar = scrollbar_y?;
-    Some(scrollbar_press_listener(
+    scrollbar_press_listener(
         element,
         state,
         scrollbar,
         ScrollbarHitArea::Track,
         scrollbar.track_rect,
-    ))
+    )
 }
 
 fn slot_scrollbar_track_press_x(
@@ -7870,13 +7870,13 @@ fn slot_scrollbar_track_press_x(
 ) -> Option<Listener> {
     let (scrollbar_x, _) = live_scrollbar_nodes_for_element(element, state?);
     let scrollbar = scrollbar_x?;
-    Some(scrollbar_press_listener(
+    scrollbar_press_listener(
         element,
         state,
         scrollbar,
         ScrollbarHitArea::Track,
         scrollbar.track_rect,
-    ))
+    )
 }
 
 fn scrollbar_press_listener(
@@ -7885,10 +7885,13 @@ fn scrollbar_press_listener(
     scrollbar: ScrollbarNode,
     area: ScrollbarHitArea,
     rect: Rect,
-) -> Listener {
-    let region = pointer_region_for_subregion(state.expect("scrollbar press needs state"), rect)
-        .expect("scrollbar press needs interaction");
-    Listener {
+) -> Option<Listener> {
+    // One Raven patch: a scroll container that is not visible (a list
+    // scrolled out of the page it is in) has no scrollbar to press. This
+    // expected a region and panicked the tree actor mid-scroll, which took
+    // the renderer down for good.
+    let region = pointer_region_for_subregion(state?, rect)?;
+    Some(Listener {
         element_id: Some(element.id),
         matcher: ListenerMatcher::CursorButtonLeftPressInside { region },
         compute: ListenerCompute::ScrollbarPressToRuntime {
@@ -7905,7 +7908,7 @@ fn scrollbar_press_listener(
                 screen_to_local: scrollbar.screen_to_local,
             },
         },
-    }
+    })
 }
 
 /// Build primary left-press listener.
@@ -15288,6 +15291,38 @@ mod tests {
             ListenerAction::TreeMsg(TreeMsg::ScrollbarThumbDragY { element_id, .. })
                 if *element_id == NodeId::from_term_bytes(vec![47])
         )));
+    }
+
+    // One Raven patch: a scroll container that is not visible (a list
+    // scrolled out of the page it is in) gets no scrollbar press listener;
+    // building one panicked the tree actor.
+    #[test]
+    fn an_invisible_scroll_container_has_no_scrollbar_press_listener() {
+        let attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(20.0),
+            ..Attrs::default()
+        };
+        let element = with_frame(
+            with_interaction(make_element(48, attrs), true),
+            Frame {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 50.0,
+                content_width: 100.0,
+                content_height: 200.0,
+            },
+        );
+        let mut state = crate::tree::scene::resolve_node_state(
+            &element,
+            crate::tree::scene::SceneContext::default(),
+        )
+        .unwrap();
+        assert!(crate::events::registry_builder::slot_scrollbar_thumb_press_y(&element, Some(&state)).is_some());
+        state.visible = false;
+        assert!(crate::events::registry_builder::slot_scrollbar_thumb_press_y(&element, Some(&state)).is_none());
+        assert!(crate::events::registry_builder::slot_scrollbar_track_press_y(&element, Some(&state)).is_none());
     }
 
     #[test]
