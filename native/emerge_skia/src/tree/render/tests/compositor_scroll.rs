@@ -315,3 +315,92 @@ fn a_change_rasterizes_only_the_tiles_it_touches() {
     );
     assert_eq!(rgba_at(&pixels, 100, 50, 25), (255, 0, 0, 255));
 }
+
+// One Raven patch: content painted after an overlay (here, over a looping
+// layer) is drawn over it, through the tiles as directly.
+#[test]
+fn tiles_keep_later_content_over_an_overlay() {
+    use crate::render_scene::{
+        AnimatedBase, LayerRendererAnimation, PaintLayerId, PaintLayerPlacement, PaintLayerPolicy,
+        RenderPaintLayerBuildParts, RenderPaintLayerContent,
+    };
+    use crate::tree::animation::{AnimationCurve, AnimationRepeat, AnimationSpec};
+    use crate::tree::geometry::Rect;
+    use crate::tree::transform::Affine2;
+    let rect = |x: f32, y: f32, w: f32, h: f32, color: u32| {
+        RenderNode::Primitive(crate::render_scene::DrawPrimitive::Rect(
+            x,
+            y,
+            w,
+            h,
+            crate::render_color::RenderColor::from(color),
+        ))
+    };
+    let layer = |id: u64, role: PaintLayerReason, bounds: Rect, nodes: Vec<RenderNode>| {
+        RenderPaintLayer::from_prepared_children(
+            RenderPaintLayerBuildParts {
+                id: PaintLayerId::new(id, role),
+                bounds,
+                placement: PaintLayerPlacement::ScrollMoving,
+                policy: PaintLayerPolicy::Cacheable,
+                content_generation: 1,
+                visual_bounds: None,
+            },
+            RenderPaintLayerContent::from_composition_nodes(nodes),
+        )
+    };
+    let mut spinner = layer(
+        9,
+        PaintLayerReason::Animation,
+        Rect { x: 50.0, y: 50.0, width: 40.0, height: 40.0 },
+        vec![rect(50.0, 50.0, 40.0, 40.0, 0xff0000ff)],
+    );
+    spinner.renderer_animation = Some(std::sync::Arc::new(LayerRendererAnimation {
+        spec: std::sync::Arc::new(AnimationSpec {
+            keyframes: vec![
+                crate::tree::attrs::Attrs { rotate: Some(0.0), ..Default::default() },
+                crate::tree::attrs::Attrs { rotate: Some(360.0), ..Default::default() },
+            ],
+            duration_ms: 1000.0,
+            curve: AnimationCurve::Linear,
+            repeat: AnimationRepeat::Loop,
+        }),
+        started_at: std::time::Instant::now(),
+        revision: 0,
+        frame: Default::default(),
+        base: AnimatedBase::default(),
+        current_transform: Affine2::identity(),
+        current_alpha: 1.0,
+        offset: (0.0, 0.0),
+        bounds_transform: Affine2::identity(),
+    }));
+    let content = layer(
+        1,
+        PaintLayerReason::ScrollContent,
+        Rect { x: 0.0, y: 0.0, width: 600.0, height: 900.0 },
+        vec![
+            rect(0.0, 0.0, 600.0, 900.0, 0x808080ff),
+            RenderNode::PaintLayer(spinner),
+            // Later, over the spinner.
+            rect(60.0, 60.0, 20.0, 20.0, 0x0000ffff),
+            rect(0.0, 700.0, 600.0, 50.0, 0x00ff00ff),
+        ],
+    );
+    let scene = || RenderScene {
+        scroll_fling: None,
+        fonts: None,
+        images: None,
+        nodes: vec![RenderNode::Transform {
+            transform: Affine2::translation(0.0, -10.0),
+            children: vec![RenderNode::PaintLayer(content.clone())],
+        }],
+    };
+    let mut renderer = tiled_renderer();
+    let tiled =
+        super::pipeline::render_scene_with_renderer_to_pixels_and_timings(&mut renderer, scene(), 600, 800).0;
+    let direct = render_scene_to_pixels(600, 800, scene());
+    assert_close(&tiled, &direct, "overlay under later content");
+    assert_eq!(rgba_at(&tiled, 600, 70, 60), (0, 0, 255, 255));
+    let counts = renderer.scroll_tile_counts();
+    assert!(counts.drawn > 0 && counts.direct > 0, "{counts:?}");
+}

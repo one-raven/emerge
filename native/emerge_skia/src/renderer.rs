@@ -4623,6 +4623,12 @@ trait RenderTraversalMode<'video> {
         eligibility: MovingLayerEligibility,
         instrumentation: &mut I,
     );
+
+    /// One Raven patch: whether to go into these grouped content nodes (a
+    /// mode that draws only part of a layer skips the rest).
+    fn visits(&self, _children: &[RenderPaintLayerContentNode]) -> bool {
+        true
+    }
 }
 
 struct RenderClipScope<'a> {
@@ -5884,6 +5890,12 @@ impl SceneRenderer {
                         instrumentation,
                     );
                 }
+                RenderPaintLayerContentNode::ShadowPass { children }
+                | RenderPaintLayerContentNode::Clip { children, .. }
+                | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+                | RenderPaintLayerContentNode::Transform { children, .. }
+                | RenderPaintLayerContentNode::Alpha { children, .. }
+                    if !mode.visits(children) => {}
                 RenderPaintLayerContentNode::ShadowPass { children } => {
                     Self::render_paint_layer_content_in_mode(
                         canvas,
@@ -7376,14 +7388,10 @@ impl<'video> RenderTraversalMode<'video> for CacheTrackingRenderMode<'_, '_> {
                     }
                     if let Some(overlays) = overlays {
                         canvas.save();
-                        if !direct.is_empty() {
-                            canvas.reset_matrix();
-                            canvas.clip_region(&region, skia_safe::ClipOp::Difference);
-                            canvas.set_matrix(&matrix);
-                        }
                         let mut mode = scroll_tiles::OverlayMode {
                             inner: self,
                             overlays: &overlays,
+                            direct: &direct,
                         };
                         SceneRenderer::render_paint_layer_content_in_mode(
                             canvas,

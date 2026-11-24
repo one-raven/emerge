@@ -100,6 +100,22 @@ struct TileInfo {
 pub(super) struct Overlays {
     pub(super) layers: HashSet<PaintLayerId>,
     pub(super) runs: HashSet<usize>,
+    /// One Raven patch: grouped content holding any of them (by the address
+    /// of its node list), the only content the overlay pass goes into.
+    pub(super) paths: HashSet<usize>,
+}
+
+impl Overlays {
+    /// Index `layers` in `nodes`: the runs and grouped content holding them.
+    fn index(nodes: &[RenderPaintLayerContentNode], layers: HashSet<PaintLayerId>) -> Self {
+        let mut overlays = Self {
+            layers,
+            runs: HashSet::new(),
+            paths: HashSet::new(),
+        };
+        overlay_runs(nodes, None, &overlays.layers, &mut overlays.runs, &mut overlays.paths);
+        overlays
+    }
 }
 
 struct TilePlan {
@@ -132,6 +148,30 @@ struct PlanBuilder {
     /// (id, bounds, run holding it), until something painted later overlaps.
     candidates: Vec<(PaintLayerId, GeometryRect, Option<usize>, bool)>,
     run: Option<usize>,
+    /// One Raven patch: the clip so far, in the layer's space (axis-aligned
+    /// bounds of the clip shapes); a dynamic layer cannot draw outside it.
+    clip: Option<GeometryRect>,
+}
+
+impl PlanBuilder {
+    /// Run `inside` with `clips` (in `transform`'s space) added to the clip.
+    fn clipped(&mut self, clips: &[ClipShape], transform: Affine2, inside: impl FnOnce(&mut Self)) {
+        let outer = self.clip;
+        for clip in clips {
+            let rect = transform.map_rect_aabb(clip.rect);
+            self.clip = Some(match self.clip {
+                Some(current) => current.intersect(rect).unwrap_or(GeometryRect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: 0.0,
+                    height: 0.0,
+                }),
+                None => rect,
+            });
+        }
+        inside(self);
+        self.clip = outer;
+    }
 }
 
 fn mix(hash: u64, value: u64) -> u64 {
@@ -160,14 +200,45 @@ impl PlanBuilder {
         Some((clamp(c0), clamp(r0), clamp(c1), clamp(r1)))
     }
 
+    fn mark_dynamic(&mut self, rect: GeometryRect) {
+        let Some((c0, r0, c1, r1)) = self.tile_range(rect) else {
+            return;
+        };
+        if (c1 - c0) > 256 || (r1 - r0) > 4096 {
+            return;
+        }
+        for row in r0..=r1 {
+            for col in c0..=c1 {
+                self.tiles.entry((col, row)).or_default().dynamic = true;
+            }
+        }
+    }
+
     fn leaf(&mut self, bounds: GeometryRect, hash: u64, dynamic: bool) {
         self.leaves += 1;
-        // Painted after a would-be overlay and under where it moves: the
-        // overlay would draw over it, so that layer goes through the tiles.
+        // Painted after an overlay and over where it can draw: the overlay
+        // would draw over it, so the tiles they share are drawn the ordinary
+        // way, in paint order, and the overlay is left out of them. One Raven
+        // patch: only those tiles. The whole overlay went through the tiles,
+        // so the label under a music equaliser made every tile the equaliser
+        // could reach dynamic.
+        // A nested scroller is large and draws from its own tiles: it goes
+        // through the tiles whole instead, as before.
+        let mut shared = Vec::new();
         for candidate in &mut self.candidates {
-            if candidate.3 && candidate.1.intersect(bounds).is_some() {
-                candidate.3 = false;
+            if !candidate.3 {
+                continue;
             }
+            if let Some(rect) = candidate.1.intersect(bounds) {
+                if candidate.0.role == PaintLayerReason::ScrollContent {
+                    candidate.3 = false;
+                } else {
+                    shared.push(rect);
+                }
+            }
+        }
+        for rect in shared {
+            self.mark_dynamic(rect);
         }
         let Some((c0, r0, c1, r1)) = self.tile_range(bounds) else {
             return;
@@ -205,22 +276,80 @@ fn layer_moves_alone(layer: &RenderPaintLayer) -> bool {
 }
 
 /// Conservative bounds of a dynamic child layer in the parent's space. A
-/// renderer-driven animation may turn or move the layer, so it covers the
-/// layer's circumscribed square grown by its size.
-fn dynamic_layer_bounds(layer: &RenderPaintLayer, transform: Affine2) -> GeometryRect {
+/// renderer-driven animation that only moves the layer covers its bounds
+/// grown by the moves' range on each axis (the curves never overshoot a
+/// keyframe); one that may turn or scale it covers the layer's circumscribed
+/// square grown by its size. One Raven patch: both within the clip it is
+/// drawn in. The square around each bar of a music equaliser overlapped its
+/// neighbours and the text under it, so every tile it touched was drawn
+/// directly each frame (33 of 39 on the Media page).
+fn dynamic_layer_bounds(
+    layer: &RenderPaintLayer,
+    transform: Affine2,
+    clip: Option<GeometryRect>,
+) -> GeometryRect {
     let bounds = transform.map_rect_aabb(layer.bounds);
-    if layer.renderer_animation.is_none() {
-        return bounds;
+    let motion = match &layer.renderer_animation {
+        None => bounds,
+        Some(animation) => match translation_range(animation) {
+            Some((dx, dy)) => {
+                let rx = dx * (transform.xx.abs() + transform.xy.abs());
+                let ry = dy * (transform.yx.abs() + transform.yy.abs());
+                GeometryRect {
+                    x: bounds.x - rx,
+                    y: bounds.y - ry,
+                    width: bounds.width + 2.0 * rx,
+                    height: bounds.height + 2.0 * ry,
+                }
+            }
+            None => {
+                let cx = bounds.x + bounds.width / 2.0;
+                let cy = bounds.y + bounds.height / 2.0;
+                let radius =
+                    (bounds.width.hypot(bounds.height)) / 2.0 + bounds.width.max(bounds.height);
+                GeometryRect {
+                    x: cx - radius,
+                    y: cy - radius,
+                    width: radius * 2.0,
+                    height: radius * 2.0,
+                }
+            }
+        },
+    };
+    match clip {
+        Some(clip) => motion.intersect(clip).unwrap_or(GeometryRect {
+            x: motion.x,
+            y: motion.y,
+            width: 0.0,
+            height: 0.0,
+        }),
+        None => motion,
     }
-    let cx = bounds.x + bounds.width / 2.0;
-    let cy = bounds.y + bounds.height / 2.0;
-    let radius = (bounds.width.hypot(bounds.height)) / 2.0 + bounds.width.max(bounds.height);
-    GeometryRect {
-        x: cx - radius,
-        y: cy - radius,
-        width: radius * 2.0,
-        height: radius * 2.0,
+}
+
+/// How far a renderer-driven animation that only moves its layer can move it
+/// on each axis: the range of its keyframes' moves. None if it turns or
+/// scales, or the element is turned.
+fn translation_range(animation: &crate::render_scene::LayerRendererAnimation) -> Option<(f32, f32)> {
+    let base = animation.base;
+    if base.rotate.is_some_and(|r| r != 0.0) || base.layout_rotate.is_some_and(|r| r != 0.0) {
+        return None;
     }
+    let mut x = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut y = (f64::INFINITY, f64::NEG_INFINITY);
+    for keyframe in &animation.spec.keyframes {
+        if keyframe.rotate.is_some() || keyframe.scale.is_some() {
+            return None;
+        }
+        let mx = keyframe.move_x.or(base.move_x).unwrap_or(0.0);
+        let my = keyframe.move_y.or(base.move_y).unwrap_or(0.0);
+        x = (x.0.min(mx), x.1.max(mx));
+        y = (y.0.min(my), y.1.max(my));
+    }
+    if !(x.0.is_finite() && y.0.is_finite()) {
+        return None;
+    }
+    Some(((x.1 - x.0) as f32, (y.1 - y.0) as f32))
 }
 
 fn plan_content(
@@ -242,12 +371,11 @@ fn plan_content(
             RenderPaintLayerContentNode::ShadowPass { children } => {
                 plan_content(builder, children, transform, mix(context, 1))
             }
-            RenderPaintLayerContentNode::Clip { clips, children } => plan_content(
-                builder,
-                children,
-                transform,
-                clip_context(context, clips, 2),
-            ),
+            RenderPaintLayerContentNode::Clip { clips, children } => {
+                builder.clipped(clips, transform, |builder| {
+                    plan_content(builder, children, transform, clip_context(context, clips, 2))
+                })
+            }
             RenderPaintLayerContentNode::RelaxedClip { clips, children } => plan_content(
                 builder,
                 children,
@@ -280,7 +408,7 @@ fn plan_layer(
     context: u64,
 ) {
     if layer_is_dynamic(layer) {
-        let bounds = dynamic_layer_bounds(layer, transform);
+        let bounds = dynamic_layer_bounds(layer, transform, builder.clip);
         if layer_moves_alone(layer) {
             builder.leaves += 1;
             builder
@@ -307,12 +435,9 @@ fn plan_nodes(builder: &mut PlanBuilder, nodes: &[RenderNode], transform: Affine
             RenderNode::ShadowPass { children } => {
                 plan_nodes(builder, children, transform, mix(context, 1))
             }
-            RenderNode::Clip { clips, children } => plan_nodes(
-                builder,
-                children,
-                transform,
-                clip_context(context, clips, 2),
-            ),
+            RenderNode::Clip { clips, children } => builder.clipped(clips, transform, |builder| {
+                plan_nodes(builder, children, transform, clip_context(context, clips, 2))
+            }),
             RenderNode::RelaxedClip { clips, children } => plan_nodes(
                 builder,
                 children,
@@ -357,30 +482,42 @@ fn plan_nodes(builder: &mut PlanBuilder, nodes: &[RenderNode], transform: Affine
 
 /// One Raven patch: the runs `make_plan` would record for `layers` (each
 /// overlay's innermost run), without the rest of a plan.
+/// Whether `nodes` hold any of `layers`; records the runs and grouped
+/// content (`Overlays::paths`) on the way.
 fn overlay_runs(
     nodes: &[RenderPaintLayerContentNode],
     run: Option<usize>,
     layers: &HashSet<PaintLayerId>,
     out: &mut HashSet<usize>,
-) {
+    paths: &mut HashSet<usize>,
+) -> bool {
+    let mut found = false;
     for node in nodes {
-        match node {
+        found |= match node {
             RenderPaintLayerContentNode::Own(own) => overlay_runs_in_nodes(
                 &own.nodes,
                 Some(Arc::as_ptr(&own.nodes) as usize),
                 layers,
                 out,
+                paths,
             ),
-            RenderPaintLayerContentNode::Child(layer) => overlay_runs_in_layer(layer, run, layers, out),
+            RenderPaintLayerContentNode::Child(layer) => {
+                overlay_runs_in_layer(layer, run, layers, out, paths)
+            }
             RenderPaintLayerContentNode::ShadowPass { children }
             | RenderPaintLayerContentNode::Clip { children, .. }
             | RenderPaintLayerContentNode::RelaxedClip { children, .. }
             | RenderPaintLayerContentNode::Transform { children, .. }
             | RenderPaintLayerContentNode::Alpha { children, .. } => {
-                overlay_runs(children, run, layers, out)
+                let inside = overlay_runs(children, run, layers, out, paths);
+                if inside {
+                    paths.insert(children.as_ptr() as usize);
+                }
+                inside
             }
-        }
+        };
     }
+    found
 }
 
 fn overlay_runs_in_layer(
@@ -388,16 +525,20 @@ fn overlay_runs_in_layer(
     run: Option<usize>,
     layers: &HashSet<PaintLayerId>,
     out: &mut HashSet<usize>,
-) {
+    paths: &mut HashSet<usize>,
+) -> bool {
     if layer_is_dynamic(layer) {
-        if layers.contains(&layer.id)
-            && let Some(run) = run
-        {
+        let overlay = layers.contains(&layer.id);
+        if overlay && let Some(run) = run {
             out.insert(run);
         }
-        return;
+        return overlay;
     }
-    overlay_runs(&layer.content.nodes, run, layers, out);
+    let inside = overlay_runs(&layer.content.nodes, run, layers, out, paths);
+    if inside {
+        paths.insert(layer.content.nodes.as_ptr() as usize);
+    }
+    inside
 }
 
 fn overlay_runs_in_nodes(
@@ -405,18 +546,23 @@ fn overlay_runs_in_nodes(
     run: Option<usize>,
     layers: &HashSet<PaintLayerId>,
     out: &mut HashSet<usize>,
-) {
+    paths: &mut HashSet<usize>,
+) -> bool {
+    let mut found = false;
     for node in nodes {
-        match node {
+        found |= match node {
             RenderNode::ShadowPass { children }
             | RenderNode::Clip { children, .. }
             | RenderNode::RelaxedClip { children, .. }
             | RenderNode::Transform { children, .. }
-            | RenderNode::Alpha { children, .. } => overlay_runs_in_nodes(children, run, layers, out),
-            RenderNode::PaintLayer(layer) => overlay_runs_in_layer(layer, run, layers, out),
-            RenderNode::Primitive(_) => {}
-        }
+            | RenderNode::Alpha { children, .. } => {
+                overlay_runs_in_nodes(children, run, layers, out, paths)
+            }
+            RenderNode::PaintLayer(layer) => overlay_runs_in_layer(layer, run, layers, out, paths),
+            RenderNode::Primitive(_) => false,
+        };
     }
+    found
 }
 
 fn clip_context(context: u64, clips: &[ClipShape], tag: u64) -> u64 {
@@ -439,15 +585,13 @@ fn make_plan(layer: &RenderPaintLayer, scale: f32) -> TilePlan {
         leaves: 0,
         candidates: Vec::new(),
         run: None,
+        clip: None,
     };
     plan_content(&mut builder, &layer.content.nodes, Affine2::identity(), 0);
-    let mut overlays = Overlays::default();
-    for (id, bounds, run, overlay) in std::mem::take(&mut builder.candidates) {
+    let mut overlay_layers = HashSet::new();
+    for (id, bounds, _run, overlay) in std::mem::take(&mut builder.candidates) {
         if overlay {
-            overlays.layers.insert(id);
-            if let Some(run) = run {
-                overlays.runs.insert(run);
-            }
+            overlay_layers.insert(id);
         } else {
             // Its tiles are drawn the ordinary way, with it in place.
             let leaves = builder.leaves;
@@ -455,6 +599,7 @@ fn make_plan(layer: &RenderPaintLayer, scale: f32) -> TilePlan {
             builder.leaves = leaves;
         }
     }
+    let overlays = Overlays::index(&layer.content.nodes, overlay_layers);
     TilePlan {
         overlays: Arc::new(overlays),
         scale,
@@ -565,17 +710,10 @@ impl ScrollTiles {
                     && state.content.source.same_build(layer.content.source)
                     && state.plan.current(scale)
                 {
-                    let mut runs = HashSet::new();
-                    overlay_runs(
+                    state.plan.overlays = Arc::new(Overlays::index(
                         &layer.content.nodes,
-                        None,
-                        &state.plan.overlays.layers,
-                        &mut runs,
-                    );
-                    state.plan.overlays = Arc::new(Overlays {
-                        layers: state.plan.overlays.layers.clone(),
-                        runs,
-                    });
+                        state.plan.overlays.layers.clone(),
+                    ));
                     state.content = Arc::clone(&layer.content);
                 }
                 if !Arc::ptr_eq(&state.content, &layer.content) || !state.plan.current(scale) {
@@ -853,11 +991,20 @@ impl<'video> RenderTraversalMode<'video> for TileRasterMode<'_> {
 pub(super) struct OverlayMode<'a, M> {
     pub(super) inner: &'a mut M,
     pub(super) overlays: &'a Overlays,
+    /// Device rects drawn the ordinary way (with the overlays in them).
+    /// One Raven patch: each overlay is clipped out of only those it reaches;
+    /// clipping every overlay out of all of them made a complex clip, which
+    /// Skia applies through a software mask for every draw under it.
+    pub(super) direct: &'a [skia_safe::IRect],
 }
 
 impl<'video, M: RenderTraversalMode<'video>> RenderTraversalMode<'video> for OverlayMode<'_, M> {
     const TRACK_ELIGIBILITY: bool = false;
     const RENDER_PRIMITIVES: bool = false;
+
+    fn visits(&self, children: &[RenderPaintLayerContentNode]) -> bool {
+        self.overlays.paths.contains(&(children.as_ptr() as usize))
+    }
 
     fn render_paint_layer<I: DrawInstrumentation>(
         &mut self,
@@ -868,8 +1015,42 @@ impl<'video, M: RenderTraversalMode<'video>> RenderTraversalMode<'video> for Ove
         instrumentation: &mut I,
     ) {
         if self.overlays.layers.contains(&layer.id) {
-            self.inner
-                .render_paint_layer(canvas, layer, options, eligibility, instrumentation);
+            let local = dynamic_layer_bounds(layer, Affine2::identity(), None);
+            let reach = canvas
+                .local_to_device_as_3x3()
+                .map_rect(skia_safe::Rect::from_xywh(
+                    local.x,
+                    local.y,
+                    local.width,
+                    local.height,
+                ))
+                .0;
+            let mut region = skia_safe::Region::new();
+            for rect in self.direct {
+                if skia_safe::Rect::from(*rect).intersects(reach) {
+                    region.op_rect(*rect, skia_safe::region::RegionOp::Union);
+                }
+            }
+            if region.is_empty() {
+                self.inner
+                    .render_paint_layer(canvas, layer, options, eligibility, instrumentation);
+            } else {
+                let matrix = canvas.local_to_device();
+                canvas.save();
+                canvas.reset_matrix();
+                canvas.clip_region(&region, skia_safe::ClipOp::Difference);
+                canvas.set_matrix(&matrix);
+                self.inner
+                    .render_paint_layer(canvas, layer, options, eligibility, instrumentation);
+                canvas.restore();
+            }
+            return;
+        }
+        if !self
+            .overlays
+            .paths
+            .contains(&(layer.content.nodes.as_ptr() as usize))
+        {
             return;
         }
         SceneRenderer::render_paint_layer_content_in_mode(
@@ -1002,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn an_animated_layer_under_later_content_makes_its_tiles_dynamic() {
+    fn an_animated_layer_under_later_content_makes_the_shared_tiles_dynamic() {
         let content = layer(
             1,
             PaintLayerReason::ScrollContent,
@@ -1013,7 +1194,13 @@ mod tests {
             ],
         );
         let plan = make_plan(&content, 1.0);
-        assert!(plan.overlays.layers.is_empty());
+        // It stays an overlay; the tile it shares with the later content is
+        // drawn the ordinary way, in paint order.
+        assert!(
+            plan.overlays
+                .layers
+                .contains(&PaintLayerId::new(9, PaintLayerReason::Animation))
+        );
         assert!(plan.tiles.get(&(0, 0)).is_some_and(|tile| tile.dynamic));
         // Far away tiles hold nothing.
         assert!(!plan.tiles.contains_key(&(0, 8)));
@@ -1035,6 +1222,57 @@ mod tests {
         let after = make_plan(&base(0x808080ff), 1.0);
         assert_eq!(before.tiles[&(0, 0)].key, after.tiles[&(0, 0)].key);
         assert_ne!(before.tiles[&(0, 2)].key, after.tiles[&(0, 2)].key);
+    }
+
+    // One Raven patch: bars that only move up and down inside their own
+    // clip boxes (a music equaliser) stay overlays though their neighbours
+    // and the text under them are painted after them.
+    #[test]
+    fn moving_bars_in_clip_boxes_stay_overlays() {
+        let bar = |id: u64, x: f32| {
+            let mut bar = layer(id, PaintLayerReason::Animation, vec![rect(x, 140.0, 6.0, 40.0, 0xff0000ff)]);
+            bar.bounds = GeometryRect { x, y: 140.0, width: 6.0, height: 40.0 };
+            bar.renderer_animation = Some(Arc::new(LayerRendererAnimation {
+                spec: Arc::new(AnimationSpec {
+                    keyframes: vec![
+                        crate::tree::attrs::Attrs { move_y: Some(0.0), ..Default::default() },
+                        crate::tree::attrs::Attrs { move_y: Some(-40.0), ..Default::default() },
+                    ],
+                    duration_ms: 800.0,
+                    curve: AnimationCurve::EaseInOut,
+                    repeat: AnimationRepeat::Loop,
+                }),
+                started_at: Instant::now(),
+                revision: 0,
+                frame: Default::default(),
+                base: AnimatedBase::default(),
+                current_transform: Affine2::identity(),
+                current_alpha: 1.0,
+                offset: (0.0, 0.0),
+                bounds_transform: Affine2::identity(),
+            }));
+            RenderNode::Clip {
+                clips: vec![ClipShape {
+                    rect: GeometryRect { x, y: 140.0, width: 6.0, height: 40.0 },
+                    radii: None,
+                }],
+                children: vec![RenderNode::PaintLayer(bar)],
+            }
+        };
+        let content = layer(
+            1,
+            PaintLayerReason::ScrollContent,
+            vec![
+                rect(0.0, 0.0, 1000.0, 600.0, 0x202020ff),
+                bar(21, 100.0),
+                bar(22, 110.0),
+                // A label just under the bars.
+                rect(90.0, 184.0, 200.0, 20.0, 0x404040ff),
+            ],
+        );
+        let plan = make_plan(&content, 1.0);
+        assert_eq!(plan.overlays.layers.len(), 2);
+        assert!(plan.tiles.values().all(|tile| !tile.dynamic));
     }
 
     // One Raven patch: content culled above (the scroll window moved down)
@@ -1145,7 +1383,7 @@ mod tests {
         }
         assert!(copy.source.same_build(content.content.source));
         let mut runs = HashSet::new();
-        overlay_runs(&copy.nodes, None, &plan.overlays.layers, &mut runs);
+        overlay_runs(&copy.nodes, None, &plan.overlays.layers, &mut runs, &mut HashSet::new());
         assert_eq!(runs.len(), plan.overlays.runs.len());
         assert!(runs.is_disjoint(&plan.overlays.runs));
     }
