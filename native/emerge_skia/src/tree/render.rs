@@ -586,6 +586,30 @@ fn build_element_subtree<R: RegistryTraversalSink>(
         return RenderSubtree::default();
     }
 
+    // One Raven patch: reuse this subtree's previous build when nothing in it
+    // changed and it is built in the same context. Upstream rebuilds every
+    // element on every animation frame, so one spinner costs as much as the
+    // whole screen. A transform animation invalidates only the animated
+    // element and its ancestors, so everything inside it is reused.
+    let element_cache_key = (!traversal.is_root)
+        .then(|| element_render_fragment_cache_key(tree, ix, element, &traversal, inherited))
+        .flatten();
+    if let Some(cache_key) = element_cache_key
+        && !(element.refresh.render_dirty || element.refresh.render_descendant_dirty)
+        && let Some(cached) = element
+            .refresh
+            .render_fragment_cache
+            .borrow()
+            .as_ref()
+            .filter(|cache| cache.key == cache_key)
+            .cloned()
+    {
+        registry.collect_registry_for_render_skipped_subtree(tree, ix);
+        let subtree = RenderSubtree::from_fragment_cache(&cached);
+        apply_subtree_outputs(outputs, &subtree);
+        return subtree;
+    }
+
     let host_registry = registry.visit_element(tree, element, scene_state.as_ref());
     let element_context = inherited.merge_with_attrs(attrs);
     let declared_animation = !traversal.is_root && element_has_declared_animation(element);
@@ -641,7 +665,22 @@ fn build_element_subtree<R: RegistryTraversalSink>(
     let inherited_host_clips = traversal.render_ctx.full_clip_shapes();
     let inherited_self_clip = traversal.render_ctx.nearest_self_clip();
 
-    let mut local = wrap_outer_shadow_nodes(outer_shadow_nodes, transform, traversal.render_ctx);
+    // One Raven patch: an element the renderer animates keeps explicit
+    // Transform/Alpha nodes even at identity, so the render thread can find
+    // and update them on the retained scene.
+    let renderer_animation = (declared_animation && !traversal.is_root)
+        .then(|| element.layout.renderer_animation.clone())
+        .flatten();
+    let force_wrappers = renderer_animation.is_some();
+
+    let mut local = if force_wrappers {
+        wrap_with_shadow_pass(wrap_with_clips(
+            wrap_with_transform_forced(outer_shadow_nodes, transform),
+            &traversal.render_ctx.shadow_clip_shapes(),
+        ))
+    } else {
+        wrap_outer_shadow_nodes(outer_shadow_nodes, transform, traversal.render_ctx)
+    };
     let mut normal_nodes = Vec::new();
     normal_nodes.extend(background_nodes);
     normal_nodes.extend(inset_shadow_nodes);
@@ -670,13 +709,15 @@ fn build_element_subtree<R: RegistryTraversalSink>(
     } else {
         inherited_host_clips.to_vec()
     };
-    let normal_nodes = if matches!(element.spec.kind, ElementKind::Image | ElementKind::Video) {
-        wrap_with_relaxed_clips(wrap_with_transform(normal_nodes, transform), &content_clips)
+    let wrap_transform = if force_wrappers {
+        wrap_with_transform_forced
     } else {
-        wrap_with_clips(
-            wrap_with_transform(normal_nodes, transform),
-            inherited_host_clips,
-        )
+        wrap_with_transform
+    };
+    let normal_nodes = if matches!(element.spec.kind, ElementKind::Image | ElementKind::Video) {
+        wrap_with_relaxed_clips(wrap_transform(normal_nodes, transform), &content_clips)
+    } else {
+        wrap_with_clips(wrap_transform(normal_nodes, transform), inherited_host_clips)
     };
     local.extend(normal_nodes);
 
@@ -696,11 +737,15 @@ fn build_element_subtree<R: RegistryTraversalSink>(
     }
 
     if declared_animation && !local.is_empty() {
-        local = wrap_with_compositor_animation_layer(
-            wrap_with_alpha(local, alpha),
-            element,
-            render_frame,
-        );
+        let wrapped = if force_wrappers {
+            wrap_with_alpha_forced(local, alpha)
+        } else {
+            wrap_with_alpha(local, alpha)
+        };
+        local = wrap_with_compositor_animation_layer(wrapped, element, render_frame);
+        if let Some(animation) = renderer_animation {
+            attach_renderer_animation(&mut local, animation, attrs, render_frame, transform, alpha);
+        }
     } else {
         local = wrap_with_alpha(local, alpha);
     }
@@ -716,12 +761,53 @@ fn build_element_subtree<R: RegistryTraversalSink>(
         escape_clips,
     );
 
-    RenderSubtree {
+    let subtree = RenderSubtree {
         local,
         escapes: wrap_with_alpha(escapes, alpha),
         text_input_focused: false,
         text_input_cursor_area: None,
+    };
+    if let Some(cache_key) = element_cache_key
+        && render_subtree_has_cacheable_fragment(&subtree)
+    {
+        element
+            .refresh
+            .render_fragment_cache
+            .borrow_mut()
+            .replace(subtree.to_fragment_cache(cache_key));
     }
+    subtree
+}
+
+// One Raven patch: the key for reusing an element's subtree. Everything the
+// build reads from outside the element: the nearby key's scroll offset, clips
+// and topology, plus the scene bounds (culling), interaction transform,
+// inherited font and traversal flags.
+fn element_render_fragment_cache_key(
+    tree: &ElementTree,
+    ix: NodeIx,
+    element: &Element,
+    traversal: &RenderTraversal<'_>,
+    inherited: &FontContext,
+) -> Option<RenderFragmentCacheKey> {
+    let mut key = nearby_render_fragment_cache_key(
+        tree,
+        ix,
+        element,
+        &traversal.scene_ctx,
+        traversal.render_ctx,
+    )?;
+    let mut hasher = DefaultHasher::new();
+    hasher.write_u64(key.context);
+    hash_rect_bits(&mut hasher, traversal.render_ctx.scene_bounds);
+    hasher.write(format!("{:?}", traversal.scene_ctx.interaction_transform).as_bytes());
+    hasher.write_usize(traversal.scene_ctx.interaction_clips.len());
+    hasher.write(format!("{:?}", inherited).as_bytes());
+    hasher.write_u8(traversal.disable_viewport_culling as u8);
+    hasher.write_u8(traversal.inside_cacheable_semantic_layer as u8);
+    key.kind = RenderFragmentCacheKind::Element;
+    key.context = hasher.finish();
+    Some(key)
 }
 
 fn wrap_semantic_scroll_content_layer(
@@ -882,6 +968,16 @@ fn offset_render_node(node: RenderNode, dx: f32, dy: f32) -> RenderNode {
             };
             let children = offset_render_nodes(layer.content_nodes(), dx, dy);
             let mut layer = layer.with_bounds_and_children(bounds, children);
+            // One Raven patch: the offset prepended a translation to this
+            // layer's Transform nodes; the renderer animation must match.
+            if let Some(animation) = layer.renderer_animation.as_mut() {
+                let animation = Arc::make_mut(animation);
+                animation.offset = (animation.offset.0 + dx, animation.offset.1 + dy);
+                animation.current_transform =
+                    Affine2::translation(dx, dy).then(animation.current_transform);
+                animation.bounds_transform =
+                    Affine2::translation(dx, dy).then(animation.bounds_transform);
+            }
             if layer.policy.allows_payload_cache() {
                 layer.content_generation = paint_layer_content_generation(
                     &layer.content.own_payload_render_nodes(),
@@ -1960,6 +2056,61 @@ fn wrap_with_transform(
         transform,
         children: nodes,
     }]
+}
+
+// One Raven patch: wrappers that always emit their node (see build_element_subtree).
+fn wrap_with_transform_forced(
+    nodes: Vec<RenderNode>,
+    transform: crate::tree::transform::Affine2,
+) -> Vec<RenderNode> {
+    if nodes.is_empty() {
+        return nodes;
+    }
+    vec![RenderNode::Transform {
+        transform,
+        children: nodes,
+    }]
+}
+
+fn wrap_with_alpha_forced(nodes: Vec<RenderNode>, alpha: f32) -> Vec<RenderNode> {
+    if nodes.is_empty() {
+        return nodes;
+    }
+    vec![RenderNode::Alpha {
+        alpha,
+        children: nodes,
+    }]
+}
+
+pub static RENDERER_ANIMATIONS_ATTACHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// One Raven patch: hand the render thread what it needs to re-evaluate this
+// element's transform and alpha at any time: the animation, the frame it
+// rotates and scales about, the element's non-animated values, and the values
+// the scene was built with (which identify the nodes to update).
+fn attach_renderer_animation(
+    nodes: &mut [RenderNode],
+    animation: super::animation::RendererDrivenAnimation,
+    attrs: &Attrs,
+    render_frame: Frame,
+    built_transform: crate::tree::transform::Affine2,
+    built_alpha: f32,
+) {
+    RENDERER_ANIMATIONS_ATTACHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(RenderNode::PaintLayer(layer)) = nodes.first_mut() {
+        layer.renderer_animation = Some(Arc::new(crate::render_scene::LayerRendererAnimation {
+            spec: animation.spec,
+            started_at: animation.started_at,
+            revision: animation.revision,
+            frame: render_frame,
+            base: attrs.clone(),
+            current_transform: built_transform,
+            current_alpha: built_alpha,
+            offset: (0.0, 0.0),
+            bounds_transform: built_transform,
+        }));
+    }
 }
 
 fn wrap_with_alpha(nodes: Vec<RenderNode>, alpha: f32) -> Vec<RenderNode> {

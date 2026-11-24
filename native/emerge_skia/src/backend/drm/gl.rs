@@ -3412,6 +3412,12 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
 
                 let first_presented_at = Instant::now();
                 let mut production = FrameProduction::default();
+                let mut renderer_animations_active = false;
+                let mut damage_history: std::collections::VecDeque<Option<crate::tree::geometry::Rect>> =
+                    std::collections::VecDeque::new();
+                let mut last_drawn_scene_version: Option<u64> = None;
+                let mut last_prepare_at = Instant::now();
+                let mut last_stall_log_at = Instant::now();
                 render_state.animation_frame.observed(first_presented_at);
                 production.submitted(render_state.animation_frame.clone(), first_presented_at + frame_interval);
                 // The blocking modeset already displayed generation zero. Only
@@ -3421,6 +3427,14 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                     |frame| frame.video_needs_cleanup || !frame.video_sync_succeeded,
                 ));
                 let mut committed_primary_generation = 0u64;
+                // One Raven patch: the blocking modeset showed the first frame
+                // without a flip event, so start renderer-driven animations here.
+                renderer_animations_active = render_state
+                    .advance_renderer_animations(first_presented_at + frame_interval)
+                    .found;
+                if renderer_animations_active {
+                    desired_primary_generation = desired_primary_generation.wrapping_add(1);
+                }
                 let mut next_render_profile_at = Instant::now();
                 let mut cursor_snapshot = cursor_state.snapshot();
                 let mut cursor_pos = cursor_snapshot.state.pos;
@@ -3600,6 +3614,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
 
                                             frame.animation_frame.observed(presented_at);
                                             production.progress(predicted_next_present_at);
+
                                             if frame.animation_frame.active() {
                                                 follow_up_primary_until = Some(presented_at + FOLLOW_UP_PRIMARY_WINDOW);
                                             }
@@ -3677,6 +3692,17 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                 render_state.pipeline_submitted_at = pipeline_submitted_at;
                                 render_state.pipeline_render_queued_at = pipeline_render_queued_at;
                                 render_state.animate = animate;
+                                // One Raven patch: ask the tree for the next
+                                // animation sample as soon as this scene arrives,
+                                // so its refresh overlaps this scene's draw.
+                                // Upstream asks only after the atomic commit,
+                                // which serializes refresh + render per frame.
+                                // The post-commit request below then finds this
+                                // frame already requested and adds none.
+                                production.submitted(
+                                    animation_frame.clone(),
+                                    received_at + frame_interval * 2,
+                                );
                                 render_state.animation_frame = animation_frame;
                                 record_drm_pipeline_scene_received(
                                     stats.as_deref(),
@@ -3797,6 +3823,36 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                     // vblank. New camera submissions remain in the registry's latest-frame slot until
                     // that staged frame is committed; replacing it here would submit GPU work for frames
                     // that can never reach scanout and can delay the in-flight frame's implicit fence.
+                    // One Raven patch: while renderer-driven animations run,
+                    // keep exactly one frame in the pipeline. Re-arming here,
+                    // not on particular flip events, covers every path a flip
+                    // can arrive by.
+                    if renderer_animations_active
+                        && desired_primary_generation == committed_primary_generation
+                        && in_flight_primary_generation.is_none()
+                        && prepared_primary_generation.is_none()
+                    {
+                        desired_primary_generation = desired_primary_generation.wrapping_add(1);
+                    }
+                    // One Raven diagnostics: a renderer-driven animation that
+                    // has not been drawn for a while says why.
+                    if renderer_animations_active
+                        && last_prepare_at.elapsed() > Duration::from_millis(500)
+                        && last_stall_log_at.elapsed() > Duration::from_secs(2)
+                    {
+                        last_stall_log_at = Instant::now();
+                        native_log.warning(
+                            "drm",
+                            format!(
+                                "renderer animation stalled: desired={} committed={} in_flight={:?} prepared={:?} free_buffers={}",
+                                desired_primary_generation,
+                                committed_primary_generation,
+                                in_flight_primary_generation,
+                                prepared_primary_generation,
+                                gbm_surface.has_free_buffers(),
+                            ),
+                        );
+                    }
                     if should_prepare_primary(
                         desired_primary_generation,
                         committed_primary_generation,
@@ -3820,6 +3876,57 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                     stats.record_drm_scene_selected_for_draw();
                                 }
                                 last_selected_scene_version = Some(render_state.render_version);
+                            }
+                            // One Raven patch: renderer-driven animations
+                            // are sampled for this frame's expected scanout.
+                            last_prepare_at = Instant::now();
+                            let was_active = renderer_animations_active;
+                            let advance = render_state
+                                .advance_renderer_animations(now + frame_interval);
+                            renderer_animations_active = advance.found;
+                            // One Raven patch: partial redraw. A frame whose only
+                            // change is renderer-driven animation redraws its
+                            // damage, unioned over the frames this back buffer
+                            // missed (EGL buffer age); anything else, full.
+                            let animation_only = advance.found
+                                && last_drawn_scene_version == Some(render_state.render_version)
+                                && !cursor_visible
+                                && render_state.video_target_ids.is_empty();
+                            damage_history.push_front(if animation_only { advance.damage } else { None });
+                            damage_history.truncate(4);
+                            let buffer_age = egl_surface_attribute(
+                                &egl_state.egl,
+                                egl_state.display,
+                                egl_state.surface,
+                                0x313D, // EGL_BUFFER_AGE_EXT
+                            )
+                            .unwrap_or(0);
+                            render_state.damage = if buffer_age >= 1
+                                && (buffer_age as usize) <= damage_history.len()
+                            {
+                                damage_history
+                                    .iter()
+                                    .take(buffer_age as usize)
+                                    .try_fold(None, |acc: Option<crate::tree::geometry::Rect>, d| {
+                                        d.map(|d| crate::render_scene::union_damage(acc, d))
+                                    })
+                                    .flatten()
+                            } else {
+                                None
+                            };
+                            last_drawn_scene_version = Some(render_state.render_version);
+                            if was_active != renderer_animations_active {
+                                native_log.info(
+                                    "drm",
+                                    format!(
+                                        "renderer animations active={} (tree samples={}, attached={})",
+                                        renderer_animations_active,
+                                        crate::tree::animation::RENDERER_DRIVEN_SAMPLES
+                                            .load(std::sync::atomic::Ordering::Relaxed),
+                                        crate::tree::render::RENDERER_ANIMATIONS_ATTACHED
+                                            .load(std::sync::atomic::Ordering::Relaxed),
+                                    ),
+                                );
                             }
                             match prepare_primary_frame(
                                 desired_primary_generation,
@@ -3864,6 +3971,10 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                     }
                                 }
                                 Err(err) => {
+                                    native_log.error(
+                                        "drm",
+                                        format!("DRM backend unavailable: frame preparation failed: {err}"),
+                                    );
                                     eprintln!("DRM backend unavailable: {err}");
                                     break;
                                 }

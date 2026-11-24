@@ -377,6 +377,221 @@ pub struct RenderPaintLayer {
     pub content_generation: u64,
     pub content: Arc<RenderPaintLayerContent>,
     pub metrics: RenderPaintLayerMetrics,
+    /// One Raven patch: set when the render thread animates this layer.
+    pub renderer_animation: Option<Arc<LayerRendererAnimation>>,
+}
+
+/// One Raven patch: a looping transform/alpha animation the render thread
+/// samples itself. The current_* fields are the values the layer's Transform/Alpha
+/// nodes hold now; each advance finds those nodes by value and replaces them.
+#[derive(Clone, Debug)]
+pub struct LayerRendererAnimation {
+    pub spec: Arc<crate::tree::animation::AnimationSpec>,
+    pub started_at: std::time::Instant,
+    pub revision: u64,
+    pub frame: crate::tree::element::Frame,
+    pub base: crate::tree::attrs::Attrs,
+    pub current_transform: Affine2,
+    pub current_alpha: f32,
+    /// Translation scroll layers prepend to the element's transform.
+    pub offset: (f32, f32),
+    /// The transform the layer's bounds were measured under.
+    pub bounds_transform: Affine2,
+}
+
+/// One Raven patch: result of advancing renderer-driven animations.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RendererAnimationAdvance {
+    pub found: bool,
+    /// Scene area whose pixels changed since the previous advance.
+    pub damage: Option<Rect>,
+}
+
+fn union_damage_rect(a: Option<Rect>, b: Rect) -> Option<Rect> {
+    Some(match a {
+        None => b,
+        Some(a) => {
+            let x = a.x.min(b.x);
+            let y = a.y.min(b.y);
+            Rect {
+                x,
+                y,
+                width: (a.x + a.width).max(b.x + b.width) - x,
+                height: (a.y + a.height).max(b.y + b.height) - y,
+            }
+        }
+    })
+}
+
+pub fn union_damage(a: Option<Rect>, b: Rect) -> Option<Rect> {
+    union_damage_rect(a, b)
+}
+
+impl PartialEq for LayerRendererAnimation {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.spec, &other.spec)
+            && self.started_at == other.started_at
+            && self.revision == other.revision
+    }
+}
+
+impl LayerRendererAnimation {
+    /// The element's transform and alpha at : its own values with the
+    /// animation's sample laid over them, as the tree would compute them.
+    fn sample(&self, at: std::time::Instant) -> (Affine2, f32) {
+        let entry = crate::tree::animation::AnimationRuntimeEntry {
+            spec_hash: self.revision,
+            started_at: self.started_at,
+        };
+        let sample = crate::tree::animation::sample_animation_spec(&self.spec, Some(&entry), Some(at));
+        let mut attrs = self.base.clone();
+        crate::tree::animation::apply_sample_attrs(&mut attrs, &sample.attrs);
+        let transform = crate::tree::transform::element_transform(self.frame, &attrs);
+        let transform = if self.offset == (0.0, 0.0) {
+            transform
+        } else {
+            Affine2::translation(self.offset.0, self.offset.1).then(transform)
+        };
+        (transform, attrs.alpha.unwrap_or(1.0) as f32)
+    }
+}
+
+impl RenderScene {
+    /// One Raven patch: move every renderer-driven animation in this scene to
+    /// time at, in place. Returns whether the scene has any, i.e. whether it
+    /// needs drawing again next vblank.
+    pub fn advance_renderer_animations(&mut self, at: std::time::Instant) -> RendererAnimationAdvance {
+        let mut advance = RendererAnimationAdvance::default();
+        advance_nodes(&mut self.nodes, at, &mut advance);
+        advance
+    }
+}
+
+fn advance_nodes(nodes: &mut [RenderNode], at: std::time::Instant, found: &mut RendererAnimationAdvance) {
+    for node in nodes.iter_mut() {
+        match node {
+            RenderNode::ShadowPass { children }
+            | RenderNode::Clip { children, .. }
+            | RenderNode::RelaxedClip { children, .. }
+            | RenderNode::Transform { children, .. }
+            | RenderNode::Alpha { children, .. } => advance_nodes(children, at, found),
+            RenderNode::PaintLayer(layer) => advance_layer(layer, at, found),
+            RenderNode::Primitive(_) => {}
+        }
+    }
+}
+
+fn layer_has_renderer_animation(layer: &RenderPaintLayer) -> bool {
+    layer.renderer_animation.is_some() || content_has_renderer_animation(&layer.content.nodes)
+}
+
+fn content_has_renderer_animation(nodes: &[RenderPaintLayerContentNode]) -> bool {
+    nodes.iter().any(|node| match node {
+        RenderPaintLayerContentNode::Own(_) => false,
+        RenderPaintLayerContentNode::Child(layer) => layer_has_renderer_animation(layer),
+        RenderPaintLayerContentNode::ShadowPass { children }
+        | RenderPaintLayerContentNode::Clip { children, .. }
+        | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+        | RenderPaintLayerContentNode::Transform { children, .. }
+        | RenderPaintLayerContentNode::Alpha { children, .. } => {
+            content_has_renderer_animation(children)
+        }
+    })
+}
+
+fn advance_layer(layer: &mut RenderPaintLayer, at: std::time::Instant, found: &mut RendererAnimationAdvance) {
+    // Copy-on-write only along paths that hold an animation; the rest of the
+    // scene stays shared with the tree.
+    if !layer_has_renderer_animation(layer) {
+        return;
+    }
+    found.found = true;
+    let patch = layer.renderer_animation.as_ref().map(|animation| {
+        let (transform, alpha) = animation.sample(at);
+        (animation.current_transform, animation.current_alpha, transform, alpha)
+    });
+    let content = Arc::make_mut(&mut layer.content);
+    if let Some((old_transform, old_alpha, transform, alpha)) = patch {
+        patch_content(&mut content.nodes, old_transform, transform, old_alpha, alpha);
+        if let Some(animation) = layer.renderer_animation.as_mut() {
+            let animation = Arc::make_mut(animation);
+            // Old and new screen area of this layer: its bounds were measured
+            // under bounds_transform; map them to each transform.
+            if let Some(inverse) = animation.bounds_transform.inverse() {
+                let before = old_transform.then(inverse).map_rect_aabb(layer.bounds);
+                let after = transform.then(inverse).map_rect_aabb(layer.bounds);
+                let pad = |r: Rect| Rect {
+                    x: r.x - 4.0,
+                    y: r.y - 4.0,
+                    width: r.width + 8.0,
+                    height: r.height + 8.0,
+                };
+                found.damage = union_damage_rect(found.damage, pad(before));
+                found.damage = union_damage_rect(found.damage, pad(after));
+            } else {
+                found.damage = None;
+            }
+            animation.current_transform = transform;
+            animation.current_alpha = alpha;
+        }
+    }
+    advance_content_children(&mut content.nodes, at, found);
+}
+
+// Replaces this layer's own Transform/Alpha nodes (not those of child layers,
+// which carry their own animations).
+fn patch_content(
+    nodes: &mut [RenderPaintLayerContentNode],
+    old_transform: Affine2,
+    transform: Affine2,
+    old_alpha: f32,
+    alpha: f32,
+) {
+    for node in nodes.iter_mut() {
+        match node {
+            RenderPaintLayerContentNode::Transform {
+                transform: t,
+                children,
+            } => {
+                if *t == old_transform {
+                    *t = transform;
+                }
+                patch_content(children, old_transform, transform, old_alpha, alpha);
+            }
+            RenderPaintLayerContentNode::Alpha { alpha: a, children } => {
+                if *a == old_alpha {
+                    *a = alpha;
+                }
+                patch_content(children, old_transform, transform, old_alpha, alpha);
+            }
+            RenderPaintLayerContentNode::ShadowPass { children }
+            | RenderPaintLayerContentNode::Clip { children, .. }
+            | RenderPaintLayerContentNode::RelaxedClip { children, .. } => {
+                patch_content(children, old_transform, transform, old_alpha, alpha)
+            }
+            RenderPaintLayerContentNode::Own(_) | RenderPaintLayerContentNode::Child(_) => {}
+        }
+    }
+}
+
+fn advance_content_children(
+    nodes: &mut [RenderPaintLayerContentNode],
+    at: std::time::Instant,
+    found: &mut RendererAnimationAdvance,
+) {
+    for node in nodes.iter_mut() {
+        match node {
+            RenderPaintLayerContentNode::Child(layer) => advance_layer(layer, at, found),
+            RenderPaintLayerContentNode::ShadowPass { children }
+            | RenderPaintLayerContentNode::Clip { children, .. }
+            | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+            | RenderPaintLayerContentNode::Transform { children, .. }
+            | RenderPaintLayerContentNode::Alpha { children, .. } => {
+                advance_content_children(children, at, found)
+            }
+            RenderPaintLayerContentNode::Own(_) => {}
+        }
+    }
 }
 
 impl RenderPaintLayer {
@@ -421,6 +636,7 @@ impl RenderPaintLayer {
             content_generation: parts.content_generation,
             content: Arc::new(content),
             metrics,
+            renderer_animation: None,
         }
     }
 
@@ -433,7 +649,7 @@ impl RenderPaintLayer {
     }
 
     pub(crate) fn with_bounds_and_children(&self, bounds: Rect, children: Vec<RenderNode>) -> Self {
-        Self::from_prepared_children(
+        let mut layer = Self::from_prepared_children(
             RenderPaintLayerBuildParts {
                 id: self.id,
                 bounds,
@@ -443,7 +659,10 @@ impl RenderPaintLayer {
                 visual_bounds: None,
             },
             RenderPaintLayerContent::from_composition_nodes(children),
-        )
+        );
+        // One Raven patch: a rebuilt layer keeps its renderer-driven animation.
+        layer.renderer_animation = self.renderer_animation.clone();
+        layer
     }
 
     pub(crate) fn child_layer_count(&self) -> usize {

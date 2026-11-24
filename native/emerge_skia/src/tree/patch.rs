@@ -1712,6 +1712,7 @@ fn clone_as_ghost(
             scrollbar_hover_axis: None,
         },
         layout: crate::tree::element::NodeLayoutState {
+            renderer_animation: None,
             dimension_samples: super::layout::dimensions::capture_ghost_samples(tree, old, id_map),
             dimension_facts,
             effective: attrs,

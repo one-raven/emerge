@@ -648,6 +648,8 @@ pub struct RenderFragmentCache {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderFragmentCacheKind {
     Nearby,
+    // One Raven patch: any clean element subtree (see tree/render.rs).
+    Element,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -711,6 +713,8 @@ pub struct InlineBox {
 
 #[derive(Clone, Debug)]
 pub struct NodeLayoutState {
+    /// One Raven patch: this element's animation is sampled by the renderer.
+    pub renderer_animation: Option<super::animation::RendererDrivenAnimation>,
     pub dimension_samples: Option<std::sync::Arc<super::layout::dimensions::DimensionSamples>>,
     pub dimension_facts: super::layout::dimensions::DimensionFacts,
     /// Scaled attributes (populated by layout pass, used by render).
@@ -748,6 +752,7 @@ pub struct NodeLayoutState {
 impl Default for NodeLayoutState {
     fn default() -> Self {
         Self {
+            renderer_animation: None,
             dimension_samples: None,
             dimension_facts: Default::default(),
             effective: Attrs::default(),
@@ -889,6 +894,7 @@ impl Element {
                 scrollbar_hover_axis: None,
             },
             layout: NodeLayoutState {
+                renderer_animation: None,
                 dimension_samples: None,
                 dimension_facts: Default::default(),
                 scroll_x: attrs.scroll_x.unwrap_or(0.0) as f32,
@@ -944,6 +950,7 @@ impl Element {
             spec: self.spec.clone(),
             runtime: self.runtime.clone(),
             layout: NodeLayoutState {
+                renderer_animation: self.layout.renderer_animation.clone(),
                 dimension_samples: self.layout.dimension_samples.clone(),
                 dimension_facts: self.layout.dimension_facts,
                 effective: self.layout.effective.clone(),

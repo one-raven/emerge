@@ -130,8 +130,24 @@ impl Clone for AnimationRuntime {
     }
 }
 
+/// One Raven patch diagnostics: renderer-driven samples taken by the tree.
+pub static RENDERER_DRIVEN_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One Raven patch: a looping, transform/alpha-only declared animation that
+/// the render thread samples itself, every vblank, on the retained scene. The
+/// tree publishes the element once and stops requesting animation frames for
+/// it, so it costs no scene rebuild.
+#[derive(Clone, Debug)]
+pub struct RendererDrivenAnimation {
+    pub spec: Arc<AnimationSpec>,
+    pub started_at: Instant,
+    pub revision: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AnimationSample {
+    /// One Raven patch: set when the render thread animates this element.
+    pub renderer_driven: Option<RendererDrivenAnimation>,
     pub attrs: Attrs,
     pub active: bool,
 }
@@ -167,7 +183,8 @@ pub(crate) struct AnimationFrameSamples {
 
 impl AnimationOverlayResult {
     fn record_sample(&mut self, id: NodeId, sample: &AnimationSample) {
-        self.active |= sample.active;
+        // One Raven patch: renderer-driven animations need no tree frames.
+        self.active |= sample.active && sample.renderer_driven.is_none();
         if let Some(effect) = animation_attrs_layout_effect(id, &sample.attrs) {
             self.record_effect(effect);
         }
@@ -1050,8 +1067,27 @@ fn sample_animation_for_element(
             .as_ref()
             .map(|spec| sample_animation_spec(spec, None, sample_time));
     };
-    selected_runs(element, Some(runtime), sample_time, false)
-        .into_iter()
+    let runs = selected_runs(element, Some(runtime), sample_time, false);
+    // One Raven patch: the element's only run is its own declared, looping,
+    // transform/alpha-only animation, so the renderer can sample it alone.
+    let renderer_driven = match runs.as_slice() {
+        [run]
+            if matches!(run.owner, groups::Owner::Regular)
+                && run.spec.repeat == AnimationRepeat::Loop
+                && animation_spec_is_compositor_only(run.spec)
+                && element.spec.declared.animate_enter.is_none()
+                && element.spec.declared.animate_exit.is_none()
+                && element.lifecycle.ghost_exit_animation.is_none() =>
+        {
+            Some(RendererDrivenAnimation {
+                spec: Arc::new(run.spec.clone()),
+                started_at: run.started,
+                revision: run.revision,
+            })
+        }
+        _ => None,
+    };
+    runs.into_iter()
         .fold(None, |result, run| {
             let clock = AnimationRuntimeEntry {
                 spec_hash: run.revision,
@@ -1089,6 +1125,10 @@ fn sample_animation_for_element(
             let mut result = result.unwrap_or_default();
             apply_sample_attrs(&mut result.attrs, &sample.attrs);
             result.active |= sample.active;
+            result.renderer_driven = renderer_driven.clone();
+            if renderer_driven.is_some() {
+                RENDERER_DRIVEN_SAMPLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             Some(result)
         })
 }
@@ -1428,6 +1468,7 @@ pub fn sample_animation_spec(
         )
     };
     AnimationSample {
+        renderer_driven: None,
         attrs,
         active: position.active,
     }

@@ -427,6 +427,7 @@ impl EndpointResolver {
                 (
                     *id,
                     super::super::animation::AnimationSample {
+                        renderer_driven: None,
                         attrs: node.attrs.clone(),
                         active: false,
                     },

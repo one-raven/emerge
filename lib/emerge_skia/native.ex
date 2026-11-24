@@ -81,7 +81,14 @@ defmodule EmergeSkia.Native do
           System.put_env("TARGET_ARCH", arch)
         end
 
-        @force_build EmergeSkia.BuildConfig.force_precompiled_build?(
+        # One Raven patch: this vendored copy carries performance patches in
+        # native/, so a firmware (Nerves target) build always compiles it
+        # rather than downloading stock upstream binaries. Laptop builds keep
+        # the precompiled host library. (Build env: mix/native.exs.)
+        @vendored_source_build Mix.target() != :host
+
+        @force_build @vendored_source_build or
+                       EmergeSkia.BuildConfig.force_precompiled_build?(
                        report_fallback: true,
                        checksum_path: @checksum_path,
                        compiled_backends: @compiled_backends,

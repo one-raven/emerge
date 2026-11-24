@@ -185,8 +185,31 @@ defmodule Emerge.Mix.Native do
 
     env
     |> append_env("SKIA_GN_ARGS", "skia_use_fontconfig=false skia_use_system_freetype2=false")
+    # One Raven patch: Skia archives with the cross toolchain's ar (macOS ar
+    # can't read the @rsp files GN writes), and cargo fetches the pinned
+    # rust-skia git revision with the git CLI (ssh insteadOf rewrites defeat
+    # libgit2's own fetch).
+    |> append_cross_ar(env)
+    |> Map.put_new("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
     |> append_env("RUSTFLAGS", "-Lnative=#{link_stubs}")
     |> Map.put_new("CARGO_PROFILE_RELEASE_STRIP", "symbols")
+  end
+
+  defp append_cross_ar(env, source) do
+    prefix =
+      source["CROSSCOMPILE"] ||
+        with cc when is_binary(cc) <- source["CC"] || System.get_env("CC"),
+             [cc | _] <- String.split(cc),
+             true <- String.ends_with?(cc, "-gcc"),
+             path when is_binary(path) <- System.find_executable(cc) do
+          String.trim_trailing(path, "-gcc")
+        else
+          _ -> nil
+        end
+
+    if prefix && File.exists?(prefix <> "-ar"),
+      do: append_env(env, "SKIA_GN_ARGS", ~s(ar="#{prefix}-ar")),
+      else: env
   end
 
   defp append_env(env, key, value) do

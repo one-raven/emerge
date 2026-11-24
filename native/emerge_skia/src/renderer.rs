@@ -75,6 +75,9 @@ pub struct RenderState {
     pub has_cacheable_paint_layers: bool,
     pub has_scroll_moving_paint_layers: bool,
     pub video_target_ids: HashSet<String>,
+    /// One Raven patch: draw only this scene area (the rest of the buffer
+    /// already holds this frame's pixels); None redraws everything.
+    pub damage: Option<crate::tree::geometry::Rect>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -531,6 +534,7 @@ impl Default for RenderState {
             has_cacheable_paint_layers: false,
             has_scroll_moving_paint_layers: false,
             video_target_ids: HashSet::new(),
+            damage: None,
         }
     }
 }
@@ -552,7 +556,17 @@ impl RenderState {
             has_cacheable_paint_layers: has_payload_cache_candidates,
             has_scroll_moving_paint_layers,
             video_target_ids,
+            damage: None,
         }
+    }
+
+    /// One Raven patch: move renderer-driven animations to at; true when the
+    /// scene has any (so it must be drawn again next vblank).
+    pub fn advance_renderer_animations(
+        &mut self,
+        at: std::time::Instant,
+    ) -> crate::render_scene::RendererAnimationAdvance {
+        self.scene.advance_renderer_animations(at)
     }
 
     pub fn set_scene(&mut self, scene: RenderScene) {
@@ -2706,6 +2720,23 @@ fn text_payload_gpu_subpixel_phase(
         return Ok(PaintLayerSubpixelPhase::default());
     }
 
+    // One Raven patch: like a browser compositor, cache text rasterized at its
+    // local resolution and compose it through a rotation or a modest scale,
+    // instead of re-rasterizing every frame. Text in a rotating or scaling
+    // layer (a wiggle, a press effect) is slightly softer while it moves.
+    // Upscaling beyond 10% would visibly blur, so that still draws directly.
+    let axis_scale_x = (transform.xx * transform.xx + transform.yx * transform.yx).sqrt();
+    let axis_scale_y = (transform.xy * transform.xy + transform.yy * transform.yy).sqrt();
+    if transform.tx.is_finite()
+        && transform.ty.is_finite()
+        && axis_scale_x.is_finite()
+        && axis_scale_y.is_finite()
+        && axis_scale_x <= 1.1
+        && axis_scale_y <= 1.1
+    {
+        return Ok(PaintLayerSubpixelPhase::default());
+    }
+
     Err(RendererCacheRejectionReason::UnsupportedTransform)
 }
 
@@ -4695,6 +4726,17 @@ impl SceneRenderer {
         let draw_started_at = Instant::now();
         let root_eligibility = moving_layer_root_eligibility_for_surface(frame.surface);
         let canvas = frame.surface.canvas();
+        // One Raven patch: partial redraw. Reset what the previous frame left
+        // on this canvas, then clip to the damaged area if there is one.
+        canvas.restore_to_count(1);
+        if let Some(damage) = state.damage {
+            canvas.save();
+            canvas.clip_rect(
+                skia_safe::Rect::from_xywh(damage.x, damage.y, damage.width, damage.height),
+                None,
+                Some(false),
+            );
+        }
 
         // Keep no-candidate frames on the original renderer path. Routing every
         // frame through cache-tracking traversal regressed mixed_ui_scene by
