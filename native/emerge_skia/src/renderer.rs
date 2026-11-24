@@ -3163,6 +3163,8 @@ pub struct RendererCacheManager {
     /// (renderer-driven animation, video, loading images). Frames that only
     /// advance that scene's animations skip comparing the base again.
     base_snapshot_unkeepable_epoch: Option<u64>,
+    /// The scene epoch the last plan looked at.
+    base_snapshot_planned_epoch: Option<u64>,
     base_snapshot_max_bytes: u64,
     base_snapshot_counts: BaseSnapshotCounts,
     last_frame_work: FrameWork,
@@ -3261,6 +3263,7 @@ impl RendererCacheManager {
             animation_snapshots: HashMap::new(),
             base_snapshot: None,
             base_snapshot_unkeepable_epoch: None,
+            base_snapshot_planned_epoch: None,
             base_snapshot_max_bytes: config
                 .paint_layer
                 .max_entry_bytes
@@ -3342,6 +3345,7 @@ impl RendererCacheManager {
         self.payloads.clear();
         self.base_snapshot = None;
         self.base_snapshot_unkeepable_epoch = None;
+        self.base_snapshot_planned_epoch = None;
     }
 
     pub fn enabled(&self) -> bool {
@@ -5280,7 +5284,17 @@ impl SceneRenderer {
                 && snapshot.color_type == info.color_type()
                 && base_snapshot_content_eq(&snapshot.content, base)
         });
+        let same_scene = state.scene_epoch != 0
+            && cache.base_snapshot_planned_epoch.replace(state.scene_epoch) == Some(state.scene_epoch);
         if !unchanged {
+            // The same scene with a different base: its renderer-driven
+            // animations are advancing it in place, so it will differ on
+            // every frame until a new scene arrives.
+            if same_scene {
+                cache.base_snapshot = None;
+                cache.base_snapshot_unkeepable_epoch = Some(state.scene_epoch);
+                return BaseSnapshotPlan::Off;
+            }
             cache.base_snapshot = Some(BaseSnapshot {
                 root_id: root.id,
                 root_bounds: root.bounds,
@@ -16086,6 +16100,41 @@ mod base_snapshot_tests {
         let before = compares();
         draw(&next);
         assert_eq!(compares() - before, 1, "a new scene is compared again");
+    }
+
+    // One Raven patch: a base that changes between frames of one scene (its
+    // animations advance in place) is given up on until the next scene.
+    #[test]
+    fn a_base_animated_in_place_is_given_up_until_the_next_scene() {
+        let mut renderer = SceneRenderer::with_cache_config(RendererCacheConfig {
+            enabled: true,
+            ..RendererCacheConfig::default()
+        });
+        let info = skia_safe::ImageInfo::new(
+            (100, 100),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        let mut surface = skia_safe::surfaces::raster(&info, None, None).unwrap();
+        let compares = || BASE_SNAPSHOT_COMPARES.with(|count| count.get());
+        let mut state = RenderState::new(
+            scene(vec![rect(0.0, 0x112233FF), overlay(1.0)]),
+            Color::TRANSPARENT,
+            1,
+            false,
+        );
+        let before = compares();
+        for color in [0x112233FFu32, 0x223344FF, 0x334455FF, 0x445566FF] {
+            // Stand-in for an animation advancing the base without a new scene.
+            if let RenderNode::PaintLayer(root) = &mut state.scene.nodes[0] {
+                root.content =
+                    layer(1, PaintLayerReason::Root, vec![rect(0.0, color), overlay(1.0)]).content;
+            }
+            let mut frame = RenderFrame::new(&mut surface, None);
+            renderer.render(&mut frame, &state);
+        }
+        assert_eq!(compares() - before, 2, "compared until the in-place change was seen");
     }
 
     #[test]
