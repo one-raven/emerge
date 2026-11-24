@@ -44,7 +44,7 @@ impl LiveConfig {
         if let Some(power) = &self.drm_power {
             power.validate()?;
         }
-        if self.input_mask & !0xff != 0 {
+        if self.input_mask & !crate::input::INPUT_MASK_ALL != 0 {
             return Err("input mask contains unknown event categories".into());
         }
         Ok(())

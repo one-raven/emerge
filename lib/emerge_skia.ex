@@ -226,26 +226,34 @@ defmodule EmergeSkia do
   def configure(renderer, previous, config) do
     with :ok <- validate_config_change(previous, config),
          :ok <- configure_scroll(renderer, previous, config) do
-      title =
+      live = live_controls(config)
+
+      # One Raven patch: a change that leaves the live controls as they were
+      # (scroll physics, say) does not resubmit them.
+      if live_controls(previous) == live,
+        do: :ok,
+        else: Native.configure(Transport.Native.native_renderer(renderer), live)
+    end
+  end
+
+  defp live_controls(config) do
+    %{
+      title:
         case config.output do
           %Emerge.Config.Window{title: title} -> title
           _ -> nil
+        end,
+      target_fps: config.renderer.target_fps,
+      input_mask: Emerge.Config.Native.input_mask(config.input),
+      drm_power:
+        case config.output do
+          %Emerge.Config.DRM{} = output ->
+            %{display_on: output.display == :on, brightness: output.backlight.brightness}
+
+          _ ->
+            nil
         end
-
-      Native.configure(Transport.Native.native_renderer(renderer), %{
-        title: title,
-        target_fps: config.renderer.target_fps,
-        input_mask: Emerge.Config.Native.input_mask(config.input),
-        drm_power:
-          case config.output do
-            %Emerge.Config.DRM{} = output ->
-              %{display_on: output.display == :on, brightness: output.backlight.brightness}
-
-            _ ->
-              nil
-          end
-      })
-    end
+    }
   end
 
   @doc """
