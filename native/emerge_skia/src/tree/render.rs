@@ -807,7 +807,13 @@ fn element_render_fragment_cache_key(
     let mut hasher = DefaultHasher::new();
     hasher.write_u64(key.context);
     hash_rect_bits(&mut hasher, traversal.render_ctx.scene_bounds);
-    hasher.write(format!("{:?}", traversal.scene_ctx.interaction_transform).as_bytes());
+    // Only the linear part: the render nodes are in layout coordinates, and
+    // culling maps the element and its clip through the same inherited
+    // transform, so moving an ancestor (a dragged sheet) leaves both alone.
+    let to_screen = traversal.scene_ctx.interaction_transform;
+    for part in [to_screen.xx, to_screen.yx, to_screen.xy, to_screen.yy] {
+        hash_f32_bits(&mut hasher, part);
+    }
     hasher.write_usize(traversal.scene_ctx.interaction_clips.len());
     hasher.write(format!("{:?}", inherited).as_bytes());
     hasher.write_u8(traversal.disable_viewport_culling as u8);

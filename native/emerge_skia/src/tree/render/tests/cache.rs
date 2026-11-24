@@ -666,6 +666,65 @@ fn clean_nearby_fragment_reuses_the_mounted_subtree_without_descending() {
     );
 }
 
+// One Raven patch: dragging a sheet moves its root with move_y every frame.
+// Its children are built in layout coordinates, so they must be reused.
+#[test]
+fn moving_an_ancestor_reuses_its_clean_descendants() {
+    let host_id = NodeId::from_term_bytes(vec![5]);
+    let mut tree = build_tree_with_child_frame(
+        Attrs::default(),
+        frame(0.0, 0.0, 360.0, 480.0),
+        solid_fill_attrs((20, 24, 32)),
+        frame(0.0, 0.0, 360.0, 240.0),
+    );
+    let child_ids = (0u8..24)
+        .map(|index| {
+            let id = NodeId::from_term_bytes(vec![100 + index]);
+            let row = NodeId::from_term_bytes(vec![200 + index]);
+            let mut child = element(
+                id,
+                ElementKind::El,
+                solid_fill_attrs((80 + index, 120, 180)),
+                frame(8.0, 8.0 + f32::from(index) * 9.0, 160.0, 8.0),
+            );
+            child.children = vec![row];
+            tree.insert(child);
+            tree.insert(element(
+                row,
+                ElementKind::El,
+                solid_fill_attrs((180, 80 + index, 120)),
+                frame(10.0, 9.0 + f32::from(index) * 9.0, 40.0, 4.0),
+            ));
+            id
+        })
+        .collect();
+    let host = tree.get_mut(&host_id).expect("host");
+    host.children = child_ids;
+    // Already moved: going from no transform to one changes the children's
+    // clip context, which does rebuild them once.
+    host.layout.effective.move_y = Some(4.0);
+    tree.clear_refresh_dirty();
+
+    let first = super::super::render_tree_scene_with_scroll_layers(&tree).scene;
+
+    for (step, dy) in [12.0, 40.0, 41.5].into_iter().enumerate() {
+        tree.get_mut(&host_id).expect("host").layout.effective.move_y = Some(dy);
+        tree.mark_render_and_registry_refresh_dirty(&host_id);
+
+        super::super::reset_render_traversal_diagnostics_for_benchmark();
+        let moved = super::super::render_tree_scene_with_scroll_layers(&tree).scene;
+        let diagnostics = super::super::take_render_traversal_diagnostics_for_benchmark();
+        tree.clear_refresh_dirty();
+
+        assert_eq!(primitive_colors(&first.nodes), primitive_colors(&moved.nodes));
+        // The root and the host rebuild; the 24 children (and their rows) don't.
+        assert!(
+            diagnostics.element_visits <= 2 + 24,
+            "step {step}: {diagnostics:?}"
+        );
+    }
+}
+
 fn camera_fixture() -> CameraFixture {
     let root_id = NodeId::from_u64(10_000);
     let video_id = NodeId::from_u64(10_001);
