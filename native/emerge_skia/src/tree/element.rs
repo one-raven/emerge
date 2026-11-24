@@ -754,7 +754,7 @@ pub struct NodeRefreshState {
     pub scroll_content_dirty: std::cell::Cell<bool>,
     /// One Raven patch: a scroll container's built content layer, reused
     /// while only the scroll offset moves (see `ScrollContentCache`).
-    pub scroll_content_cache: RefCell<Option<ScrollContentCache>>,
+    pub scroll_content_cache: RefCell<Option<Box<ScrollContentCache>>>,
     /// One Raven patch: last marked dirty by a scroll offset moving below it.
     /// Its next build is not cached: a scroll's next step drops it unused,
     /// and storing it copied the subtree (for the root, the whole scene) on
@@ -778,6 +778,14 @@ pub struct NodeRefreshState {
 pub struct ScrollContentCache {
     pub key: u64,
     pub window: crate::tree::geometry::Rect,
+    /// One Raven patch: the viewport the window was made for, (start,
+    /// length) along the scrolling axis (y if it scrolls vertically). A fling
+    /// the render thread carries on stays inside the window
+    /// (crate::scroll_fling).
+    pub viewport: (f32, f32),
+    /// One Raven patch: the scroll offset it was built at, so a later build
+    /// can tell which way the content is moving.
+    pub offset: (f32, f32),
     pub content: Vec<RenderNode>,
     pub escapes: Vec<RenderNode>,
     pub text_input_focused: bool,
@@ -1180,7 +1188,7 @@ impl Element {
                 scroll_content_cache: RefCell::new(None),
                 scroll_moving: std::cell::Cell::new(false),
                 built_renderer_animation: std::cell::Cell::new(None),
-            offered_renderer_animation: std::cell::Cell::new(None),
+                offered_renderer_animation: std::cell::Cell::new(None),
             },
             lifecycle: self.lifecycle.clone(),
             #[cfg(test)]

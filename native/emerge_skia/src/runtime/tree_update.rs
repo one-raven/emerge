@@ -100,6 +100,9 @@ pub struct TreeUpdateEngine {
     listener_barrier: Option<crate::actors::ListenerBarrier>,
     /// One Raven patch: compositor scrolling (kept across tree uploads).
     compositor_scroll: bool,
+    /// One Raven patch: the last fling sample, (container, fling, curve
+    /// position), while no other scroll of that container came after it.
+    fling_sample: Option<(NodeId, u64, f32)>,
 }
 
 impl TreeUpdateEngine {
@@ -118,6 +121,7 @@ impl TreeUpdateEngine {
             animation_retry: AnimationRetry::default(),
             listener_barrier: None,
             compositor_scroll: true,
+            fling_sample: None,
         }
     }
 
@@ -227,6 +231,11 @@ impl TreeUpdateEngine {
         }
 
         let mut scroll_acc = HashMap::new();
+        // One Raven patch: containers scrolled, and containers given a fling
+        // sample, in this pass. The event runtime sends a fling step's scroll
+        // and its sample in one dispatch, the sample ahead of the scroll.
+        let mut scrolled: Vec<NodeId> = Vec::new();
+        let mut sampled: Vec<NodeId> = Vec::new();
         let mut thumb_drag_x_acc = HashMap::new();
         let mut thumb_drag_y_acc = HashMap::new();
         let mut hover_x_state = HashMap::new();
@@ -430,6 +439,7 @@ impl TreeUpdateEngine {
                     element_id,
                     position,
                 } => {
+                    scrolled.push(element_id);
                     invalidation.add(self.tree.set_scroll_position(&element_id, position));
                 }
                 TreeMsg::SetScrollOverscroll {
@@ -470,6 +480,15 @@ impl TreeUpdateEngine {
                     let entry = scroll_acc.entry((element_id, mount)).or_insert((0.0, 0.0));
                     entry.0 += dx;
                     entry.1 += dy;
+                    scrolled.push(element_id);
+                }
+                TreeMsg::FlingSample {
+                    element_id,
+                    fling,
+                    position,
+                } => {
+                    sampled.push(element_id);
+                    self.fling_sample = Some((element_id, fling, position));
                 }
                 TreeMsg::ScrollbarThumbDragX { element_id, dx } => {
                     let entry = thumb_drag_x_acc.entry((element_id, mount)).or_insert(0.0);
@@ -645,6 +664,12 @@ impl TreeUpdateEngine {
 
         // One Raven patch: an upload replaces the tree; keep the setting.
         self.tree.compositor_scroll = self.compositor_scroll;
+        if self
+            .fling_sample
+            .is_some_and(|(id, _, _)| scrolled.contains(&id) && !sampled.contains(&id))
+        {
+            self.fling_sample = None;
+        }
         for ((id, mount), (dx, dy)) in scroll_acc {
             if !self.is_current_mount(&id, mount) {
                 registry_requested = true;
@@ -1140,11 +1165,60 @@ impl TreeUpdateEngine {
         }
         trace_tree_snapshots(&self.tree);
         self.clear_latest_sample_time_if_inactive(animations_active);
+        let mut output = output;
+        output.scene.scroll_fling = self.scroll_fling_anchor();
         Ok(TreeUpdateEffect::Layout {
             output: Box::new(output),
             pipeline_submitted_at,
             tree_batch_started_at,
             animation_trace,
+        })
+    }
+
+    /// One Raven patch: where the sampled fling stands in the scene about to
+    /// be published (crate::scroll_fling).
+    fn scroll_fling_anchor(&self) -> Option<crate::scroll_fling::ScrollFlingAnchor> {
+        let (id, fling, sample) = self.fling_sample?;
+        let element = self.tree.get(&id)?;
+        let (window, viewport) = element
+            .refresh
+            .scroll_content_cache
+            .borrow()
+            .as_ref()
+            .map(|cache| (cache.window, cache.viewport))?;
+        // As `CompositorScroll` places it.
+        let overscroll = element.runtime.scroll_overscroll.map(f32::from_bits);
+        let offset = (
+            (element.layout.scroll_x + overscroll[0]).round(),
+            (element.layout.scroll_y + overscroll[1]).round(),
+        );
+        let frame = element.layout.frame?;
+        let attrs = &element.layout.effective;
+        let axis_y = attrs.scrollbar_y.unwrap_or(false);
+        let (start, length) = viewport;
+        let (offset, window_start, window_length, range) = if axis_y {
+            (
+                offset.1,
+                window.y,
+                window.height,
+                frame.content_height - frame.height,
+            )
+        } else {
+            (
+                offset.0,
+                window.x,
+                window.width,
+                frame.content_width - frame.width,
+            )
+        };
+        Some(crate::scroll_fling::ScrollFlingAnchor {
+            fling,
+            node: id.to_wire_u64(),
+            axis_y,
+            offset,
+            sample,
+            min: (window_start - start).max(0.0),
+            max: (window_start + window_length - start - length).min(range.max(0.0)),
         })
     }
 

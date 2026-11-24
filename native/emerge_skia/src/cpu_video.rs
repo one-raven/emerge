@@ -168,6 +168,7 @@ mod tests {
         let mut renderer = SceneRenderer::with_cache_config(Default::default());
         let state = RenderState::new(
             RenderScene {
+                scroll_fling: None,
                 nodes: vec![RenderNode::Primitive(DrawPrimitive::Video(
                     0.0,
                     0.0,

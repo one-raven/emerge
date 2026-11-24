@@ -179,6 +179,7 @@ impl EventRuntimeDriver {
             self.runtime.hover_stack.clear();
         }
         let result = operation(&mut self.runtime, &commands, self.log_render);
+        self.runtime.share_fling();
         let mut messages = self
             .runtime
             .resolve_scroll_commands(commands.0.into_inner());
@@ -901,6 +902,7 @@ fn tree_msg_label(msg: &TreeMsg) -> &'static str {
         TreeMsg::SetScrollOverscroll { .. } => "set_scroll_overscroll",
         TreeMsg::SetScrollMode { .. } => "set_scroll_mode",
         TreeMsg::ScrollRequest { .. } => "scroll_request",
+        TreeMsg::FlingSample { .. } => "fling_sample",
         TreeMsg::ScrollbarThumbDragX { .. } => "scrollbar_thumb_drag_x",
         TreeMsg::ScrollbarThumbDragY { .. } => "scrollbar_thumb_drag_y",
         TreeMsg::SetScrollbarXHover { .. } => "set_scrollbar_x_hover",
@@ -1192,6 +1194,10 @@ struct DirectEventRuntime {
     last_present_timing: Option<PresentTimingState>,
     drag_motion: Option<DragMotionState>,
     inertial_scroll: Option<InertialScrollState>,
+    /// One Raven patch: flings started, and the one shared with the
+    /// presenter (crate::scroll_fling).
+    flings_started: u64,
+    shared_fling: Option<u64>,
     suppress_drag_release_inertia: bool,
     scroll_line_pixels: f32,
     native_log: Arc<NativeLogRelay>,
@@ -1257,6 +1263,8 @@ impl DirectEventRuntime {
             last_present_timing: None,
             drag_motion: None,
             inertial_scroll: None,
+            flings_started: 0,
+            shared_fling: None,
             suppress_drag_release_inertia: false,
             scroll_line_pixels: SCROLL_LINE_PIXELS,
             native_log,
@@ -1362,6 +1370,25 @@ impl DirectEventRuntime {
             .unwrap_or(PENDING_SLIDER_PATCH_TTL_FALLBACK)
             .max(PENDING_SLIDER_PATCH_TTL_MIN)
             .min(PENDING_SLIDER_PATCH_TTL_MAX)
+    }
+
+    /// One Raven patch: tell the presenter which fling runs, if it changed
+    /// (crate::scroll_fling).
+    fn share_fling(&mut self) {
+        let id = self.inertial_scroll.as_ref().map(|_| self.flings_started);
+        if id == self.shared_fling {
+            return;
+        }
+        self.shared_fling = id;
+        let fling = self.inertial_scroll.as_ref().map(|inertia| crate::scroll_fling::ScrollFling {
+            id: self.flings_started,
+            node: inertia.element_id.to_wire_u64(),
+            axis_y: inertia.axis == ScrollbarAxis::Y,
+            started_at: inertia.started_at,
+            distance: inertia.simulation.distance,
+            duration_secs: inertia.simulation.duration_secs,
+        });
+        self.backend_wake.set_scroll_fling(fling);
     }
 
     fn cancel_inertial_scroll(&mut self) {
@@ -1590,6 +1617,7 @@ impl DirectEventRuntime {
             return;
         };
 
+        self.flings_started += 1;
         self.inertial_scroll = Some(InertialScrollState {
             element_id: motion.element_id,
             axis: motion.axis,
@@ -1648,6 +1676,17 @@ impl DirectEventRuntime {
                 },
                 log_render,
             );
+            if !hit_boundary {
+                send_tree(
+                    tree_tx,
+                    TreeMsg::FlingSample {
+                        element_id: inertia.element_id,
+                        fling: self.flings_started,
+                        position,
+                    },
+                    log_render,
+                );
+            }
         }
 
         if hit_boundary {

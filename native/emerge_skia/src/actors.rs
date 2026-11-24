@@ -110,6 +110,13 @@ pub enum TreeMsg {
         dx: f32,
         dy: f32,
     },
+    /// One Raven patch: the scroll requests so far bring fling `fling` to
+    /// `position` on its curve (crate::scroll_fling).
+    FlingSample {
+        element_id: NodeId,
+        fling: u64,
+        position: f32,
+    },
     ScrollbarThumbDragX {
         element_id: NodeId,
         dx: f32,
@@ -195,6 +202,7 @@ impl TreeMsg {
             Self::SetScrollPosition { element_id, .. }
             | Self::SetScrollOverscroll { element_id, .. }
             | Self::ScrollRequest { element_id, .. }
+            | Self::FlingSample { element_id, .. }
             | Self::ScrollbarThumbDragX { element_id, .. }
             | Self::ScrollbarThumbDragY { element_id, .. }
             | Self::SetScrollbarXHover { element_id, .. }
@@ -230,6 +238,7 @@ impl TreeMsg {
             Self::SetScrollPosition { .. }
             | Self::SetScrollOverscroll { .. }
             | Self::ScrollRequest { .. }
+            | Self::FlingSample { .. }
             | Self::ScrollbarThumbDragX { .. }
             | Self::ScrollbarThumbDragY { .. } => true,
             Self::Batch(messages) | Self::EventBatch { messages, .. } => {
@@ -261,7 +270,9 @@ impl TreeMsg {
             // for a registry round trip on every pointer move.
             Self::SetTextInputRuntime { .. } => false,
             // One Raven patch: drawn only.
-            Self::SetScrollOverscroll { .. } | Self::SetScrollMode { .. } => false,
+            Self::SetScrollOverscroll { .. }
+            | Self::SetScrollMode { .. }
+            | Self::FlingSample { .. } => false,
             Self::RequestFrame { .. }
             | Self::AnimationPulse { .. }
             | Self::SampleAnimation { .. }

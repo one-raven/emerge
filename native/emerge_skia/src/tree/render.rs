@@ -570,6 +570,7 @@ fn build_refresh_output_with_semantic_layers(
     let nodes = wrap_with_root_paint_layer(subtree.into_nodes(), tree.get_ix(root_ix));
     RefreshBuildOutput {
         scene: RenderScene {
+            scroll_fling: None,
             fonts: tree.frame_fonts.clone(),
             images: Some(tree.frame_assets.as_ref().map_or_else(
                 || crate::renderer::ImageSnapshot::capture(&nodes),
@@ -854,16 +855,22 @@ fn build_element_subtree<R: RegistryTraversalSink>(
                     traversal.render_ctx.scene_bounds,
                 );
                 if let Some(key) = compositor_cache_key {
-                    element.refresh.scroll_content_cache.replace(Some(
+                    element.refresh.scroll_content_cache.replace(Some(Box::new(
                         crate::tree::element::ScrollContentCache {
                             key,
                             window: plan.window,
+                            viewport: if plan.axes.1 {
+                                (plan.viewport.y, plan.viewport.height)
+                            } else {
+                                (plan.viewport.x, plan.viewport.width)
+                            },
+                            offset: plan.scroll,
                             content: content.clone(),
                             escapes: host_content.escapes.clone(),
                             text_input_focused: host_content.text_input_focused,
                             text_input_cursor_area: host_content.text_input_cursor_area,
                         },
-                    ));
+                    )));
                     element.refresh.scroll_content_dirty.set(false);
                 }
                 content
@@ -1744,6 +1751,9 @@ struct CompositorScroll {
     content_state: ResolvedNodeState,
     /// Culling window in content coordinates (screen position at offset zero).
     window: Rect,
+    viewport: Rect,
+    /// The scroll offset, unrounded and without overscroll.
+    scroll: (f32, f32),
     /// The container clip as content sees it: unbounded along the
     /// scrolling axes (the viewport is clipped outside the layer).
     content_clip: ClipShape,
@@ -1787,27 +1797,42 @@ impl CompositorScroll {
         let overscroll = element.runtime.scroll_overscroll.map(f32::from_bits);
         let viewport = state.host_clip.rect;
         // One Raven patch: the window stays put while the viewport is inside
-        // it, and when the viewport nears an edge it moves ahead in the
-        // direction of travel, keeping a quarter viewport behind. Re-anchoring
-        // every quarter viewport rebuilt the content (35-75 ms on the hub's
-        // Dashboard) every 420 px of a fling.
+        // it. Content moving toward an edge moves it once less than a
+        // viewport is left ahead (the render thread carries a fling on into
+        // that viewport while the tree rebuilds: crate::scroll_fling), and the
+        // window then reaches two viewports ahead, keeping a quarter viewport
+        // behind. Re-anchoring every quarter viewport rebuilt the content
+        // (35-75 ms on the hub's Dashboard) every 420 px of a fling.
         let prior = element
             .refresh
             .scroll_content_cache
             .borrow()
             .as_ref()
-            .map(|cache| cache.window);
-        let window_axis = |start: f32, len: f32, offset: f32, prior: Option<(f32, f32)>| {
+            .map(|cache| (cache.window, cache.offset));
+        // Kept within what the container can scroll to, so at either end
+        // the window reaches as far as it can into the content.
+        let window_axis = |start: f32,
+                           len: f32,
+                           offset: f32,
+                           range: f32,
+                           prior: Option<(f32, f32, f32)>| {
             let step = (len / 4.0).max(64.0);
             let size = len * 3.0 + step;
             let top = start + offset;
-            match prior {
-                Some((at, prior_size)) if prior_size == size => {
+            let within = |(at, size): (f32, f32)| {
+                (at.min(start + range.max(0.0) + len - size).max(start), size)
+            };
+            within(match prior {
+                Some((at, prior_size, built_at)) if prior_size == size => {
                     let edge = COMPOSITOR_SCROLL_WINDOW_EDGE.min(len / 4.0);
-                    if top < at + edge {
-                        ((top + len + step - size).round(), size)
-                    } else if top + len > at + size - edge {
-                        ((top - step).round(), size)
+                    let forward = offset > built_at + 0.5;
+                    let backward = offset < built_at - 0.5;
+                    let back = (top + len + step - size).round();
+                    let ahead = (top - step).round();
+                    if top < at + edge || (backward && top < at + len) {
+                        (back, size)
+                    } else if top + len > at + size - edge || (forward && top + len > at + size - len) {
+                        (ahead, size)
                     } else {
                         (at, size)
                     }
@@ -1816,8 +1841,14 @@ impl CompositorScroll {
                     let anchor = (offset / step).floor() * step;
                     (start + anchor - len, size)
                 }
-            }
+            })
         };
+        let range = element.layout.frame.map_or((0.0, 0.0), |frame| {
+            (
+                frame.content_width - frame.width,
+                frame.content_height - frame.height,
+            )
+        });
         let unbounded = |start: f32, len: f32, scrolls: bool| -> (f32, f32) {
             if scrolls {
                 (-COMPOSITOR_SCROLL_UNBOUNDED, 2.0 * COMPOSITOR_SCROLL_UNBOUNDED)
@@ -1826,12 +1857,24 @@ impl CompositorScroll {
             }
         };
         let (wx, ww) = if axes.0 {
-            window_axis(viewport.x, viewport.width, scroll.0, prior.map(|w| (w.x, w.width)))
+            window_axis(
+                viewport.x,
+                viewport.width,
+                scroll.0,
+                range.0,
+                prior.map(|(w, o)| (w.x, w.width, o.0)),
+            )
         } else {
             (viewport.x, viewport.width)
         };
         let (wy, wh) = if axes.1 {
-            window_axis(viewport.y, viewport.height, scroll.1, prior.map(|w| (w.y, w.height)))
+            window_axis(
+                viewport.y,
+                viewport.height,
+                scroll.1,
+                range.1,
+                prior.map(|(w, o)| (w.y, w.height, o.1)),
+            )
         } else {
             (viewport.y, viewport.height)
         };
@@ -1866,6 +1909,10 @@ impl CompositorScroll {
                 radii: None,
             }
         };
+        let offset = (
+            (scroll.0 + overscroll[0]).round(),
+            (scroll.1 + overscroll[1]).round(),
+        );
         let mut content_state = state.clone();
         content_state.local_scroll_x = 0.0;
         content_state.local_scroll_y = 0.0;
@@ -1876,12 +1923,11 @@ impl CompositorScroll {
         Some(Self {
             content_state,
             window,
+            viewport,
+            scroll,
             content_clip,
             axes,
-            offset: (
-                (scroll.0 + overscroll[0]).round(),
-                (scroll.1 + overscroll[1]).round(),
-            ),
+            offset,
         })
     }
 

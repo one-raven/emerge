@@ -36,6 +36,7 @@ fn node(id: &str, fit: ImageFit) -> RenderNode {
 fn scene(id: &str, fit: ImageFit) -> RenderScene {
     let nodes = vec![node(id, fit)];
     RenderScene {
+        scroll_fling: None,
         fonts: None,
         images: Some(ImageSnapshot::capture(&nodes)),
         nodes,
@@ -172,6 +173,7 @@ fn source_pins_are_sparse_shared_and_released_with_the_last_scene() {
         assert!(unused.upgrade().is_none());
         let mut renderer = SceneRenderer::new();
         let state = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: Some(snapshot),
             nodes,

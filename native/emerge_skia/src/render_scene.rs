@@ -19,6 +19,10 @@ pub struct RenderScene {
     #[doc(hidden)]
     pub images: Option<crate::renderer::ImageSnapshot>,
     pub nodes: Vec<RenderNode>,
+    /// One Raven patch: where a fling the render thread carries on stands in
+    /// this scene (crate::scroll_fling).
+    #[doc(hidden)]
+    pub scroll_fling: Option<crate::scroll_fling::ScrollFlingAnchor>,
 }
 
 impl RenderScene {
@@ -1504,12 +1508,43 @@ pub struct RenderPaintLayerContent {
     /// tree actor's time in a hard fling on the hub's Dashboard). The render
     /// thread rewrites transforms and alphas in place, never shadow passes.
     pub shadow_pass: bool,
+    /// One Raven patch: which build this content came from. Copies keep it,
+    /// so content the render thread copied on write to advance a
+    /// renderer-driven animation in it is still known as the same build
+    /// (the scroll tiles keep their plan).
+    pub source: ContentSource,
+}
+
+/// One Raven patch: a build's identity (`RenderPaintLayerContent::source`).
+/// It never makes two contents unequal.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ContentSource(u64);
+
+impl ContentSource {
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn same_build(self, other: Self) -> bool {
+        self.0 != 0 && self.0 == other.0
+    }
+}
+
+impl PartialEq for ContentSource {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 impl RenderPaintLayerContent {
     pub(crate) fn new(nodes: Vec<RenderPaintLayerContentNode>) -> Self {
         let shadow_pass = layer_content_has_shadow_pass(&nodes);
-        Self { nodes, shadow_pass }
+        Self {
+            nodes,
+            shadow_pass,
+            source: ContentSource::next(),
+        }
     }
 
     pub(crate) fn from_nodes(nodes: Vec<RenderNode>) -> Self {
@@ -1575,6 +1610,150 @@ pub struct RenderPaintRun {
     pub bounds: Rect,
     pub nodes: Arc<Vec<RenderNode>>,
     pub metrics: RenderPaintLayerMetrics,
+}
+
+/// One Raven patch: a new scene takes the render thread's copies of the
+/// scroll contents it shares with the scene before it. Advancing a
+/// renderer-driven animation in scroll content copies that content on write,
+/// and a scene the tree sends shares it with the tree's cache, so every scene
+/// of a scroll or fling copied the whole content again on its first frame
+/// (18% of the render thread in a hard fling on the Dashboard). A copy of the
+/// same build (`ContentSource`) differs only in the animated values, which
+/// the next advance sets anyway, and nothing else holds it, so later
+/// advances change it in place.
+pub(crate) fn adopt_advanced_scroll_content(new: &mut [RenderNode], old: &[RenderNode]) {
+    let mut copies = Vec::new();
+    collect_scroll_contents(old, &mut copies);
+    if copies.is_empty() {
+        return;
+    }
+    adopt_in_nodes(new, &copies);
+}
+
+type ScrollContentCopy = (PaintLayerId, Arc<RenderPaintLayerContent>);
+
+fn collect_scroll_contents(nodes: &[RenderNode], out: &mut Vec<ScrollContentCopy>) {
+    for node in nodes {
+        match node {
+            RenderNode::ShadowPass { children }
+            | RenderNode::Clip { children, .. }
+            | RenderNode::RelaxedClip { children, .. }
+            | RenderNode::Transform { children, .. }
+            | RenderNode::Alpha { children, .. } => collect_scroll_contents(children, out),
+            RenderNode::PaintLayer(layer) => collect_scroll_layer(layer, out),
+            RenderNode::Primitive(_) => {}
+        }
+    }
+}
+
+fn collect_scroll_layer(layer: &RenderPaintLayer, out: &mut Vec<ScrollContentCopy>) {
+    if layer.id.role == PaintLayerReason::ScrollContent {
+        out.push((layer.id, Arc::clone(&layer.content)));
+        return;
+    }
+    collect_scroll_content_nodes(&layer.content.nodes, out);
+}
+
+fn collect_scroll_content_nodes(nodes: &[RenderPaintLayerContentNode], out: &mut Vec<ScrollContentCopy>) {
+    for node in nodes {
+        match node {
+            RenderPaintLayerContentNode::Own(run) => collect_scroll_contents(&run.nodes, out),
+            RenderPaintLayerContentNode::Child(layer) => collect_scroll_layer(layer, out),
+            RenderPaintLayerContentNode::ShadowPass { children }
+            | RenderPaintLayerContentNode::Clip { children, .. }
+            | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+            | RenderPaintLayerContentNode::Transform { children, .. }
+            | RenderPaintLayerContentNode::Alpha { children, .. } => {
+                collect_scroll_content_nodes(children, out)
+            }
+        }
+    }
+}
+
+fn adoptable<'a>(layer: &RenderPaintLayer, copies: &'a [ScrollContentCopy]) -> Option<&'a Arc<RenderPaintLayerContent>> {
+    copies
+        .iter()
+        .find(|(id, copy)| {
+            *id == layer.id
+                && !Arc::ptr_eq(copy, &layer.content)
+                && copy.source.same_build(layer.content.source)
+        })
+        .map(|(_, copy)| copy)
+}
+
+fn layer_adopts(layer: &RenderPaintLayer, copies: &[ScrollContentCopy]) -> bool {
+    if layer.id.role == PaintLayerReason::ScrollContent {
+        return adoptable(layer, copies).is_some();
+    }
+    content_adopts(&layer.content.nodes, copies)
+}
+
+fn nodes_adopt(nodes: &[RenderNode], copies: &[ScrollContentCopy]) -> bool {
+    nodes.iter().any(|node| match node {
+        RenderNode::ShadowPass { children }
+        | RenderNode::Clip { children, .. }
+        | RenderNode::RelaxedClip { children, .. }
+        | RenderNode::Transform { children, .. }
+        | RenderNode::Alpha { children, .. } => nodes_adopt(children, copies),
+        RenderNode::PaintLayer(layer) => layer_adopts(layer, copies),
+        RenderNode::Primitive(_) => false,
+    })
+}
+
+fn content_adopts(nodes: &[RenderPaintLayerContentNode], copies: &[ScrollContentCopy]) -> bool {
+    nodes.iter().any(|node| match node {
+        RenderPaintLayerContentNode::Own(run) => nodes_adopt(&run.nodes, copies),
+        RenderPaintLayerContentNode::Child(layer) => layer_adopts(layer, copies),
+        RenderPaintLayerContentNode::ShadowPass { children }
+        | RenderPaintLayerContentNode::Clip { children, .. }
+        | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+        | RenderPaintLayerContentNode::Transform { children, .. }
+        | RenderPaintLayerContentNode::Alpha { children, .. } => content_adopts(children, copies),
+    })
+}
+
+fn adopt_in_nodes(nodes: &mut [RenderNode], copies: &[ScrollContentCopy]) {
+    for node in nodes {
+        match node {
+            RenderNode::ShadowPass { children }
+            | RenderNode::Clip { children, .. }
+            | RenderNode::RelaxedClip { children, .. }
+            | RenderNode::Transform { children, .. }
+            | RenderNode::Alpha { children, .. } => adopt_in_nodes(children, copies),
+            RenderNode::PaintLayer(layer) => adopt_in_layer(layer, copies),
+            RenderNode::Primitive(_) => {}
+        }
+    }
+}
+
+fn adopt_in_layer(layer: &mut RenderPaintLayer, copies: &[ScrollContentCopy]) {
+    if layer.id.role == PaintLayerReason::ScrollContent {
+        if let Some(copy) = adoptable(layer, copies) {
+            layer.content = Arc::clone(copy);
+        }
+        return;
+    }
+    if content_adopts(&layer.content.nodes, copies) {
+        adopt_in_content(&mut Arc::make_mut(&mut layer.content).nodes, copies);
+    }
+}
+
+fn adopt_in_content(nodes: &mut [RenderPaintLayerContentNode], copies: &[ScrollContentCopy]) {
+    for node in nodes {
+        match node {
+            RenderPaintLayerContentNode::Own(run) => {
+                if nodes_adopt(&run.nodes, copies) {
+                    adopt_in_nodes(Arc::make_mut(&mut run.nodes).as_mut_slice(), copies);
+                }
+            }
+            RenderPaintLayerContentNode::Child(layer) => adopt_in_layer(layer, copies),
+            RenderPaintLayerContentNode::ShadowPass { children }
+            | RenderPaintLayerContentNode::Clip { children, .. }
+            | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+            | RenderPaintLayerContentNode::Transform { children, .. }
+            | RenderPaintLayerContentNode::Alpha { children, .. } => adopt_in_content(children, copies),
+        }
+    }
 }
 
 /// One Raven patch: whether `nodes` hold a shadow pass, taking each nested
@@ -2725,6 +2904,7 @@ mod tests {
             }],
         );
         let scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(parent)],
@@ -3064,6 +3244,7 @@ mod renderer_animation_tests {
         let started_at = Instant::now();
         let child = child_layer(1);
         let mut scene = RenderScene {
+            scroll_fling: None,
             nodes: vec![RenderNode::PaintLayer(animated_layer(
                 started_at,
                 Some(child.clone()),
@@ -3102,6 +3283,7 @@ mod renderer_animation_tests {
     #[test]
     fn scene_without_renderer_animations_finds_none() {
         let mut scene = RenderScene {
+            scroll_fling: None,
             nodes: vec![RenderNode::PaintLayer(child_layer(1))],
             ..RenderScene::default()
         };
@@ -3117,6 +3299,7 @@ mod renderer_animation_tests {
         let key = renderer_animation_snapshot_key(&layer);
 
         let mut scene = RenderScene {
+            scroll_fling: None,
             nodes: vec![RenderNode::PaintLayer(layer.clone())],
             ..RenderScene::default()
         };
@@ -3197,6 +3380,7 @@ mod renderer_animation_tests {
         )
         .with_children(children);
         RenderScene {
+            scroll_fling: None,
             nodes: vec![RenderNode::PaintLayer(root)],
             ..RenderScene::default()
         }
@@ -3267,6 +3451,7 @@ mod renderer_animation_tests {
             repeat: AnimationRepeat::Loop,
         });
         let mut scene = RenderScene {
+            scroll_fling: None,
             nodes: vec![RenderNode::PaintLayer(layer)],
             ..RenderScene::default()
         };
@@ -3297,6 +3482,7 @@ mod renderer_animation_tests {
             repeat: AnimationRepeat::Loop,
         });
         let mut scene = RenderScene {
+            scroll_fling: None,
             nodes: vec![RenderNode::PaintLayer(slow)],
             ..RenderScene::default()
         };
@@ -3327,6 +3513,7 @@ mod renderer_animation_tests {
         let mut second = animated_layer(started_at, None);
         second.id = PaintLayerId::new(8, PaintLayerReason::Animation);
         let mut scene = RenderScene {
+            scroll_fling: None,
             nodes: vec![
                 RenderNode::PaintLayer(degenerate),
                 RenderNode::PaintLayer(second),

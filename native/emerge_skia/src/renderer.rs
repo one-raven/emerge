@@ -598,7 +598,9 @@ impl RenderState {
         self.renderer_animations.motions(&self.scene)
     }
 
-    pub fn set_scene(&mut self, scene: RenderScene) {
+    pub fn set_scene(&mut self, mut scene: RenderScene) {
+        // One Raven patch: keep the copies this thread already advanced.
+        crate::render_scene::adopt_advanced_scroll_content(&mut scene.nodes, &self.scene.nodes);
         self.renderer_animations.invalidate();
         self.scene_epoch = next_scene_epoch();
         self.has_cacheable_paint_layers = scene.has_payload_cache_candidate_layers();
@@ -9990,6 +9992,7 @@ mod tests {
             width,
             height,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: primitives.into_iter().map(RenderNode::Primitive).collect(),
@@ -10143,6 +10146,7 @@ mod tests {
         ));
 
         let single_clip_scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Clip {
@@ -10151,6 +10155,7 @@ mod tests {
             }],
         };
         let repeated_clip_scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Clip {
@@ -10193,6 +10198,7 @@ mod tests {
         ));
 
         let single_clip_scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Clip {
@@ -10201,6 +10207,7 @@ mod tests {
             }],
         };
         let repeated_clip_scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Clip {
@@ -10306,11 +10313,13 @@ mod tests {
         );
 
         let candidate_scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(parent_layer)],
         };
         let expected_scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![
@@ -10377,6 +10386,7 @@ mod tests {
             )
         };
         let scene = |generation, first_color: u32| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(RenderPaintLayer::from_children(
@@ -10414,6 +10424,7 @@ mod tests {
             80,
             60,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![
@@ -10507,6 +10518,7 @@ mod tests {
     #[test]
     fn isolated_wide_italic_text_cache_preserves_direct_visual_extent() {
         let scene = || RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(RenderPaintLayer::from_children(
@@ -10687,11 +10699,13 @@ mod tests {
         );
 
         let relaxed_scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(relaxed_layer)],
         };
         let ordinary_scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(ordinary_layer)],
@@ -10799,6 +10813,7 @@ mod tests {
             60,
             40,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![RenderNode::Alpha {
@@ -10818,6 +10833,7 @@ mod tests {
             },
         );
         let scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(parent)],
@@ -10874,6 +10890,7 @@ mod tests {
             (0x0000FFFFu32).into(),
         ));
         let before = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(RenderPaintLayer::from_children(
@@ -10905,6 +10922,7 @@ mod tests {
             ))],
         );
         let after = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(RenderPaintLayer::from_children(
@@ -10924,6 +10942,7 @@ mod tests {
             40,
             40,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![RenderNode::Alpha {
@@ -11084,6 +11103,7 @@ mod tests {
             (
                 false,
                 RenderScene {
+                    scroll_fling: None,
                     fonts: None,
                     images: None,
                     nodes: vec![RenderNode::Primitive(DrawPrimitive::Rect(
@@ -11158,6 +11178,7 @@ mod tests {
             vec![dynamic_child],
         );
         let scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(direct_parent)],
@@ -11905,6 +11926,7 @@ mod tests {
             16,
             16,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![RenderNode::Primitive(DrawPrimitive::Rect(
@@ -11963,6 +11985,7 @@ mod tests {
             28,
             22,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: children.clone(),
@@ -11972,6 +11995,7 @@ mod tests {
             28,
             22,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![moving_paint_layer_node(
@@ -12033,6 +12057,7 @@ mod tests {
             32,
             24,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: child_nodes,
@@ -12047,6 +12072,7 @@ mod tests {
             32,
             24,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![RenderNode::PaintLayer(parent_layer)],
@@ -12097,6 +12123,7 @@ mod tests {
 
     fn animation_scene(stable_id: u64, content_generation: u64, color: u32) -> RenderScene {
         RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(RenderPaintLayer::from_children(
@@ -12136,6 +12163,7 @@ mod tests {
             })
             .collect();
         RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes,
@@ -12204,6 +12232,7 @@ mod tests {
             width,
             height,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![direct_node],
@@ -12213,6 +12242,7 @@ mod tests {
             width,
             height,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![candidate_node],
@@ -12225,6 +12255,7 @@ mod tests {
 
     fn translated_candidate_scene(content_generation: u64) -> RenderScene {
         RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Transform {
@@ -12241,6 +12272,7 @@ mod tests {
 
     fn translated_direct_scene() -> RenderScene {
         RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Transform {
@@ -12399,6 +12431,7 @@ mod tests {
     #[test]
     fn moving_paint_layer_payload_cache_reuses_payload_across_root_alpha_changes() {
         let direct_scene = |alpha| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Alpha {
@@ -12407,6 +12440,7 @@ mod tests {
             }],
         };
         let candidate_scene = |alpha| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Alpha {
@@ -12486,6 +12520,7 @@ mod tests {
         }
 
         let child_scene = || RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Transform {
@@ -12494,6 +12529,7 @@ mod tests {
             }],
         };
         let parent_scene = || RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Transform {
@@ -12588,6 +12624,7 @@ mod tests {
         }
 
         let parent_scene = |content_generation, color: u32| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Transform {
@@ -12781,6 +12818,7 @@ mod tests {
 
         let changed = RenderState::new(
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![RenderNode::Transform {
@@ -13057,6 +13095,7 @@ mod tests {
     #[test]
     fn visible_frame_fingerprint_ignores_offscreen_dynamic_layer_changes() {
         let scene = |generation: u64| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![
@@ -13095,6 +13134,7 @@ mod tests {
     #[test]
     fn moving_paint_layer_payload_cache_reuses_payload_after_integer_scroll_translation() {
         let candidate_scene = |scroll_y: f32| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Transform {
@@ -13107,6 +13147,7 @@ mod tests {
             }],
         };
         let direct_scene = |scroll_y: f32| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Transform {
@@ -13152,6 +13193,7 @@ mod tests {
     #[test]
     fn moving_paint_layer_payload_cache_reuses_exact_run_across_layer_generation_change() {
         let candidate_scene = |content_generation: u64, y: f32| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Transform {
@@ -13191,6 +13233,7 @@ mod tests {
     #[test]
     fn moving_paint_layer_payload_cache_reuses_payload_after_nested_scroll_translation() {
         let candidate_scene = |scroll_y: f32| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Transform {
@@ -13206,6 +13249,7 @@ mod tests {
             }],
         };
         let direct_scene = |scroll_y: f32| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Transform {
@@ -13261,6 +13305,7 @@ mod tests {
             radii: None,
         };
         let candidate_scene = |scroll_y: f32| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Clip {
@@ -13276,6 +13321,7 @@ mod tests {
             }],
         };
         let direct_scene = |scroll_y: f32| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Clip {
@@ -13372,6 +13418,7 @@ mod tests {
             radii: None,
         };
         let candidate_scene = |scroll_y: f32| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Clip {
@@ -13387,6 +13434,7 @@ mod tests {
             }],
         };
         let direct_scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Clip {
@@ -13548,6 +13596,7 @@ mod tests {
             ))]
         };
         let image_scene = || RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(
@@ -13752,6 +13801,7 @@ mod tests {
             40,
             10,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![
@@ -13794,6 +13844,7 @@ mod tests {
             50,
             10,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![
@@ -13829,6 +13880,7 @@ mod tests {
             40,
             10,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![
@@ -13866,6 +13918,7 @@ mod tests {
             40,
             24,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![RenderNode::Alpha {
@@ -13895,6 +13948,7 @@ mod tests {
             120,
             32,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![RenderNode::Alpha {
@@ -13926,6 +13980,7 @@ mod tests {
             48,
             32,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![RenderNode::Alpha {
@@ -13966,6 +14021,7 @@ mod tests {
             16,
             16,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![RenderNode::Alpha {
@@ -13995,6 +14051,7 @@ mod tests {
     #[test]
     fn test_clipped_single_primitive_alpha_preserves_clip_without_layer() {
         let scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Clip {
@@ -14037,6 +14094,7 @@ mod tests {
             60,
             10,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![
@@ -14838,6 +14896,7 @@ mod tests {
             4,
             4,
             RenderScene {
+                scroll_fling: None,
                 fonts: None,
                 images: None,
                 nodes: vec![RenderNode::Primitive(DrawPrimitive::Image(
@@ -14925,6 +14984,7 @@ mod tests {
         cache_test_svg_asset(image_id, 2, 2, svg);
 
         let scene = || RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Primitive(DrawPrimitive::Image(
@@ -15676,6 +15736,7 @@ mod tests {
         let width = 64;
         let height = 36;
         let scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::Alpha {
@@ -15752,6 +15813,7 @@ mod tests {
         let width = 32;
         let height = 32;
         let scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![
@@ -15812,6 +15874,7 @@ mod tests {
         let width = 64;
         let height = 36;
         let scene = RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![
@@ -15934,6 +15997,7 @@ mod tests {
                 10,
                 10,
                 RenderScene {
+                    scroll_fling: None,
                     fonts: None,
                     images: None,
                     nodes: vec![RenderNode::Primitive(
@@ -16053,6 +16117,7 @@ mod tests {
             let scene =
                 layout_and_refresh_default(&mut tree, Constraint::new(240.0, 200.0), 1.0).scene;
             RenderScene {
+                scroll_fling: None,
                 fonts: scene.fonts,
                 images: scene.images,
                 nodes: vec![RenderNode::PaintLayer(moving_paint_layer(
@@ -16114,6 +16179,7 @@ mod tests {
             ..RendererCacheConfig::default()
         });
         let scene = |middle, generation| RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(moving_paint_layer(
@@ -16230,6 +16296,7 @@ mod base_snapshot_tests {
 
     fn scene(children: Vec<RenderNode>) -> RenderScene {
         RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(layer(
@@ -16624,6 +16691,7 @@ mod idle_animation_tests {
             })
             .collect();
         RenderScene {
+            scroll_fling: None,
             fonts: None,
             images: None,
             nodes: vec![RenderNode::PaintLayer(

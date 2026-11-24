@@ -31,6 +31,10 @@ pub(crate) trait BackendWake: Send + Sync {
 
     fn notify_video_frame(&self);
 
+    /// One Raven patch: the running fling, for a presenter that carries it on
+    /// (crate::scroll_fling).
+    fn set_scroll_fling(&self, _fling: Option<crate::scroll_fling::ScrollFling>) {}
+
     fn set_frame_rate(&self, _fps: Option<u32>) -> Result<(), String> {
         Err("this backend does not support live frame caps".into())
     }
@@ -96,6 +100,10 @@ impl BackendWakeHandle {
 
     pub(crate) fn notify_video_frame(&self) {
         self.inner.notify_video_frame();
+    }
+
+    pub(crate) fn set_scroll_fling(&self, fling: Option<crate::scroll_fling::ScrollFling>) {
+        self.inner.set_scroll_fling(fling);
     }
 }
 

@@ -4176,6 +4176,7 @@ fn scene_without_moving_paint_layers(
     scene: crate::render_scene::RenderScene,
 ) -> crate::render_scene::RenderScene {
     crate::render_scene::RenderScene {
+        scroll_fling: None,
         fonts: None,
         images: None,
         nodes: nodes_without_moving_paint_layers(scene.nodes),

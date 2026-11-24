@@ -50,6 +50,7 @@ mod native_log;
 pub mod paint_layer_payload_cache;
 pub mod render_color;
 pub mod render_scene;
+pub mod scroll_fling;
 pub mod renderer;
 pub mod runtime;
 pub mod services;
@@ -2795,12 +2796,14 @@ fn start_native_renderer_with_config(
             })?;
             let (control_tx, control_rx) = bounded(64);
             let input_gate = Arc::new(AtomicBool::new(false));
+            let scroll_fling = scroll_fling::slot();
             backend_wake = BackendWakeHandle::new(drm::DrmBackendWake::new(
                 presenter_wake.clone(),
                 input_wake.clone(),
                 control_tx,
                 input_gate.clone(),
                 selected_rendering_api.supports_drm_power(),
+                scroll_fling.clone(),
             ));
 
             let (screen_tx, screen_rx) = bounded(1);
@@ -2879,6 +2882,7 @@ fn start_native_renderer_with_config(
                 drm::run(
                     drm::DrmRunContext {
                         input_gate,
+                        scroll_fling,
                         control_rx,
                         presenter: None,
                         lifecycle: drm_lifecycle,

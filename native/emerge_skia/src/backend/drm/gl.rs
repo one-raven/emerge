@@ -2634,8 +2634,12 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
         stats,
         latest_frame,
         video_registry,
+        scroll_fling,
         ..
     } = context;
+    // One Raven patch: flings carried on by this thread (crate::scroll_fling).
+    let mut fling_carrier = crate::scroll_fling::Carrier::default();
+    let mut fling_carried = false;
 
     if let Err(err) = video_registry.set_prime_video_available(false) {
         native_log.warning("video", format!("failed to disable PRIME video: {err}"));
@@ -3906,7 +3910,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                             last_primary_presented_at,
                             animation_retry_at,
                             frame_interval,
-                            animation_divisor,
+                            if fling_carried { 1 } else { animation_divisor },
                         );
                         if Instant::now() >= due_at {
                             animation_retry_at = None;
@@ -3944,12 +3948,21 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                             // are sampled for this frame's expected scanout.
                             let advance = render_state
                                 .advance_renderer_animations(now + frame_interval);
-                            renderer_animations_active = advance.found;
+                            // One Raven patch: a fling, carried on to this
+                            // frame's expected scanout.
+                            let fling = fling_carrier.advance(
+                                &mut render_state.scene,
+                                render_state.render_version,
+                                crate::scroll_fling::current(&scroll_fling),
+                                now + frame_interval,
+                            );
+                            fling_carried = fling.active;
+                            renderer_animations_active = advance.found || fling.active;
                             // One Raven patch: partial redraw. A frame whose only
                             // change is renderer-driven animation redraws its
                             // damage, unioned over the frames this back buffer
                             // missed (EGL buffer age); anything else, full.
-                            let animation_only = advance.found
+                            let animation_only = (advance.found || fling.active || fling.changed)
                                 && last_drawn_scene_version == Some(render_state.render_version)
                                 && !cursor_visible
                                 && render_state.video_target_ids.is_empty();
@@ -3958,6 +3971,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                             // the keyframes) isn't drawn or presented.
                             let unchanged_animation_frame = animation_only
                                 && !advance.changed
+                                && !fling.changed
                                 && animation_armed_generation == Some(desired_primary_generation)
                                 && !video_sync_required
                                 && capture_request_generation.is_none();
@@ -3974,7 +3988,11 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                     accounting.animation_frame_unchanged(animation_divisor);
                                 }
                             } else {
-                                damage_history.push_front(if animation_only { advance.damage } else { None });
+                                damage_history.push_front(if animation_only && !fling.changed {
+                                    advance.damage
+                                } else {
+                                    None
+                                });
                                 damage_history.truncate(4);
                                 let buffer_age = egl_surface_attribute(
                                     &egl_state.egl,
@@ -4376,7 +4394,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                             last_primary_presented_at,
                             animation_retry_at,
                             frame_interval,
-                            animation_divisor,
+                            if fling_carried { 1 } else { animation_divisor },
                         );
                         next_deadline = Some(next_deadline.map_or(due_at, |deadline| deadline.min(due_at)));
                     }

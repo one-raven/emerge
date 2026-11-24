@@ -47,6 +47,7 @@ pub(crate) struct DrmBackendWake {
     presenter_wake: EventFd,
     input_wake: EventFd,
     control_tx: Sender<crate::runtime::config::ConfigRequest>,
+    scroll_fling: crate::scroll_fling::ScrollFlingSlot,
 }
 
 impl DrmBackendWake {
@@ -56,6 +57,7 @@ impl DrmBackendWake {
         control_tx: Sender<crate::runtime::config::ConfigRequest>,
         input_gate: Arc<AtomicBool>,
         power_supported: bool,
+        scroll_fling: crate::scroll_fling::ScrollFlingSlot,
     ) -> Self {
         Self {
             presenter_wake,
@@ -63,6 +65,7 @@ impl DrmBackendWake {
             control_tx,
             input_gate,
             power_supported,
+            scroll_fling,
         }
     }
 }
@@ -103,6 +106,11 @@ impl BackendWake for DrmBackendWake {
     }
 
     fn notify_video_frame(&self) {
+        let _ = self.presenter_wake.signal();
+    }
+
+    fn set_scroll_fling(&self, fling: Option<crate::scroll_fling::ScrollFling>) {
+        crate::scroll_fling::set(&self.scroll_fling, fling);
         let _ = self.presenter_wake.signal();
     }
 }
@@ -169,6 +177,8 @@ impl DrmBackendStartupInfo {
 #[derive(Clone)]
 pub(crate) struct DrmRunContext {
     pub(crate) input_gate: Arc<AtomicBool>,
+    /// One Raven patch: the fling the presenter carries on.
+    pub(crate) scroll_fling: crate::scroll_fling::ScrollFlingSlot,
     pub(crate) control_rx: Receiver<crate::runtime::config::ConfigRequest>,
     pub(crate) presenter: Option<power::PresenterControl>,
     pub(crate) lifecycle: Arc<crate::runtime::lifecycle::Lifecycle>,

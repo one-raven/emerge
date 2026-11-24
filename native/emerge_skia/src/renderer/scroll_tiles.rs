@@ -177,11 +177,15 @@ impl PlanBuilder {
         if (c1 - c0) > 256 || (r1 - r0) > 4096 {
             return;
         }
-        let ordinal = self.leaves;
+        // One Raven patch: the key is what this tile draws, in order (`mix`
+        // is order-sensitive). It mixed in each leaf's ordinal in the whole
+        // layer too, so content culled above the viewport when the window
+        // moved changed the key of every tile below it: a whole viewport
+        // rasterized again (24 tiles, 35-40 ms) at every re-anchor.
         for row in r0..=r1 {
             for col in c0..=c1 {
                 let info = self.tiles.entry((col, row)).or_default();
-                info.key = mix(mix(info.key, hash), ordinal);
+                info.key = mix(info.key, hash);
                 info.dynamic |= dynamic;
             }
         }
@@ -351,6 +355,70 @@ fn plan_nodes(builder: &mut PlanBuilder, nodes: &[RenderNode], transform: Affine
     }
 }
 
+/// One Raven patch: the runs `make_plan` would record for `layers` (each
+/// overlay's innermost run), without the rest of a plan.
+fn overlay_runs(
+    nodes: &[RenderPaintLayerContentNode],
+    run: Option<usize>,
+    layers: &HashSet<PaintLayerId>,
+    out: &mut HashSet<usize>,
+) {
+    for node in nodes {
+        match node {
+            RenderPaintLayerContentNode::Own(own) => overlay_runs_in_nodes(
+                &own.nodes,
+                Some(Arc::as_ptr(&own.nodes) as usize),
+                layers,
+                out,
+            ),
+            RenderPaintLayerContentNode::Child(layer) => overlay_runs_in_layer(layer, run, layers, out),
+            RenderPaintLayerContentNode::ShadowPass { children }
+            | RenderPaintLayerContentNode::Clip { children, .. }
+            | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+            | RenderPaintLayerContentNode::Transform { children, .. }
+            | RenderPaintLayerContentNode::Alpha { children, .. } => {
+                overlay_runs(children, run, layers, out)
+            }
+        }
+    }
+}
+
+fn overlay_runs_in_layer(
+    layer: &RenderPaintLayer,
+    run: Option<usize>,
+    layers: &HashSet<PaintLayerId>,
+    out: &mut HashSet<usize>,
+) {
+    if layer_is_dynamic(layer) {
+        if layers.contains(&layer.id)
+            && let Some(run) = run
+        {
+            out.insert(run);
+        }
+        return;
+    }
+    overlay_runs(&layer.content.nodes, run, layers, out);
+}
+
+fn overlay_runs_in_nodes(
+    nodes: &[RenderNode],
+    run: Option<usize>,
+    layers: &HashSet<PaintLayerId>,
+    out: &mut HashSet<usize>,
+) {
+    for node in nodes {
+        match node {
+            RenderNode::ShadowPass { children }
+            | RenderNode::Clip { children, .. }
+            | RenderNode::RelaxedClip { children, .. }
+            | RenderNode::Transform { children, .. }
+            | RenderNode::Alpha { children, .. } => overlay_runs_in_nodes(children, run, layers, out),
+            RenderNode::PaintLayer(layer) => overlay_runs_in_layer(layer, run, layers, out),
+            RenderNode::Primitive(_) => {}
+        }
+    }
+}
+
 fn clip_context(context: u64, clips: &[ClipShape], tag: u64) -> u64 {
     let mut hasher = FastHasher::new();
     hash_paint_layer_clip_shapes(&mut hasher, clips, PaintLayerHashFloat::Exact);
@@ -490,6 +558,26 @@ impl ScrollTiles {
         let state = match entry {
             std::collections::hash_map::Entry::Occupied(occupied) => {
                 let state = occupied.into_mut();
+                // One Raven patch: the same build copied on write by the
+                // render thread (to advance a renderer-driven animation in
+                // it) keeps its plan; only the overlay runs moved.
+                if !Arc::ptr_eq(&state.content, &layer.content)
+                    && state.content.source.same_build(layer.content.source)
+                    && state.plan.current(scale)
+                {
+                    let mut runs = HashSet::new();
+                    overlay_runs(
+                        &layer.content.nodes,
+                        None,
+                        &state.plan.overlays.layers,
+                        &mut runs,
+                    );
+                    state.plan.overlays = Arc::new(Overlays {
+                        layers: state.plan.overlays.layers.clone(),
+                        runs,
+                    });
+                    state.content = Arc::clone(&layer.content);
+                }
                 if !Arc::ptr_eq(&state.content, &layer.content) || !state.plan.current(scale) {
                     state.content = Arc::clone(&layer.content);
                     state.plan = make_plan(layer, scale);
@@ -947,5 +1035,118 @@ mod tests {
         let after = make_plan(&base(0x808080ff), 1.0);
         assert_eq!(before.tiles[&(0, 0)].key, after.tiles[&(0, 0)].key);
         assert_ne!(before.tiles[&(0, 2)].key, after.tiles[&(0, 2)].key);
+    }
+
+    // One Raven patch: content culled above (the scroll window moved down)
+    // leaves the keys of the tiles below it alone.
+    #[test]
+    fn content_dropped_above_leaves_the_keys_below() {
+        let below = || {
+            vec![
+                rect(0.0, 600.0, 100.0, 100.0, 0x404040ff),
+                rect(20.0, 620.0, 40.0, 40.0, 0x808080ff),
+            ]
+        };
+        let mut with_top = vec![rect(0.0, 0.0, 100.0, 100.0, 0x202020ff)];
+        with_top.extend(below());
+        let before = make_plan(&layer(1, PaintLayerReason::ScrollContent, with_top), 1.0);
+        let after = make_plan(&layer(1, PaintLayerReason::ScrollContent, below()), 1.0);
+        assert_eq!(before.tiles[&(0, 2)].key, after.tiles[&(0, 2)].key);
+        // Order within a tile still counts.
+        let mut swapped = below();
+        swapped.reverse();
+        let swapped = make_plan(&layer(1, PaintLayerReason::ScrollContent, swapped), 1.0);
+        assert_ne!(after.tiles[&(0, 2)].key, swapped.tiles[&(0, 2)].key);
+    }
+
+    // One Raven patch: a new scene takes the render thread's advanced copy
+    // of the same build, and only that.
+    #[test]
+    fn a_new_scene_adopts_the_advanced_copy_of_its_scroll_content() {
+        let content = layer(
+            1,
+            PaintLayerReason::ScrollContent,
+            vec![rect(0.0, 0.0, 100.0, 100.0, 0x202020ff), spinner(10.0, 10.0)],
+        );
+        let page = |content: RenderPaintLayer| {
+            vec![RenderNode::PaintLayer(layer(
+                7,
+                PaintLayerReason::Root,
+                vec![RenderNode::Transform {
+                    transform: Affine2::translation(0.0, -50.0),
+                    children: vec![RenderNode::PaintLayer(content)],
+                }],
+            ))]
+        };
+        let mut advanced = content.clone();
+        advanced.content = Arc::new((*content.content).clone());
+        let old = page(advanced.clone());
+        let mut new = page(content.clone());
+        crate::render_scene::adopt_advanced_scroll_content(&mut new, &old);
+        let adopted = |nodes: &[RenderNode]| {
+            let RenderNode::PaintLayer(root) = &nodes[0] else {
+                unreachable!()
+            };
+            let mut found = None;
+            fn find(
+                nodes: &[RenderPaintLayerContentNode],
+                found: &mut Option<Arc<RenderPaintLayerContent>>,
+            ) {
+                for node in nodes {
+                    match node {
+                        RenderPaintLayerContentNode::Child(layer)
+                            if layer.id.role == PaintLayerReason::ScrollContent =>
+                        {
+                            *found = Some(Arc::clone(&layer.content));
+                        }
+                        RenderPaintLayerContentNode::Transform { children, .. }
+                        | RenderPaintLayerContentNode::Clip { children, .. } => {
+                            find(children, found)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            find(&root.content.nodes, &mut found);
+            found.expect("scroll content")
+        };
+        assert!(Arc::ptr_eq(&adopted(&new), &advanced.content));
+        // A different build is left alone.
+        let rebuilt = layer(1, PaintLayerReason::ScrollContent, vec![rect(0.0, 0.0, 100.0, 100.0, 0x202020ff)]);
+        let mut other = page(rebuilt.clone());
+        crate::render_scene::adopt_advanced_scroll_content(&mut other, &old);
+        assert!(Arc::ptr_eq(&adopted(&other), &rebuilt.content));
+    }
+
+    // One Raven patch: the overlay runs of a copy of the same build are found
+    // again without a new plan.
+    #[test]
+    fn overlay_runs_follow_a_copy_of_the_same_build() {
+        // The spinner inside a run, as a transformed or clipped one is.
+        let mut content = layer(1, PaintLayerReason::ScrollContent, Vec::new());
+        content.content = Arc::new(RenderPaintLayerContent::new(vec![
+            RenderPaintLayerContentNode::Own(crate::render_scene::RenderPaintRun {
+                slot: 0,
+                bounds: GeometryRect::default(),
+                nodes: Arc::new(vec![
+                    rect(0.0, 0.0, 1000.0, 600.0, 0x202020ff),
+                    spinner(100.0, 100.0),
+                ]),
+                metrics: Default::default(),
+            }),
+        ]));
+        let plan = make_plan(&content, 1.0);
+        assert_eq!(plan.overlays.runs.len(), 1);
+        let mut copy = (*content.content).clone();
+        for node in &mut copy.nodes {
+            if let RenderPaintLayerContentNode::Own(run) = node {
+                run.nodes = Arc::new((*run.nodes).clone());
+            }
+        }
+        assert!(copy.source.same_build(content.content.source));
+        let mut runs = HashSet::new();
+        overlay_runs(&copy.nodes, None, &plan.overlays.layers, &mut runs);
+        assert_eq!(runs.len(), plan.overlays.runs.len());
+        assert!(runs.is_disjoint(&plan.overlays.runs));
     }
 }

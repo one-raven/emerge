@@ -106,16 +106,17 @@ fn a_scroll_within_the_window_reuses_the_content_layer() {
     assert!(render_scene_to_pixels(100, 60, after) == expected);
 }
 
-// One Raven patch: the window stays while the viewport is inside it and
-// moves ahead in the direction of travel, so a long scroll rebuilds rarely.
+// One Raven patch: the window stays while the viewport is inside it, moves
+// once less than a viewport is left ahead of moving content, and then
+// reaches ahead in the direction of travel, so a long scroll rebuilds rarely.
 #[test]
 fn the_window_moves_only_near_its_edge_and_then_ahead() {
     let mut tree = super::pipeline::build_manual_scroll_row_tree(120);
     let first = scroll_layer(&scene(&tree)).expect("scroll layer");
     tree.clear_refresh_dirty();
-    // The window covers 398.5..612.5; a viewport 50 px tall stays inside it
-    // (12.5 px from its end) up to an offset of 549.5.
-    for offset in (505..=545).step_by(5) {
+    // The window covers 398.5..612.5; moving down, a viewport 50 px tall
+    // keeps it while a viewport is left ahead, up to an offset of 512.
+    for offset in (505..=510).step_by(5) {
         set_offset(&mut tree, rows_root(), offset as f32);
         let layer = scroll_layer(&scene(&tree)).expect("scroll layer");
         assert!(
@@ -124,12 +125,12 @@ fn the_window_moves_only_near_its_edge_and_then_ahead() {
         );
         tree.clear_refresh_dirty();
     }
-    set_offset(&mut tree, rows_root(), 560.0);
+    set_offset(&mut tree, rows_root(), 520.0);
     let moved = scroll_layer(&scene(&tree)).expect("scroll layer");
     assert!(!std::sync::Arc::ptr_eq(&first.content, &moved.content));
     tree.clear_refresh_dirty();
-    // It moved ahead, to 497..711: the next 80 px forward reuse it.
-    for offset in (570..=640).step_by(10) {
+    // It moved ahead, to 457..671: the next 50 px forward reuse it.
+    for offset in (530..=570).step_by(10) {
         set_offset(&mut tree, rows_root(), offset as f32);
         let layer = scroll_layer(&scene(&tree)).expect("scroll layer");
         assert!(
@@ -141,7 +142,7 @@ fn the_window_moves_only_near_its_edge_and_then_ahead() {
     let expected = {
         let mut tree = super::pipeline::build_manual_scroll_row_tree(120);
         tree.compositor_scroll = false;
-        set_offset(&mut tree, rows_root(), 640.0);
+        set_offset(&mut tree, rows_root(), 570.0);
         pixels(&tree, 100, 60)
     };
     assert!(pixels(&tree, 100, 60) == expected);
@@ -274,12 +275,13 @@ fn a_scroll_rasterizes_only_tiles_that_come_into_view() {
     let _ = draw(&mut renderer, &tree);
     let second = renderer.scroll_tile_counts();
     assert_eq!(second.rasterized, first.rasterized, "{first:?} {second:?}");
-    // A whole tile row further: at most one new row (one tile wide here).
+    // A whole tile row further: the new row, and (as the window moved ahead)
+    // the row that held the old window's edge (one tile wide here).
     set_offset(&mut tree, NodeId::from_u64(2), 134.0 + 256.0);
     let _ = draw(&mut renderer, &tree);
     let third = renderer.scroll_tile_counts();
     assert!(
-        third.rasterized - second.rasterized <= 2,
+        third.rasterized - second.rasterized <= 3,
         "{second:?} {third:?}"
     );
 }
