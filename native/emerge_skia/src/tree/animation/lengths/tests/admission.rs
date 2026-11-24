@@ -8,6 +8,7 @@ fn change_event(d: &Driver, target: Length, ms: f64) -> Event {
         field: change::Field::Width,
         duration_ms: ms,
         curve: AnimationCurve::Linear,
+        from: None,
     }]));
     Event::Attrs(id(2), Box::new(attrs))
 }
@@ -75,7 +76,12 @@ fn failed_change_b_then_a_restores_committed_generation_clock_and_source() {
         let now = &d.runtime.changes[&(id(2), change::Field::Width)];
         assert_eq!(now.generation, original.generation);
         assert_eq!(now.started_at, original.started_at);
-        assert!(Arc::ptr_eq(&now.source, &original.source));
+        assert!(
+            now.source
+                .as_ref()
+                .zip(original.source.as_ref())
+                .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+        );
         assert!(Arc::ptr_eq(&now.spec, &original.spec));
         assert_eq!(d.runtime.changes.record_counts(), (1, 0));
         close(extent(&d.tree, 2, Axis::Width), 137.5);
@@ -91,7 +97,13 @@ fn retrying_failed_b_keeps_its_clock_and_source_instead_of_restarting() {
     let current = &d.runtime.changes[&(id(2), change::Field::Width)];
     assert_eq!(current.generation, generation);
     assert_eq!(current.started_at, candidate.started_at);
-    assert!(Arc::ptr_eq(&current.source, &candidate.source));
+    assert!(
+        current
+            .source
+            .as_ref()
+            .zip(candidate.source.as_ref())
+            .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+    );
     assert_eq!(d.runtime.changes.record_counts(), (1, 0));
     close(extent(&d.tree, 2, Axis::Width), 191.25);
 }
@@ -104,7 +116,12 @@ fn failed_b_then_c_uses_the_first_published_source_and_discards_b() {
     assert!(d.step(750_000, vec![c, viewport(600.0)]).result.is_ok());
     let entry = &d.runtime.changes[&(id(2), change::Field::Width)];
     assert!(entry.generation.0 > b_generation.0);
-    close(entry.source.dimensions[0].unwrap().visible, 105.0);
+    close(
+        entry.source.as_ref().unwrap().dimensions[0]
+            .unwrap()
+            .visible,
+        105.0,
+    );
     close(extent(&d.tree, 2, Axis::Width), 105.0);
     assert!(rejected.upgrade().is_none());
     assert_eq!(d.runtime.changes.record_counts(), (1, 0));
@@ -134,7 +151,12 @@ fn published_b_then_a_is_a_new_interruption_not_a_restore() {
     assert!(d.step(750_000, vec![a]).result.is_ok());
     let current = &d.runtime.changes[&(id(2), change::Field::Width)];
     assert!(current.generation.0 > published_b.0 && published_b.0 > original.0);
-    close(current.source.dimensions[0].unwrap().visible, 191.25);
+    close(
+        current.source.as_ref().unwrap().dimensions[0]
+            .unwrap()
+            .visible,
+        191.25,
+    );
     close(extent(&d.tree, 2, Axis::Width), 191.25);
 }
 #[test]
@@ -285,6 +307,7 @@ fn retry_of_same_target_keeps_a_staged_enter_handoff_on_its_existing_generation(
         field: change::Field::Alpha,
         duration_ms: 1000.0,
         curve: AnimationCurve::Linear,
+        from: None,
     }]));
     assert!(
         d.step(500_000, vec![Event::Attrs(id(2), Box::new(target.clone()))])
@@ -376,6 +399,7 @@ fn held_enter_with_pending_width_and_paint() -> Driver {
                 field,
                 duration_ms: 1000.0,
                 curve: AnimationCurve::Linear,
+                from: None,
             })
             .collect(),
     ));

@@ -78,6 +78,7 @@ fn visual_tree(a: Length, b: Length, axis: Axis, owner: u8) -> ElementTree {
             },
             duration_ms: 1000.0,
             curve: AnimationCurve::Linear,
+            from: None,
         }]));
     } else if owner == 3 {
         node.spec.declared.animate_exit = node.spec.declared.animate.take();

@@ -79,19 +79,64 @@ defmodule Emerge.Engine.AttrValidation do
     raise ArgumentError, "change expects a list of animatable attributes, got: #{inspect(attrs)}"
   end
 
+  # One Raven patch: `from:` values, eased from on the element's first mount.
+  # Each names a field of `attrs` and must animate to its target.
+  def normalize_change!(attrs, duration, curve, from) when is_list(from) do
+    triples = normalize_change!(attrs, duration, curve)
+
+    targets =
+      Enum.reduce(triples, %{}, fn {key, value, _policy}, acc ->
+        put_change_value(acc, key, value)
+      end)
+
+    from =
+      Enum.reduce(from, %{}, fn attr, acc ->
+        case normalize_animation_attr!("change from", attr) do
+          {key, value} -> put_change_value(acc, key, value)
+          _ -> raise ArgumentError, "change from expects non-nil animatable attributes"
+        end
+      end)
+
+    Enum.each(from, fn {key, value} ->
+      unless Map.has_key?(targets, key),
+        do: raise(ArgumentError, "change from #{inspect(key)} has no target in the change")
+
+      validate_animation_compatibility!("change from", key, value, Map.fetch!(targets, key), 2)
+    end)
+
+    Enum.map(triples, fn {key, value, policy} ->
+      case Map.fetch(from, key) do
+        {:ok, start} -> {key, value, Map.put(policy, :from, start)}
+        :error -> {key, value, policy}
+      end
+    end)
+  end
+
+  def normalize_change!(_attrs, _duration, _curve, from) do
+    raise ArgumentError,
+          "change from expects a list of animatable attributes, got: #{inspect(from)}"
+  end
+
+  defp put_change_value(acc, :box_shadow, value),
+    do: Map.update(acc, :box_shadow, List.wrap(value), &(&1 ++ List.wrap(value)))
+
+  defp put_change_value(acc, key, value), do: Map.put(acc, key, value)
+
   def normalize_change_policies!(policies) when is_map(policies) do
     Map.new(policies, fn {key, policy} ->
       unless MapSet.member?(@animatable_key_set, key),
         do: raise(ArgumentError, "invalid change field: #{inspect(key)}")
 
-      unless is_map(policy) and map_size(policy) == 2 and Map.has_key?(policy, :duration) and
-               Map.has_key?(policy, :curve),
-             do: raise(ArgumentError, "change policy expects :duration and :curve")
+      unless is_map(policy) and Map.has_key?(policy, :duration) and
+               Map.has_key?(policy, :curve) and
+               map_size(policy) == if(Map.has_key?(policy, :from), do: 3, else: 2),
+             do:
+               raise(ArgumentError, "change policy expects :duration, :curve and optional :from")
 
       %{duration: duration, curve: curve} = policy
       validate_animation_duration!("change", duration)
       validate_animation_curve!("change", curve)
-      {key, %{duration: duration, curve: curve}}
+      {key, Map.take(policy, [:duration, :curve, :from])}
     end)
   end
 

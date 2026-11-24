@@ -221,6 +221,7 @@ mod tests {
             field,
             duration_ms: 1000.0,
             curve: AnimationCurve::Linear,
+            from: None,
         }
     }
     #[test]

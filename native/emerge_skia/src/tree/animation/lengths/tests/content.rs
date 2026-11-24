@@ -13,6 +13,7 @@ fn content_tree(text: &str) -> ElementTree {
         field: Field::Width,
         duration_ms: 1000.0,
         curve: AnimationCurve::Linear,
+        from: None,
     }]));
     tree.insert(Element::with_attrs(
         id(4),
@@ -231,6 +232,7 @@ fn content_both_axes_use_joint_native_destinations_at_all_scales() {
                 field: Field::Height,
                 duration_ms: 1000.0,
                 curve: AnimationCurve::Linear,
+                from: None,
             });
             let mut d = Driver::new(tree, Instant::now(), mode);
             assert!(
@@ -491,6 +493,7 @@ fn nested_content_policies_share_destinations_without_sample_feedback() {
                 field: Field::Width,
                 duration_ms: 2000.0,
                 curve: AnimationCurve::Linear,
+                from: None,
             }]));
         let mut d = Driver::new(tree, Instant::now(), mode);
         d.step(0, vec![]);

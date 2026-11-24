@@ -542,6 +542,7 @@ fn change_handoff_during_move_uses_first_published_native_source() {
         field: Field::Width,
         duration_ms: 1000.0,
         curve: AnimationCurve::Linear,
+        from: None,
     }]));
     let out = d.step(600_000, vec![Event::Attrs(id(2), Box::new(attrs))]);
     assert!(out.result.is_ok(), "{:?}", out.result);

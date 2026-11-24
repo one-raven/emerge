@@ -322,6 +322,9 @@ defmodule Emerge.UI.Internal.Validation do
           {attrs, duration, curve} ->
             {:animate_change, AttrValidation.normalize_change!(attrs, duration, curve)}
 
+          {attrs, duration, curve, from} ->
+            {:animate_change, AttrValidation.normalize_change!(attrs, duration, curve, from)}
+
           _ ->
             raise ArgumentError, "change expects an attribute list, duration and curve"
         end

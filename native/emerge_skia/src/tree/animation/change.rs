@@ -203,6 +203,9 @@ pub struct ChangePolicy {
     pub field: Field,
     pub duration_ms: f64,
     pub curve: AnimationCurve,
+    /// One Raven patch: the value (this field only) the element eases from
+    /// when it first mounts. Upstream a first mount is immediate.
+    pub from: Option<Arc<Attrs>>,
 }
 #[derive(Clone, Debug)]
 pub(super) struct ChangeEntry {
@@ -211,7 +214,9 @@ pub(super) struct ChangeEntry {
     pub spec: Arc<AnimationSpec>,
     pub started_at: Instant,
     pub mount: u64,
-    pub source: Arc<source::PresentationSource>,
+    /// None for a run started on mount (`ChangePolicy::from`), which has no
+    /// presentation to interrupt, as an enter run has none.
+    pub source: Option<Arc<source::PresentationSource>>,
     pub pending: bool,
 }
 
@@ -235,6 +240,9 @@ pub(crate) fn validate_policies(attrs: &Attrs) -> Result<(), String> {
             return Err("invalid animate_change policy or missing target".into());
         }
         seen = seen.union(writes);
+        if let Some(from) = &policy.from {
+            validate_mount_from(policy.field, from, attrs)?;
+        }
         if attrs.animate.as_ref().is_some_and(|spec| {
             spec.keyframes
                 .iter()
@@ -244,6 +252,27 @@ pub(crate) fn validate_policies(attrs: &Attrs) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// One Raven patch: a `from` holds exactly its policy's field, and that value
+// can animate to the declared one.
+fn validate_mount_from(field: Field, from: &Attrs, attrs: &Attrs) -> Result<(), String> {
+    if !field.present(from) || field.extract(from) != *from {
+        return Err("animate_change from must hold only its field".into());
+    }
+    for length in from.width.iter().chain(from.height.iter()) {
+        super::validate_animated_length(length)?;
+    }
+    let target = Attrs {
+        animate_change: Some(Arc::new(vec![ChangePolicy {
+            field,
+            duration_ms: 1.0,
+            curve: AnimationCurve::Linear,
+            from: None,
+        }])),
+        ..field.extract(attrs)
+    };
+    validate_transition(from, &target)
 }
 
 pub(crate) fn validate_transition(before: &Attrs, after: &Attrs) -> Result<(), String> {
@@ -511,7 +540,7 @@ impl AnimationRuntime {
                             curve: policy.curve.clone(),
                             repeat: AnimationRepeat::Once,
                         }),
-                        source: Arc::clone(&source),
+                        source: Some(Arc::clone(&source)),
                         started_at: now,
                         mount: node.lifecycle.mounted_at_revision,
                         pending,
@@ -520,6 +549,65 @@ impl AnimationRuntime {
             }
         }
         Ok(completed)
+    }
+    /// One Raven patch: on an element's first mount, a policy with `from`
+    /// starts a change run from that value to the declared one, as if the
+    /// element had been showing `from`; later changes and interruptions are
+    /// ordinary. An enter animation writing the same field owns the mount.
+    pub(super) fn admit_mount_changes(
+        &mut self,
+        node: &crate::tree::element::Element,
+        now: Instant,
+    ) -> Result<(), ProjectionError> {
+        let Some(policies) = &node.spec.declared.animate_change else {
+            return Ok(());
+        };
+        let mount = node.lifecycle.mounted_at_revision;
+        let enter_writes = node
+            .spec
+            .declared
+            .animate_enter
+            .as_ref()
+            .map(super::fields::FieldMask::from_spec)
+            .unwrap_or_default();
+        for policy in policies.iter() {
+            let Some(from) = &policy.from else {
+                continue;
+            };
+            let key = (node.id, policy.field);
+            let target = policy.field.extract(&node.spec.declared);
+            if **from == target
+                || enter_writes.conflicts(super::fields::FieldMask::field(policy.field))
+                || self
+                    .changes
+                    .get(&key)
+                    .is_some_and(|entry| entry.mount == mount)
+            {
+                continue;
+            }
+            if !timing::valid_duration(policy.duration_ms, &AnimationRepeat::Once, now) {
+                return Err(ProjectionError::InvalidTiming(node.id));
+            }
+            let generation = self.allocate_generation()?;
+            self.changes.insert(
+                key,
+                ChangeEntry {
+                    resolved_target: None,
+                    generation,
+                    spec: Arc::new(AnimationSpec {
+                        keyframes: vec![(**from).clone(), target],
+                        duration_ms: policy.duration_ms,
+                        curve: policy.curve.clone(),
+                        repeat: AnimationRepeat::Once,
+                    }),
+                    source: None,
+                    started_at: now,
+                    mount,
+                    pending: false,
+                },
+            );
+        }
+        Ok(())
     }
     pub(super) fn handoff_changes(
         &mut self,
@@ -606,7 +694,7 @@ impl AnimationRuntime {
             }
             if let Some(entry) = self.changes.get_mut(&(id, field)) {
                 Arc::make_mut(&mut entry.spec).keyframes[0] = field.extract(&raw);
-                entry.source = Arc::clone(&source);
+                entry.source = Some(Arc::clone(&source));
                 entry.started_at = now;
                 entry.pending = false;
             }

@@ -334,14 +334,37 @@ defmodule Emerge.Engine.AttrCodec do
         [encode_atom(field), encode_f64(duration), encode_atom(curve)]
       end)
 
-    payload = [<<map_size(policies)::unsigned-16>>, entries]
+    # One Raven patch: `from:` values trail the entries, only when present.
+    from =
+      for {field, %{from: value}} <- Enum.sort(policies) do
+        attrs = encode_attrs(%{field => value})
+        [encode_atom(field), <<byte_size(attrs)::unsigned-32>>, attrs]
+      end
+
+    from_section = if from == [], do: [], else: [<<length(from)::unsigned-16>>, from]
+    payload = [<<map_size(policies)::unsigned-16>>, entries, from_section]
     [<<IO.iodata_length(payload)::unsigned-32>>, payload]
   end
 
   defp decode_change(<<len::unsigned-32, payload::binary-size(len), rest::binary>>) do
     <<count::unsigned-16, entries::binary>> = payload
-    {policies, <<>>} = decode_change_entries(entries, count, %{})
+    {policies, from_section} = decode_change_entries(entries, count, %{})
+    policies = decode_change_from(from_section, policies)
     {AttrValidation.normalize_change_policies!(policies), rest}
+  end
+
+  defp decode_change_from(<<>>, policies), do: policies
+
+  defp decode_change_from(<<count::unsigned-16, rest::binary>>, policies) do
+    {policies, <<>>} =
+      Enum.reduce(1..count//1, {policies, rest}, fn _, {policies, rest} ->
+        {field, rest} = decode_atom(rest)
+        <<len::unsigned-32, attrs::binary-size(len), rest::binary>> = rest
+        %{^field => value} = decode_attrs(attrs)
+        {Map.update!(policies, field, &Map.put(&1, :from, value)), rest}
+      end)
+
+    policies
   end
 
   defp decode_change_entries(rest, 0, acc), do: {acc, rest}

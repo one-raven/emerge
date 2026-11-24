@@ -515,6 +515,7 @@ fn a_cached_frame_on_an_unpublished_remount_is_not_an_implicit_change_source() {
             field: crate::tree::animation::change::Field::Width,
             duration_ms: 1000.0,
             curve: AnimationCurve::Linear,
+            from: None,
         },
     ]));
     assert!(source::PresentationSource::capture(&d.tree, &id(2)).is_none());
@@ -541,6 +542,7 @@ fn invalid_direct_ownership_keeps_successfully_admitted_prefix_clocks_on_retry()
             field: crate::tree::animation::change::Field::Width,
             duration_ms: 1000.0,
             curve: AnimationCurve::Linear,
+            from: None,
         },
     ]));
     let mut rt = AnimationRuntime::default();

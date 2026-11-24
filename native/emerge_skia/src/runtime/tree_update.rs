@@ -2733,6 +2733,7 @@ mod tests {
                     field: Field::Width,
                     duration_ms: 1000.0,
                     curve: AnimationCurve::Linear,
+                    from: None,
                 }])),
                 ..Default::default()
             },
@@ -2964,6 +2965,7 @@ mod tests {
                 field: Field::Width,
                 duration_ms: 1000.0,
                 curve: AnimationCurve::Linear,
+                from: None,
             }]));
             engine.tree.layout_model_epoch += 1;
             engine.tree.set_revision(2);
@@ -3445,6 +3447,7 @@ mod subtree_replace_tests {
                 field: Field::Width,
                 duration_ms: 100.0,
                 curve: AnimationCurve::Linear,
+                from: None,
             }]));
         let returning = id(OLD_LIST + 2 + 2 * 7);
         let mut inserted = new_list(3);

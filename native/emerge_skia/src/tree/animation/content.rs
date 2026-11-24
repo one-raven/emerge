@@ -319,7 +319,7 @@ impl AnimationRuntime {
                 }),
                 started_at: admitted_at,
                 mount: source.mounted_at,
-                source: Arc::new(source),
+                source: Some(Arc::new(source)),
                 pending,
             },
         );

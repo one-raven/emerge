@@ -183,6 +183,7 @@ fn change_target(tree: &mut ElementTree, width: Length, duration: f64) {
         field: Field::Width,
         duration_ms: duration,
         curve: AnimationCurve::Linear,
+        from: None,
     }]));
     tree.layout_model_epoch = tree.layout_model_epoch.wrapping_add(1);
     tree.set_revision(tree.revision() + 1);
@@ -458,6 +459,7 @@ fn completed_change_keeps_its_source_only_until_joint_release() {
             field: Field::Width,
             duration_ms: duration,
             curve: AnimationCurve::Linear,
+            from: None,
         }]));
         tree.mark_measure_dirty(&id(n));
     }
@@ -662,6 +664,7 @@ fn corrupt_structural_source_does_not_partially_replace_other_tracks_or_samples(
             field: Field::Width,
             duration_ms: 1000.0,
             curve: AnimationCurve::Linear,
+            from: None,
         }]));
         tree.insert(Element::with_attrs(
             id(4),
@@ -745,6 +748,7 @@ fn cancelling_last_mover_releases_completed_change_sources_in_the_same_sync() {
             field: Field::Width,
             duration_ms: duration,
             curve: AnimationCurve::Linear,
+            from: None,
         }]));
         tree.mark_measure_dirty(&id(n));
     }
@@ -786,6 +790,7 @@ fn change_arrival_at_old_barrier_joins_before_completion_and_retargets_the_hold(
         field: Field::Width,
         duration_ms: 1000.0,
         curve: AnimationCurve::Linear,
+        from: None,
     }]));
     tree.layout_model_epoch += 1;
     tree.set_revision(tree.revision() + 1);
@@ -889,6 +894,7 @@ fn bounded_static_sources_cannot_enter_implicit_change_runs() {
             field,
             duration_ms: 1000.0,
             curve: AnimationCurve::Linear,
+            from: None,
         }]));
         tree.bump_revision();
         tree.layout_model_epoch += 1;
@@ -948,6 +954,7 @@ fn min_max_keyframes_are_rejected_for_each_owner_and_axis() {
                     field,
                     duration_ms: 1000.0,
                     curve: AnimationCurve::Linear,
+                    from: None,
                 }]));
                 assert!(change::validate_transition(&before, &after).is_err());
             }
@@ -1300,6 +1307,8 @@ mod driver;
 mod support;
 
 mod admission;
+// One Raven patch: `ChangePolicy::from`.
+mod mount_from;
 
 mod application;
 

@@ -106,7 +106,7 @@ pub(super) struct Change {
     pub target: Attrs,
     pub pending: bool,
     pub phases: fields::PhaseMasks,
-    pub source: Source,
+    pub source: Option<Source>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct RegularFields {
@@ -188,7 +188,7 @@ impl Owners {
                                     .is_some_and(|now| entry_is_active(&e.spec, e.started_at, now)),
                                 rt.synced_sample_time,
                             ),
-                            source: Source::from(e.source.as_ref()),
+                            source: e.source.as_deref().map(Source::from),
                         },
                     )
                 })

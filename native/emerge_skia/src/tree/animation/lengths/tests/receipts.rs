@@ -194,7 +194,7 @@ fn a_delayed_receipt_cannot_retire_a_new_same_node_change_or_its_source() {
     rt.sync_with_tree(&tree, now);
     let entry = &rt.changes[&(id(2), change::Field::Width)];
     let generation = entry.generation;
-    let source = Arc::clone(&entry.source);
+    let source = Arc::clone(entry.source.as_ref().unwrap());
     assert!(generation.0 > old.0);
     assert_eq!(
         rt.finish_prepared_frame(&mut tree),
@@ -206,7 +206,10 @@ fn a_delayed_receipt_cannot_retire_a_new_same_node_change_or_its_source() {
     );
     assert!(Arc::ptr_eq(
         &source,
-        &rt.changes[&(id(2), change::Field::Width)].source
+        rt.changes[&(id(2), change::Field::Width)]
+            .source
+            .as_ref()
+            .unwrap()
     ));
     assert_eq!(rt.groups.len(), 1);
 }

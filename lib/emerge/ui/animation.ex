@@ -163,7 +163,9 @@ defmodule Emerge.UI.Animation do
   @type animate_attr :: {:animate, spec_map()}
   @type animate_enter_attr :: {:animate_enter, spec_map()}
   @type animate_exit_attr :: {:animate_exit, spec_map()}
-  @type change_attr :: {:animate_change, {Emerge.UI.attrs(), number(), curve()}}
+  @type change_attr ::
+          {:animate_change, {Emerge.UI.attrs(), number(), curve()}}
+          | {:animate_change, {Emerge.UI.attrs(), number(), curve(), Emerge.UI.attrs()}}
   @type t :: animate_attr() | animate_enter_attr() | animate_exit_attr() | change_attr()
 
   @doc """
@@ -173,9 +175,9 @@ defmodule Emerge.UI.Animation do
   An empty list is a no-op. Repeated attributes use the last value; separate calls
   can assign different timings to different properties.
 
-  First mount is immediate. Identical resolved targets and timing-only updates do not restart.
-  Interruption starts from the current native presentation. A later plain attribute
-  removes only its change policy.
+  First mount is immediate unless `from:` gives start values (see below). Identical
+  resolved targets and timing-only updates do not restart. Interruption starts from the
+  current native presentation. A later plain attribute removes only its change policy.
 
   Content width and height also transition when text, children or intrinsic font/image
   measurements change, even if the declared length stays `content()`. Animation's own
@@ -185,11 +187,38 @@ defmodule Emerge.UI.Animation do
 
       # Updating the text animates the retained element's resolved width.
       el([Animation.change([width(content())], 1000, :linear)], text(label))
+
+  ## Options
+
+    * `:from` - attrs to start from when the element first mounts, for some or all
+      of the changed attrs. The element eases from them to its targets as if it had
+      been showing them, so an element mounted mid-motion continues the motion.
+      Read only on mount; later updates animate as usual. An `animate_enter/4` of
+      the same attr owns the mount instead.
+
+          # A strip rebuilt at a new page slides in from where the old one was.
+          Animation.change([Transform.move_x(offset)], 280, :ease_out,
+            from: [Transform.move_x(previous_offset)]
+          )
   """
   @spec change(Emerge.UI.attrs(), number(), curve()) :: change_attr()
-  def change(attrs, duration, curve) do
+  @spec change(Emerge.UI.attrs(), number(), curve(), [{:from, Emerge.UI.attrs()}]) ::
+          change_attr()
+  def change(attrs, duration, curve, opts \\ [])
+
+  def change(attrs, duration, curve, []) do
     Emerge.Engine.AttrValidation.normalize_change!(attrs, duration, curve)
     {:animate_change, {attrs, duration, curve}}
+  end
+
+  # One Raven patch: `from:` start values for an element's first mount.
+  def change(attrs, duration, curve, from: from) do
+    Emerge.Engine.AttrValidation.normalize_change!(attrs, duration, curve, from)
+    {:animate_change, {attrs, duration, curve, from}}
+  end
+
+  def change(_attrs, _duration, _curve, opts) do
+    raise ArgumentError, "change accepts only a :from option, got: #{inspect(opts)}"
   end
 
   @doc "Animate animatable attrs across keyframes during normal updates."

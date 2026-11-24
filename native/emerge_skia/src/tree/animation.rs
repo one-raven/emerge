@@ -556,6 +556,10 @@ impl AnimationRuntime {
             // there. Same steps, skipping lookups into empty maps.
             let mount = element.lifecycle.mounted_at_revision;
             let newly_mounted = mount > self.last_seen_revision;
+            // One Raven patch: `Animation.change(..., from: ...)`.
+            if newly_mounted && element.spec.declared.animate_change.is_some() {
+                self.admit_mount_changes(element, started_at)?;
+            }
             if element.spec.declared.animate.is_none()
                 && element.spec.declared.animate_enter.is_none()
             {
@@ -1277,7 +1281,7 @@ fn selected_runs<'a>(
                     owner: groups::Owner::Change(field),
                     revision: 0,
                     generation: e.generation,
-                    source: Some(&e.source),
+                    source: e.source.as_deref(),
                 })
         }))
         .collect()

@@ -14,4 +14,5 @@ mod paint;
 mod paragraph;
 mod pipeline;
 mod scroll_nearby_clip;
+mod shadow_transform_clip;
 mod text;

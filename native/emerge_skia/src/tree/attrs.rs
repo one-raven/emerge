@@ -867,7 +867,7 @@ fn decode_change_policies(
     let data = cursor.read_bytes_u32()?;
     let mut nested = AttrCursor::new(&data);
     let count = nested.read_u16_be()?;
-    let policies = (0..count)
+    let mut policies = (0..count)
         .map(|_| {
             let name = nested.read_string_u16()?;
             let field = Field::from_name(&name).ok_or_else(|| {
@@ -889,9 +889,29 @@ fn decode_change_policies(
                 field,
                 duration_ms,
                 curve,
+                from: None,
             })
         })
         .collect::<Result<Vec<_>, DecodeError>>()?;
+    // One Raven patch: an optional trailing section holds the `from` values
+    // (`Animation.change(..., from: ...)`): a count, then per entry the field
+    // name and its value as an attrs blob. Absent unless a policy has one, so
+    // the payload is unchanged for every other policy.
+    if nested.remaining() != 0 {
+        let from_count = nested.read_u16_be()?;
+        for _ in 0..from_count {
+            let name = nested.read_string_u16()?;
+            let from = decode_attrs(&nested.read_bytes_u32()?)?;
+            let policy = policies
+                .iter_mut()
+                .find(|policy| Field::from_name(&name) == Some(policy.field))
+                .filter(|policy| policy.from.is_none())
+                .ok_or_else(|| {
+                    DecodeError::InvalidStructure(format!("invalid animate_change from: {name}"))
+                })?;
+            policy.from = Some(std::sync::Arc::new(from));
+        }
+    }
     if nested.remaining() != 0 {
         return Err(DecodeError::InvalidStructure(
             "animate_change trailing bytes".into(),

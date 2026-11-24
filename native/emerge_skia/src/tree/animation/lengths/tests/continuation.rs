@@ -2046,6 +2046,7 @@ fn upward_enter_and_change_owners_release_against_native_loop_forecasts() {
                         },
                         duration_ms: 1000.0,
                         curve: AnimationCurve::Linear,
+                        from: None,
                     }]));
                 } else {
                     root.lifecycle.mounted_at_revision = 1;
@@ -2435,6 +2436,7 @@ fn self_axis_wrapping() -> ElementTree {
         field: Field::Height,
         duration_ms: 1000.0,
         curve: AnimationCurve::Linear,
+        from: None,
     }]));
     for n in 10..18 {
         tree.insert(Element::with_attrs(
@@ -2887,6 +2889,7 @@ fn noncanonical_self_and_cross_axis_repeats_interruptions_and_failures_preserve_
                                             field: Field::Height,
                                             duration_ms: 4500.0,
                                             curve: curve.clone(),
+                                            from: None,
                                         }]));
                                     let owner = if cross {
                                         let policy = node.spec.declared.animate_change.take();
@@ -2976,6 +2979,7 @@ fn noncanonical_self_and_cross_axis_repeats_interruptions_and_failures_preserve_
                                         field,
                                         duration_ms: 800.0,
                                         curve: curve.clone(),
+                                        from: None,
                                     }]));
                                     let failed = d.attempt(
                                         2_250_000,
