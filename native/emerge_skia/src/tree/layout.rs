@@ -1303,9 +1303,9 @@ fn prepare_attrs_for_node_ix(
     let frame_attrs = frame_declared_attrs(element, samples);
     dimensions::prepare_scale(element, scale_factor);
     element.layout.effective = scale_attrs(&frame_attrs, scale_factor);
-        element.layout.renderer_animation = samples
-            .get(&element.id)
-            .and_then(|sample| sample.renderer_driven.clone());
+    element.layout.renderer_animation = samples
+        .get(&element.id)
+        .and_then(|sample| sample.renderer_driven.clone());
     element.normalize_extracted_state();
 
     Some(next_scale)

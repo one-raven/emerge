@@ -443,7 +443,8 @@ impl LayerRendererAnimation {
             spec_hash: self.revision,
             started_at: self.started_at,
         };
-        let sample = crate::tree::animation::sample_animation_spec(&self.spec, Some(&entry), Some(at));
+        let sample =
+            crate::tree::animation::sample_animation_spec(&self.spec, Some(&entry), Some(at));
         let mut attrs = self.base.clone();
         crate::tree::animation::apply_sample_attrs(&mut attrs, &sample.attrs);
         let transform = crate::tree::transform::element_transform(self.frame, &attrs);
@@ -460,14 +461,21 @@ impl RenderScene {
     /// One Raven patch: move every renderer-driven animation in this scene to
     /// time at, in place. Returns whether the scene has any, i.e. whether it
     /// needs drawing again next vblank.
-    pub fn advance_renderer_animations(&mut self, at: std::time::Instant) -> RendererAnimationAdvance {
+    pub fn advance_renderer_animations(
+        &mut self,
+        at: std::time::Instant,
+    ) -> RendererAnimationAdvance {
         let mut advance = RendererAnimationAdvance::default();
         advance_nodes(&mut self.nodes, at, &mut advance);
         advance
     }
 }
 
-fn advance_nodes(nodes: &mut [RenderNode], at: std::time::Instant, found: &mut RendererAnimationAdvance) {
+fn advance_nodes(
+    nodes: &mut [RenderNode],
+    at: std::time::Instant,
+    found: &mut RendererAnimationAdvance,
+) {
     for node in nodes.iter_mut() {
         match node {
             RenderNode::ShadowPass { children }
@@ -485,7 +493,7 @@ fn layer_has_renderer_animation(layer: &RenderPaintLayer) -> bool {
     layer.renderer_animation.is_some() || content_has_renderer_animation(&layer.content.nodes)
 }
 
-fn content_has_renderer_animation(nodes: &[RenderPaintLayerContentNode]) -> bool {
+pub(crate) fn content_has_renderer_animation(nodes: &[RenderPaintLayerContentNode]) -> bool {
     nodes.iter().any(|node| match node {
         RenderPaintLayerContentNode::Own(_) => false,
         RenderPaintLayerContentNode::Child(layer) => layer_has_renderer_animation(layer),
@@ -499,7 +507,11 @@ fn content_has_renderer_animation(nodes: &[RenderPaintLayerContentNode]) -> bool
     })
 }
 
-fn advance_layer(layer: &mut RenderPaintLayer, at: std::time::Instant, found: &mut RendererAnimationAdvance) {
+fn advance_layer(
+    layer: &mut RenderPaintLayer,
+    at: std::time::Instant,
+    found: &mut RendererAnimationAdvance,
+) {
     // Copy-on-write only along paths that hold an animation; the rest of the
     // scene stays shared with the tree.
     if !layer_has_renderer_animation(layer) {
@@ -508,11 +520,22 @@ fn advance_layer(layer: &mut RenderPaintLayer, at: std::time::Instant, found: &m
     found.found = true;
     let patch = layer.renderer_animation.as_ref().map(|animation| {
         let (transform, alpha) = animation.sample(at);
-        (animation.current_transform, animation.current_alpha, transform, alpha)
+        (
+            animation.current_transform,
+            animation.current_alpha,
+            transform,
+            alpha,
+        )
     });
     let content = Arc::make_mut(&mut layer.content);
     if let Some((old_transform, old_alpha, transform, alpha)) = patch {
-        patch_content(&mut content.nodes, old_transform, transform, old_alpha, alpha);
+        patch_content(
+            &mut content.nodes,
+            old_transform,
+            transform,
+            old_alpha,
+            alpha,
+        );
         if let Some(animation) = layer.renderer_animation.as_mut() {
             let animation = Arc::make_mut(animation);
             // Old and new screen area of this layer: its bounds were measured
@@ -540,7 +563,7 @@ fn advance_layer(layer: &mut RenderPaintLayer, at: std::time::Instant, found: &m
 
 // Replaces this layer's own Transform/Alpha nodes (not those of child layers,
 // which carry their own animations).
-fn patch_content(
+pub(crate) fn patch_content(
     nodes: &mut [RenderPaintLayerContentNode],
     old_transform: Affine2,
     transform: Affine2,
@@ -570,6 +593,118 @@ fn patch_content(
                 patch_content(children, old_transform, transform, old_alpha, alpha)
             }
             RenderPaintLayerContentNode::Own(_) | RenderPaintLayerContentNode::Child(_) => {}
+        }
+    }
+}
+
+/// One Raven patch: a renderer-driven layer the renderer may draw as one
+/// cached texture of its whole subtree (child layers included): its
+/// animation is transform-only, and nothing inside it moves on its own or is
+/// live media.
+pub(crate) fn renderer_animation_snapshot_eligible(layer: &RenderPaintLayer) -> bool {
+    let Some(animation) = layer.renderer_animation.as_deref() else {
+        return false;
+    };
+    animation
+        .spec
+        .keyframes
+        .iter()
+        .all(|attrs| attrs.alpha.is_none())
+        && !content_has_renderer_animation(&layer.content.nodes)
+        && !content_has_media(&layer.content.nodes)
+}
+
+fn content_has_media(nodes: &[RenderPaintLayerContentNode]) -> bool {
+    nodes.iter().any(|node| match node {
+        RenderPaintLayerContentNode::Own(_) => false,
+        RenderPaintLayerContentNode::Child(layer) => {
+            layer.id.role == PaintLayerReason::DirectMedia
+                || content_has_media(&layer.content.nodes)
+        }
+        RenderPaintLayerContentNode::ShadowPass { children }
+        | RenderPaintLayerContentNode::Clip { children, .. }
+        | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+        | RenderPaintLayerContentNode::Transform { children, .. }
+        | RenderPaintLayerContentNode::Alpha { children, .. } => content_has_media(children),
+    })
+}
+
+/// One Raven patch: identity of a renderer-driven layer's subtree content,
+/// apart from its own animated transform. Paint runs are compared by their
+/// shared payload (the tree replaces it whenever the content changes), and
+/// every structural value and child layer is included.
+pub(crate) fn renderer_animation_snapshot_key(layer: &RenderPaintLayer) -> u64 {
+    let own = layer
+        .renderer_animation
+        .as_deref()
+        .map(|animation| animation.current_transform);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_rect(&mut hasher, layer.bounds);
+    hash_snapshot_content(&mut hasher, &layer.content.nodes, own);
+    hasher.finish()
+}
+
+fn hash_rect(hasher: &mut impl Hasher, rect: Rect) {
+    for value in [rect.x, rect.y, rect.width, rect.height] {
+        value.to_bits().hash(hasher);
+    }
+}
+
+fn hash_snapshot_content(
+    hasher: &mut impl Hasher,
+    nodes: &[RenderPaintLayerContentNode],
+    own_transform: Option<Affine2>,
+) {
+    for node in nodes {
+        match node {
+            RenderPaintLayerContentNode::Own(run) => {
+                0u8.hash(hasher);
+                (Arc::as_ptr(&run.nodes) as usize).hash(hasher);
+                hash_rect(hasher, run.bounds);
+            }
+            RenderPaintLayerContentNode::Child(child) => {
+                1u8.hash(hasher);
+                child.id.hash(hasher);
+                hash_rect(hasher, child.bounds);
+                hash_snapshot_content(hasher, &child.content.nodes, None);
+            }
+            RenderPaintLayerContentNode::ShadowPass { children } => {
+                2u8.hash(hasher);
+                hash_snapshot_content(hasher, children, own_transform);
+            }
+            RenderPaintLayerContentNode::Clip { clips, children }
+            | RenderPaintLayerContentNode::RelaxedClip { clips, children } => {
+                3u8.hash(hasher);
+                for clip in clips {
+                    hash_rect(hasher, clip.rect);
+                    format!("{:?}", clip.radii).hash(hasher);
+                }
+                hash_snapshot_content(hasher, children, own_transform);
+            }
+            RenderPaintLayerContentNode::Transform {
+                transform,
+                children,
+            } => {
+                4u8.hash(hasher);
+                if Some(*transform) != own_transform {
+                    for value in [
+                        transform.xx,
+                        transform.yx,
+                        transform.xy,
+                        transform.yy,
+                        transform.tx,
+                        transform.ty,
+                    ] {
+                        value.to_bits().hash(hasher);
+                    }
+                }
+                hash_snapshot_content(hasher, children, own_transform);
+            }
+            RenderPaintLayerContentNode::Alpha { alpha, children } => {
+                5u8.hash(hasher);
+                alpha.to_bits().hash(hasher);
+                hash_snapshot_content(hasher, children, own_transform);
+            }
         }
     }
 }
@@ -1926,5 +2061,226 @@ mod tests {
         ] {
             assert_ne!(original, fingerprint(colors, angle));
         }
+    }
+}
+
+#[cfg(test)]
+mod renderer_animation_tests {
+    use super::*;
+    use crate::tree::animation::{AnimationCurve, AnimationRepeat, AnimationSpec};
+    use crate::tree::attrs::Attrs;
+    use crate::tree::element::Frame;
+    use std::time::{Duration, Instant};
+
+    const BOUNDS: Rect = Rect {
+        x: 100.0,
+        y: 200.0,
+        width: 80.0,
+        height: 40.0,
+    };
+
+    fn frame() -> Frame {
+        Frame {
+            x: BOUNDS.x,
+            y: BOUNDS.y,
+            width: BOUNDS.width,
+            height: BOUNDS.height,
+            ..Frame::default()
+        }
+    }
+
+    fn spin_spec() -> Arc<AnimationSpec> {
+        let at = |deg| Attrs {
+            rotate: Some(deg),
+            ..Attrs::default()
+        };
+        Arc::new(AnimationSpec {
+            keyframes: vec![at(0.0), at(360.0)],
+            duration_ms: 1000.0,
+            curve: AnimationCurve::Linear,
+            repeat: AnimationRepeat::Loop,
+        })
+    }
+
+    fn rect_node() -> RenderNode {
+        RenderNode::Primitive(DrawPrimitive::Rect(
+            BOUNDS.x,
+            BOUNDS.y,
+            BOUNDS.width,
+            BOUNDS.height,
+            RenderColor::from(0xff0000ff),
+        ))
+    }
+
+    /// An animated layer built the way tree/render.rs builds one: its own
+    /// Transform node holding the built transform, plus a child layer.
+    fn animated_layer(started_at: Instant, child: Option<RenderPaintLayer>) -> RenderPaintLayer {
+        let built = Affine2::identity();
+        let mut children = vec![rect_node()];
+        if let Some(child) = child {
+            children.push(RenderNode::PaintLayer(child));
+        }
+        let mut layer = RenderPaintLayer::from_prepared_children(
+            RenderPaintLayerBuildParts {
+                id: PaintLayerId::new(7, PaintLayerReason::Animation),
+                bounds: BOUNDS,
+                placement: PaintLayerPlacement::Fixed,
+                policy: PaintLayerPolicy::Cacheable,
+                content_generation: 1,
+                visual_bounds: None,
+            },
+            RenderPaintLayerContent::from_composition_nodes(vec![RenderNode::Transform {
+                transform: built,
+                children,
+            }]),
+        );
+        layer.renderer_animation = Some(Arc::new(LayerRendererAnimation {
+            spec: spin_spec(),
+            started_at,
+            revision: 0,
+            frame: frame(),
+            base: Attrs::default(),
+            current_transform: built,
+            current_alpha: 1.0,
+            offset: (0.0, 0.0),
+            bounds_transform: built,
+        }));
+        layer
+    }
+
+    fn child_layer(generation: u64) -> RenderPaintLayer {
+        RenderPaintLayer::from_children(
+            9,
+            BOUNDS,
+            PaintLayerPlacement::Fixed,
+            PaintLayerPolicy::Cacheable,
+            PaintLayerReason::Nearby,
+            generation,
+            vec![rect_node()],
+        )
+    }
+
+    fn own_transform(layer: &RenderPaintLayer) -> Affine2 {
+        match &layer.content.nodes[0] {
+            RenderPaintLayerContentNode::Transform { transform, .. } => *transform,
+            other => panic!("expected the layer's Transform node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sample_matches_the_tree_transform() {
+        let started_at = Instant::now();
+        let layer = animated_layer(started_at, None);
+        let animation = layer.renderer_animation.as_deref().unwrap();
+        let (transform, alpha) = animation.sample(started_at + Duration::from_millis(250));
+        let expected = crate::tree::transform::element_transform(
+            frame(),
+            &Attrs {
+                rotate: Some(90.0),
+                ..Attrs::default()
+            },
+        );
+        for (a, b) in [
+            (transform.xx, expected.xx),
+            (transform.yx, expected.yx),
+            (transform.xy, expected.xy),
+            (transform.yy, expected.yy),
+            (transform.tx, expected.tx),
+            (transform.ty, expected.ty),
+        ] {
+            assert!((a - b).abs() < 1e-3, "{transform:?} != {expected:?}");
+        }
+        assert_eq!(alpha, 1.0);
+    }
+
+    #[test]
+    fn advance_patches_own_nodes_only_and_reports_damage() {
+        let started_at = Instant::now();
+        let child = child_layer(1);
+        let mut scene = RenderScene {
+            nodes: vec![RenderNode::PaintLayer(animated_layer(
+                started_at,
+                Some(child.clone()),
+            ))],
+            ..RenderScene::default()
+        };
+        let advance = scene.advance_renderer_animations(started_at + Duration::from_millis(250));
+        assert!(advance.found);
+        let RenderNode::PaintLayer(layer) = &scene.nodes[0] else {
+            panic!("scene root should stay a layer");
+        };
+        assert!(!own_transform(layer).is_identity());
+        assert_eq!(
+            layer
+                .renderer_animation
+                .as_deref()
+                .unwrap()
+                .current_transform,
+            own_transform(layer)
+        );
+        // The child layer is untouched, and the damage covers the old and
+        // the rotated position.
+        let RenderPaintLayerContentNode::Transform { children, .. } = &layer.content.nodes[0]
+        else {
+            unreachable!()
+        };
+        assert!(children.iter().any(|node| matches!(
+            node,
+            RenderPaintLayerContentNode::Child(c) if c == &child
+        )));
+        let damage = advance.damage.expect("damage");
+        assert!(damage.x <= BOUNDS.x && damage.y <= BOUNDS.y);
+        assert!(damage.x + damage.width >= BOUNDS.x + BOUNDS.width);
+    }
+
+    #[test]
+    fn scene_without_renderer_animations_finds_none() {
+        let mut scene = RenderScene {
+            nodes: vec![RenderNode::PaintLayer(child_layer(1))],
+            ..RenderScene::default()
+        };
+        let advance = scene.advance_renderer_animations(Instant::now());
+        assert!(!advance.found);
+        assert!(advance.damage.is_none());
+    }
+
+    #[test]
+    fn snapshot_key_ignores_own_motion_but_not_content() {
+        let started_at = Instant::now();
+        let layer = animated_layer(started_at, Some(child_layer(1)));
+        let key = renderer_animation_snapshot_key(&layer);
+
+        let mut scene = RenderScene {
+            nodes: vec![RenderNode::PaintLayer(layer.clone())],
+            ..RenderScene::default()
+        };
+        scene.advance_renderer_animations(started_at + Duration::from_millis(250));
+        let RenderNode::PaintLayer(moved) = &scene.nodes[0] else {
+            unreachable!()
+        };
+        assert_eq!(renderer_animation_snapshot_key(moved), key);
+
+        let changed = animated_layer(started_at, Some(child_layer(2)));
+        // A rebuilt child is a new payload, so the key changes.
+        assert_ne!(renderer_animation_snapshot_key(&changed), key);
+    }
+
+    #[test]
+    fn snapshot_eligibility() {
+        let started_at = Instant::now();
+        assert!(renderer_animation_snapshot_eligible(&animated_layer(
+            started_at, None
+        )));
+
+        let mut nested = animated_layer(started_at, Some(animated_layer(started_at, None)));
+        assert!(!renderer_animation_snapshot_eligible(&nested));
+
+        let mut fading = animated_layer(started_at, None);
+        let animation = Arc::make_mut(fading.renderer_animation.as_mut().unwrap());
+        Arc::make_mut(&mut animation.spec).keyframes[0].alpha = Some(0.5);
+        assert!(!renderer_animation_snapshot_eligible(&fading));
+
+        nested.renderer_animation = None;
+        assert!(!renderer_animation_snapshot_eligible(&nested));
     }
 }

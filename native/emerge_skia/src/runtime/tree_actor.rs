@@ -39,6 +39,9 @@ pub(crate) struct TreeActorConfig {
     pub(crate) initial_width: u32,
     pub(crate) initial_height: u32,
     pub(crate) asset_context: AssetContext,
+    /// One Raven patch: the presenter samples looping transform/alpha
+    /// animations itself (see `tree::animation::RendererDrivenAnimation`).
+    pub(crate) renderer_driven_animations: bool,
 }
 
 #[cfg_attr(
@@ -71,10 +74,12 @@ pub(crate) fn spawn_tree_actor_with_initial_tree(
             initial_width,
             initial_height,
             asset_context,
+            renderer_driven_animations,
         } = config;
 
         let _asset_context_guard = asset_context.enter();
         let mut engine = TreeUpdateEngine::new(initial_tree, initial_width, initial_height);
+        engine.set_renderer_driven_animations(renderer_driven_animations);
         let (animation_requests, animation_rx) = AnimationRequests::channel();
 
         // At most one unsent full registry and one latest scene. Continue
@@ -311,6 +316,7 @@ mod tests {
                     initial_width: width,
                     initial_height: height,
                     asset_context: crate::assets::AssetRuntime::new().context(),
+                    renderer_driven_animations: false,
                 },
                 initial_tree,
             );

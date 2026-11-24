@@ -32,6 +32,7 @@ impl BlockedActor {
                 initial_width: 600,
                 initial_height: 60,
                 asset_context: crate::assets::AssetRuntime::new().context(),
+                renderer_driven_animations: false,
             },
             tree,
         );

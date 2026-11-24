@@ -3412,12 +3412,9 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
 
                 let first_presented_at = Instant::now();
                 let mut production = FrameProduction::default();
-                let mut renderer_animations_active = false;
                 let mut damage_history: std::collections::VecDeque<Option<crate::tree::geometry::Rect>> =
                     std::collections::VecDeque::new();
                 let mut last_drawn_scene_version: Option<u64> = None;
-                let mut last_prepare_at = Instant::now();
-                let mut last_stall_log_at = Instant::now();
                 render_state.animation_frame.observed(first_presented_at);
                 production.submitted(render_state.animation_frame.clone(), first_presented_at + frame_interval);
                 // The blocking modeset already displayed generation zero. Only
@@ -3429,7 +3426,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                 let mut committed_primary_generation = 0u64;
                 // One Raven patch: the blocking modeset showed the first frame
                 // without a flip event, so start renderer-driven animations here.
-                renderer_animations_active = render_state
+                let mut renderer_animations_active = render_state
                     .advance_renderer_animations(first_presented_at + frame_interval)
                     .found;
                 if renderer_animations_active {
@@ -3834,25 +3831,6 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                     {
                         desired_primary_generation = desired_primary_generation.wrapping_add(1);
                     }
-                    // One Raven diagnostics: a renderer-driven animation that
-                    // has not been drawn for a while says why.
-                    if renderer_animations_active
-                        && last_prepare_at.elapsed() > Duration::from_millis(500)
-                        && last_stall_log_at.elapsed() > Duration::from_secs(2)
-                    {
-                        last_stall_log_at = Instant::now();
-                        native_log.warning(
-                            "drm",
-                            format!(
-                                "renderer animation stalled: desired={} committed={} in_flight={:?} prepared={:?} free_buffers={}",
-                                desired_primary_generation,
-                                committed_primary_generation,
-                                in_flight_primary_generation,
-                                prepared_primary_generation,
-                                gbm_surface.has_free_buffers(),
-                            ),
-                        );
-                    }
                     if should_prepare_primary(
                         desired_primary_generation,
                         committed_primary_generation,
@@ -3879,8 +3857,6 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                             }
                             // One Raven patch: renderer-driven animations
                             // are sampled for this frame's expected scanout.
-                            last_prepare_at = Instant::now();
-                            let was_active = renderer_animations_active;
                             let advance = render_state
                                 .advance_renderer_animations(now + frame_interval);
                             renderer_animations_active = advance.found;
@@ -3915,19 +3891,6 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                 None
                             };
                             last_drawn_scene_version = Some(render_state.render_version);
-                            if was_active != renderer_animations_active {
-                                native_log.info(
-                                    "drm",
-                                    format!(
-                                        "renderer animations active={} (tree samples={}, attached={})",
-                                        renderer_animations_active,
-                                        crate::tree::animation::RENDERER_DRIVEN_SAMPLES
-                                            .load(std::sync::atomic::Ordering::Relaxed),
-                                        crate::tree::render::RENDERER_ANIMATIONS_ATTACHED
-                                            .load(std::sync::atomic::Ordering::Relaxed),
-                                    ),
-                                );
-                            }
                             match prepare_primary_frame(
                                 desired_primary_generation,
                                 config.rendering_api,

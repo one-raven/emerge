@@ -185,6 +185,7 @@ impl Harness {
                 initial_width: 600,
                 initial_height: 60,
                 asset_context: context,
+                renderer_driven_animations: false,
             },
             tree.clone(),
         );

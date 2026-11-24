@@ -202,6 +202,7 @@ fn isolated_event_pressure_probe() {
             initial_width: 800,
             initial_height: 600,
             asset_context: assets.context(),
+            renderer_driven_animations: false,
         },
         tree,
     );

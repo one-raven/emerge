@@ -2730,6 +2730,7 @@ fn start_native_renderer_with_config(
                     initial_width,
                     initial_height,
                     asset_context: asset_runtime.context(),
+                    renderer_driven_animations: false,
                 },
             ));
 
@@ -2946,6 +2947,13 @@ fn start_native_renderer_with_config(
                     initial_width,
                     initial_height,
                     asset_context: asset_runtime.context(),
+                    // The OpenGL presenter (backend/drm/gl.rs) animates eligible
+                    // loops itself; Vulkan and CPU raster presenters don't.
+                    renderer_driven_animations: cfg!(feature = "opengl")
+                        && matches!(
+                            selected_rendering_api,
+                            RenderingApi::Auto | RenderingApi::OpenGl
+                        ),
                 },
             ));
 
@@ -4477,6 +4485,7 @@ fn test_harness_new(width: u32, height: u32) -> Result<ResourceArc<TestHarnessRe
             initial_width: width,
             initial_height: height,
             asset_context: asset_runtime.context(),
+            renderer_driven_animations: false,
         },
         ElementTree::new(),
     );
@@ -4745,6 +4754,7 @@ mod tests {
                     initial_width: width,
                     initial_height: height,
                     asset_context: asset_runtime.context(),
+                    renderer_driven_animations: false,
                 },
                 initial_tree,
             );

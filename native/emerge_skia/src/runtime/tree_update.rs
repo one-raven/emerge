@@ -118,6 +118,12 @@ impl TreeUpdateEngine {
         }
     }
 
+    /// One Raven patch: let the presenter sample looping transform/alpha
+    /// animations itself, so they cost no tree work per frame.
+    pub(crate) fn set_renderer_driven_animations(&mut self, enabled: bool) {
+        self.animation_runtime.renderer_driven_loops = enabled;
+    }
+
     pub fn frame_request(&self) -> u64 {
         // A delayed resize from another queue cannot satisfy a replay barrier
         // for the wrong layout. Keep the request so a matching resize restores it.

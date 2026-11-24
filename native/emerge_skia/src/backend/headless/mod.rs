@@ -348,6 +348,7 @@ pub(crate) fn start_renderer_with_config(
             initial_width: width,
             initial_height: height,
             asset_context: asset_runtime.context(),
+            renderer_driven_animations: false,
         },
     );
 

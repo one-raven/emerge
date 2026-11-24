@@ -717,7 +717,10 @@ fn build_element_subtree<R: RegistryTraversalSink>(
     let normal_nodes = if matches!(element.spec.kind, ElementKind::Image | ElementKind::Video) {
         wrap_with_relaxed_clips(wrap_transform(normal_nodes, transform), &content_clips)
     } else {
-        wrap_with_clips(wrap_transform(normal_nodes, transform), inherited_host_clips)
+        wrap_with_clips(
+            wrap_transform(normal_nodes, transform),
+            inherited_host_clips,
+        )
     };
     local.extend(normal_nodes);
 
@@ -2082,9 +2085,6 @@ fn wrap_with_alpha_forced(nodes: Vec<RenderNode>, alpha: f32) -> Vec<RenderNode>
     }]
 }
 
-pub static RENDERER_ANIMATIONS_ATTACHED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 // One Raven patch: hand the render thread what it needs to re-evaluate this
 // element's transform and alpha at any time: the animation, the frame it
 // rotates and scales about, the element's non-animated values, and the values
@@ -2097,7 +2097,6 @@ fn attach_renderer_animation(
     built_transform: crate::tree::transform::Affine2,
     built_alpha: f32,
 ) {
-    RENDERER_ANIMATIONS_ATTACHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(RenderNode::PaintLayer(layer)) = nodes.first_mut() {
         layer.renderer_animation = Some(Arc::new(crate::render_scene::LayerRendererAnimation {
             spec: animation.spec,

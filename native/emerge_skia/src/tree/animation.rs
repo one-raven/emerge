@@ -91,6 +91,8 @@ pub struct ExitAnimationRuntimeEntry {
 
 #[derive(Debug, Default)]
 pub struct AnimationRuntime {
+    /// One Raven patch: the presenter samples eligible loops itself.
+    pub(crate) renderer_driven_loops: bool,
     identity: Option<RuntimeAuthority>,
     last_generation: u64,
     synced_sample_time: Option<Instant>,
@@ -111,6 +113,7 @@ pub struct AnimationRuntime {
 impl Clone for AnimationRuntime {
     fn clone(&self) -> Self {
         Self {
+            renderer_driven_loops: self.renderer_driven_loops,
             identity: self.identity.as_ref().map(|_| RuntimeAuthority::default()),
             last_generation: self.last_generation,
             synced_sample_time: self.synced_sample_time,
@@ -129,9 +132,6 @@ impl Clone for AnimationRuntime {
         }
     }
 }
-
-/// One Raven patch diagnostics: renderer-driven samples taken by the tree.
-pub static RENDERER_DRIVEN_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One Raven patch: a looping, transform/alpha-only declared animation that
 /// the render thread samples itself, every vblank, on the retained scene. The
@@ -1072,7 +1072,8 @@ fn sample_animation_for_element(
     // transform/alpha-only animation, so the renderer can sample it alone.
     let renderer_driven = match runs.as_slice() {
         [run]
-            if matches!(run.owner, groups::Owner::Regular)
+            if runtime.renderer_driven_loops
+                && matches!(run.owner, groups::Owner::Regular)
                 && run.spec.repeat == AnimationRepeat::Loop
                 && animation_spec_is_compositor_only(run.spec)
                 && element.spec.declared.animate_enter.is_none()
@@ -1087,50 +1088,46 @@ fn sample_animation_for_element(
         }
         _ => None,
     };
-    runs.into_iter()
-        .fold(None, |result, run| {
-            let clock = AnimationRuntimeEntry {
-                spec_hash: run.revision,
-                started_at: run.started,
-            };
-            let mut sample = sample_animation_spec(run.spec, Some(&clock), sample_time);
-            let phases = if let groups::Owner::Change(field) = run.owner {
-                runtime.change_phases(
-                    (element.id, field),
-                    runtime
-                        .changes
-                        .get(&(element.id, field))
-                        .expect("selected change"),
-                    sample.active,
-                    sample_time,
-                )
-            } else {
-                runtime.owner_phases(
-                    run.owner_key(element),
-                    run.fields,
-                    sample.active,
-                    sample_time,
-                    fields::FieldMask::default(),
-                )
-            };
-            let mask = if matches!(run.owner, groups::Owner::Regular | groups::Owner::Exit) {
-                run.fields
-            } else {
-                phases.writes()
-            };
-            if mask.is_empty() {
-                return result;
-            }
-            sample.attrs = mask.select(&sample.attrs);
-            let mut result = result.unwrap_or_default();
-            apply_sample_attrs(&mut result.attrs, &sample.attrs);
-            result.active |= sample.active;
-            result.renderer_driven = renderer_driven.clone();
-            if renderer_driven.is_some() {
-                RENDERER_DRIVEN_SAMPLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Some(result)
-        })
+    runs.into_iter().fold(None, |result, run| {
+        let clock = AnimationRuntimeEntry {
+            spec_hash: run.revision,
+            started_at: run.started,
+        };
+        let mut sample = sample_animation_spec(run.spec, Some(&clock), sample_time);
+        let phases = if let groups::Owner::Change(field) = run.owner {
+            runtime.change_phases(
+                (element.id, field),
+                runtime
+                    .changes
+                    .get(&(element.id, field))
+                    .expect("selected change"),
+                sample.active,
+                sample_time,
+            )
+        } else {
+            runtime.owner_phases(
+                run.owner_key(element),
+                run.fields,
+                sample.active,
+                sample_time,
+                fields::FieldMask::default(),
+            )
+        };
+        let mask = if matches!(run.owner, groups::Owner::Regular | groups::Owner::Exit) {
+            run.fields
+        } else {
+            phases.writes()
+        };
+        if mask.is_empty() {
+            return result;
+        }
+        sample.attrs = mask.select(&sample.attrs);
+        let mut result = result.unwrap_or_default();
+        apply_sample_attrs(&mut result.attrs, &sample.attrs);
+        result.active |= sample.active;
+        result.renderer_driven = renderer_driven.clone();
+        Some(result)
+    })
 }
 
 fn runs_for_element<'a>(

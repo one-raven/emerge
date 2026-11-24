@@ -87,16 +87,17 @@ defmodule EmergeSkia.Native do
         # the precompiled host library. (Build env: mix/native.exs.)
         @vendored_source_build Mix.target() != :host
 
-        @force_build @vendored_source_build or
-                       EmergeSkia.BuildConfig.force_precompiled_build?(
-                       report_fallback: true,
-                       checksum_path: @checksum_path,
-                       compiled_backends: @compiled_backends,
-                       compiled_vulkan_backends: @compiled_vulkan_backends,
-                       compiled_opengl_backends: @compiled_opengl_backends,
-                       targets: @precompiled_targets,
-                       nif_versions: @precompiled_nif_versions
-                     )
+        @upstream_force_build EmergeSkia.BuildConfig.force_precompiled_build?(
+                                report_fallback: true,
+                                checksum_path: @checksum_path,
+                                compiled_backends: @compiled_backends,
+                                compiled_vulkan_backends: @compiled_vulkan_backends,
+                                compiled_opengl_backends: @compiled_opengl_backends,
+                                targets: @precompiled_targets,
+                                nif_versions: @precompiled_nif_versions
+                              )
+
+        @force_build Enum.any?([@vendored_source_build, @upstream_force_build])
 
         use RustlerPrecompiled,
             Keyword.merge(

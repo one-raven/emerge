@@ -2950,7 +2950,26 @@ pub struct RendererCacheManager {
     visible_admissions: HashMap<PaintLayerPayloadKey, PaintLayerVisibleAdmission>,
     stored_run_families: HashMap<PaintLayerRunFamilyKey, u64>,
     payloads: PaintLayerPayloadCache<PaintLayerPayload>,
+    /// One Raven patch: whole-subtree textures of renderer-driven layers.
+    animation_snapshots: HashMap<PaintLayerId, AnimationSnapshot>,
 }
+
+/// One Raven patch: a renderer-driven layer's subtree, rasterized once under
+/// its base transform, for compositing through the animation each frame.
+#[derive(Debug)]
+#[cfg_attr(
+    not(any(feature = "opengl", feature = "vulkan", feature = "macos")),
+    allow(dead_code)
+)]
+struct AnimationSnapshot {
+    key: u64,
+    image: Image,
+    scale: f32,
+    last_used: u64,
+}
+
+/// Frames an unused animation snapshot is kept.
+const ANIMATION_SNAPSHOT_MAX_UNSEEN_FRAMES: u64 = 120;
 
 impl Default for RendererCacheManager {
     fn default() -> Self {
@@ -2973,6 +2992,7 @@ impl RendererCacheManager {
             gpu_replacement_stores_remaining: GPU_PAINT_LAYER_REPLACEMENT_STORES_PER_FRAME,
             visible_admissions: HashMap::new(),
             stored_run_families: HashMap::new(),
+            animation_snapshots: HashMap::new(),
             payloads: PaintLayerPayloadCache::with_config(
                 renderer_paint_layer_payload_cache_config(config),
             ),
@@ -2984,6 +3004,10 @@ impl RendererCacheManager {
         self.gpu_replacement_stores_remaining = GPU_PAINT_LAYER_REPLACEMENT_STORES_PER_FRAME;
         self.prune_non_consecutive_visible_admissions();
         self.prune_unseen_run_families();
+        let frame_index = self.frame_index;
+        self.animation_snapshots.retain(|_, snapshot| {
+            frame_index.saturating_sub(snapshot.last_used) <= ANIMATION_SNAPSHOT_MAX_UNSEEN_FRAMES
+        });
         let mut stats = RendererCacheFrameStats::default();
         for bytes in self.payloads.begin_frame(self.frame_index) {
             stats.paint_layer.record_stale_eviction(bytes);
@@ -5498,6 +5522,128 @@ impl SceneRenderer {
         });
     }
 
+    /// One Raven patch: draw a renderer-driven layer as one texture of its
+    /// whole subtree, like a browser compositor layer. The texture is made
+    /// under the layer's base transform (the one its bounds were measured
+    /// under) and re-made only when the subtree's content changes; each
+    /// frame composites it through the animation's current transform. Six
+    /// wiggling cards then cost six draws, not one per cached run inside them.
+    /// Returns false to fall back to the normal path.
+    #[cfg(any(feature = "opengl", feature = "vulkan", feature = "macos"))]
+    fn draw_animation_snapshot(
+        canvas: &skia_safe::Canvas,
+        layer: &RenderPaintLayer,
+        options: RenderTraversalOptions<'_>,
+        gr_context: &mut gpu::DirectContext,
+        cache: &mut RendererCacheManager,
+    ) -> bool {
+        let Some(animation) = layer.renderer_animation.as_deref() else {
+            return false;
+        };
+        let Some(base_inverse) = animation.bounds_transform.inverse() else {
+            return false;
+        };
+        let bounds = layer.bounds;
+        if !(bounds.width > 0.0 && bounds.height > 0.0) {
+            return false;
+        }
+        // Rasterize at the device scale the layer lands at.
+        let device = canvas.local_to_device_as_3x3();
+        let scale = (device.scale_x().abs().max(device.skew_y().abs()))
+            .max(device.scale_y().abs().max(device.skew_x().abs()))
+            .clamp(0.25, 4.0);
+        let key = crate::render_scene::renderer_animation_snapshot_key(layer);
+        let frame_index = cache.frame_index;
+
+        let fresh = cache
+            .animation_snapshots
+            .get(&layer.id)
+            .is_some_and(|snapshot| snapshot.key == key && snapshot.scale == scale);
+        if !fresh {
+            let width = (bounds.width * scale).ceil() as i32;
+            let height = (bounds.height * scale).ceil() as i32;
+            if width <= 0 || height <= 0 || width > 4096 || height > 4096 {
+                return false;
+            }
+            let info = skia_safe::ImageInfo::new(
+                (width, height),
+                skia_safe::ColorType::RGBA8888,
+                skia_safe::AlphaType::Premul,
+                None,
+            );
+            let Some(mut surface) = gpu::surfaces::render_target(
+                gr_context,
+                gpu::Budgeted::Yes,
+                &info,
+                0,
+                gpu::SurfaceOrigin::TopLeft,
+                None,
+                false,
+                false,
+            ) else {
+                return false;
+            };
+            // The subtree under its base transform, so the texture lines up
+            // with the measured bounds.
+            let mut base = layer.clone();
+            {
+                let content = Arc::make_mut(&mut base.content);
+                crate::render_scene::patch_content(
+                    &mut content.nodes,
+                    animation.current_transform,
+                    animation.bounds_transform,
+                    animation.current_alpha,
+                    animation.current_alpha,
+                );
+            }
+            base.renderer_animation = None;
+            let offscreen = surface.canvas();
+            offscreen.clear(Color::TRANSPARENT);
+            offscreen.save();
+            offscreen.scale((scale, scale));
+            offscreen.translate((-bounds.x, -bounds.y));
+            let mut mode = DirectRenderMode;
+            let mut instrumentation = NoDrawInstrumentation;
+            Self::render_paint_layer_content_in_mode(
+                offscreen,
+                &base,
+                &base.content.nodes,
+                &mut mode,
+                options.with_active_clip(None),
+                MovingLayerEligibility::root(),
+                &mut instrumentation,
+            );
+            offscreen.restore();
+            cache.animation_snapshots.insert(
+                layer.id,
+                AnimationSnapshot {
+                    key,
+                    image: surface.image_snapshot(),
+                    scale,
+                    last_used: frame_index,
+                },
+            );
+        }
+
+        let Some(snapshot) = cache.animation_snapshots.get_mut(&layer.id) else {
+            return false;
+        };
+        snapshot.last_used = frame_index;
+        canvas.save();
+        canvas.concat(&matrix_from_affine2(
+            animation.current_transform.then(base_inverse),
+        ));
+        canvas.draw_image_rect_with_sampling_options(
+            &snapshot.image,
+            None,
+            skia_safe::Rect::from_xywh(bounds.x, bounds.y, bounds.width, bounds.height),
+            SamplingOptions::new(skia_safe::FilterMode::Linear, skia_safe::MipmapMode::None),
+            &Paint::default(),
+        );
+        canvas.restore();
+        true
+    }
+
     fn prepare_moving_layer_payload(
         run: &RenderPaintRun,
         options: RenderTraversalOptions<'_>,
@@ -6531,6 +6677,19 @@ impl<'video> RenderTraversalMode<'video> for CacheTrackingRenderMode<'_, '_> {
         eligibility: MovingLayerEligibility,
         instrumentation: &mut I,
     ) {
+        #[cfg(any(feature = "opengl", feature = "vulkan", feature = "macos"))]
+        if crate::render_scene::renderer_animation_snapshot_eligible(layer)
+            && let Some(gr_context) = self.cache_tracking.gpu_context.as_mut()
+            && SceneRenderer::draw_animation_snapshot(
+                canvas,
+                layer,
+                options,
+                gr_context,
+                self.cache_tracking.renderer_cache,
+            )
+        {
+            return;
+        }
         SceneRenderer::render_paint_layer_content_in_mode(
             canvas,
             layer,
@@ -9979,9 +10138,18 @@ mod tests {
             text_payload_gpu_subpixel_phase(run, quarter_turn, true),
             Ok(PaintLayerSubpixelPhase::default())
         );
+        // Rotation and scale up to 1.1 are composed from the cached payload
+        // (One Raven patch), so even an off-grid quarter turn is cacheable;
+        // the 1.25 upscale above still draws directly.
         assert_eq!(
             text_payload_gpu_subpixel_phase(run, fractional_quarter_turn, true),
-            Err(RendererCacheRejectionReason::UnsupportedTransform)
+            Ok(PaintLayerSubpixelPhase::default())
+        );
+        let wiggle = MovingLayerEligibility::root()
+            .with_transform(Affine2::rotation_degrees(0.8).then(Affine2::scale(1.04, 1.04)));
+        assert_eq!(
+            text_payload_gpu_subpixel_phase(run, wiggle, true),
+            Ok(PaintLayerSubpixelPhase::default())
         );
 
         let phase = PaintLayerSubpixelPhase::from_translation(0.0, -5335.513).unwrap();
