@@ -751,7 +751,8 @@ fn build_element_subtree<R: RegistryTraversalSink>(
             host_content.local,
             element,
             render_frame,
-            current_host_clip.clip,
+            current_host_clip,
+            traversal.render_ctx.scene_bounds,
         ));
         normal_nodes.extend(wrap_with_host_clip(scrollbar_nodes, current_host_clip.clip));
     } else {
@@ -929,7 +930,8 @@ fn wrap_semantic_scroll_content_layer(
     canonical_nodes: Vec<RenderNode>,
     element: &Element,
     render_frame: Frame,
-    host_clip: ClipShape,
+    host_clip: HostClipDescriptor,
+    scene_bounds: Rect,
 ) -> Vec<RenderNode> {
     let scroll_x = element.layout.scroll_x;
     let scroll_y = element.layout.scroll_y;
@@ -938,8 +940,11 @@ fn wrap_semantic_scroll_content_layer(
         paint_layer_own_content_visual_bounds(&canonical_nodes),
         nominal_bounds,
     );
-    let canonical_host_clip = host_clip.offset(-scroll_x, -scroll_y);
-    let canonical_nodes = wrap_with_host_clip(canonical_nodes, canonical_host_clip);
+    let canonical_host_clip = host_clip.clip.offset(-scroll_x, -scroll_y);
+    let canonical_shadow_clip =
+        shadow_boundary_clip(host_clip, scene_bounds).offset(-scroll_x, -scroll_y);
+    let canonical_nodes =
+        wrap_scroll_content_with_clips(canonical_nodes, canonical_host_clip, canonical_shadow_clip);
     let content = RenderPaintLayerContent::from_composition_nodes(canonical_nodes);
     let content_generation =
         paint_layer_content_generation(&content.own_payload_render_nodes(), content_bounds);
@@ -958,6 +963,42 @@ fn wrap_semantic_scroll_content_layer(
         vec![RenderNode::PaintLayer(layer)],
         Affine2::translation(-scroll_x, -scroll_y),
     )
+}
+
+// One Raven patch: clip canonical scroll content to its container. A node
+// holding a shadow escapes the clip (`wrap_with_clips`), which is right for a
+// bare `ShadowPass`: it carries the container's shadow boundary from where it
+// was built. A node that mixes a shadow with ordinary content (the alpha,
+// transform or animation layer of an element with a shadowed descendant)
+// escaped whole, and canonicalizing had stripped the container's clip from
+// the content inside it, so a faded, rotated or `animate_enter` wrapper
+// around a shadowed card was drawn outside the scroll viewport (the Media
+// hero art over the status bar). Such a node is now clipped to the
+// container's shadow boundary: the viewport on the scrolling axis, as a bare
+// shadow is. Upstream bug.
+fn wrap_scroll_content_with_clips(
+    nodes: Vec<RenderNode>,
+    host_clip: ClipShape,
+    shadow_clip: ClipShape,
+) -> Vec<RenderNode> {
+    if !nodes.iter().any(render_node_has_shadow_escape) {
+        return wrap_with_host_clip(nodes, host_clip);
+    }
+    let mut out = Vec::new();
+    let mut clipped = Vec::new();
+    for node in nodes {
+        if matches!(node, RenderNode::ShadowPass { .. }) {
+            push_clipped_group(&mut out, &[host_clip], false, &mut clipped);
+            out.push(node);
+        } else if render_node_has_shadow_escape(&node) {
+            push_clipped_group(&mut out, &[host_clip], false, &mut clipped);
+            out.push(clip_node(vec![shadow_clip], false, vec![node]));
+        } else {
+            clipped.push(node);
+        }
+    }
+    push_clipped_group(&mut out, &[host_clip], false, &mut clipped);
+    out
 }
 
 // One Raven patch: nodes go straight into the output. Upstream returned a
