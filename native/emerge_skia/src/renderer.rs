@@ -6897,6 +6897,24 @@ fn outset_rect_in_device_space(canvas: &skia_safe::Canvas, rect: Rect, device_ou
     }
 
     let matrix = canvas.local_to_device_as_3x3();
+    // One Raven patch: under rotation or skew, the round trip below maps
+    // bounding boxes both ways and inflates the rect (2x at 45 degrees), so a
+    // rotating image was drawn up to twice its size. Outset along the
+    // transform's own axes instead.
+    if !matrix.has_perspective() && (matrix.skew_x() != 0.0 || matrix.skew_y() != 0.0) {
+        let axis_x = (matrix.scale_x().powi(2) + matrix.skew_y().powi(2)).sqrt();
+        let axis_y = (matrix.skew_x().powi(2) + matrix.scale_y().powi(2)).sqrt();
+        if !(axis_x > 0.0 && axis_y > 0.0) {
+            return rect;
+        }
+        let (dx, dy) = (device_outset / axis_x, device_outset / axis_y);
+        return Rect::from_ltrb(
+            rect.left() - dx,
+            rect.top() - dy,
+            rect.right() + dx,
+            rect.bottom() + dy,
+        );
+    }
     let (device_rect, _) = matrix.map_rect(rect);
     if !device_rect.left().is_finite()
         || !device_rect.top().is_finite()
