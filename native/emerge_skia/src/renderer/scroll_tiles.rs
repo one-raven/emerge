@@ -73,9 +73,10 @@ pub(super) struct ScrollTiles {
 }
 
 struct LayerTiles {
-    /// The content the plan was made for (kept alive, so the pointer is
-    /// never reused while it is compared).
-    content: Arc<crate::render_scene::RenderPaintLayerContent>,
+    /// The content the plan was made for: its build and the copy (One
+    /// Raven patch: not the content itself, see `ContentCopy`).
+    source: crate::render_scene::ContentSource,
+    copy: u64,
     plan: TilePlan,
     tiles: HashMap<(i32, i32), Tile>,
     last_used: u64,
@@ -706,18 +707,19 @@ impl ScrollTiles {
                 // One Raven patch: the same build copied on write by the
                 // render thread (to advance a renderer-driven animation in
                 // it) keeps its plan; only the overlay runs moved.
-                if !Arc::ptr_eq(&state.content, &layer.content)
-                    && state.content.source.same_build(layer.content.source)
+                if !layer.content.copy.is(state.copy)
+                    && state.source.same_build(layer.content.source)
                     && state.plan.current(scale)
                 {
                     state.plan.overlays = Arc::new(Overlays::index(
                         &layer.content.nodes,
                         state.plan.overlays.layers.clone(),
                     ));
-                    state.content = Arc::clone(&layer.content);
+                    state.copy = layer.content.copy.id();
                 }
-                if !Arc::ptr_eq(&state.content, &layer.content) || !state.plan.current(scale) {
-                    state.content = Arc::clone(&layer.content);
+                if !layer.content.copy.is(state.copy) || !state.plan.current(scale) {
+                    state.source = layer.content.source;
+                    state.copy = layer.content.copy.id();
                     state.plan = make_plan(layer, scale);
                     self.counts.plans += 1;
                 }
@@ -726,7 +728,8 @@ impl ScrollTiles {
             std::collections::hash_map::Entry::Vacant(vacant) => {
                 self.counts.plans += 1;
                 vacant.insert(LayerTiles {
-                    content: Arc::clone(&layer.content),
+                    source: layer.content.source,
+                    copy: layer.content.copy.id(),
                     plan: make_plan(layer, scale),
                     tiles: HashMap::new(),
                     last_used: frame_index,

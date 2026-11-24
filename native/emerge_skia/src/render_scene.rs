@@ -1513,6 +1513,8 @@ pub struct RenderPaintLayerContent {
     /// renderer-driven animation in it is still known as the same build
     /// (the scroll tiles keep their plan).
     pub source: ContentSource,
+    /// One Raven patch: which copy this is (`ContentCopy`).
+    pub copy: ContentCopy,
 }
 
 /// One Raven patch: a build's identity (`RenderPaintLayerContent::source`).
@@ -1537,6 +1539,42 @@ impl PartialEq for ContentSource {
     }
 }
 
+/// One Raven patch: a content's identity as an object. Every copy gets a
+/// new one, so a cache can tell the content it saw from a copy of it without
+/// holding it: holding it made the render thread copy a whole scroll content
+/// on write every frame of an idle animation in it, instead of changing it
+/// in place. It never makes two contents unequal.
+#[derive(Debug, Default)]
+pub struct ContentCopy(u64);
+
+impl ContentCopy {
+    pub(crate) fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The same object (0, a default content, is never the same).
+    pub fn is(&self, id: u64) -> bool {
+        self.0 != 0 && self.0 == id
+    }
+
+    pub fn id(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Clone for ContentCopy {
+    fn clone(&self) -> Self {
+        Self::next()
+    }
+}
+
+impl PartialEq for ContentCopy {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 impl RenderPaintLayerContent {
     pub(crate) fn new(nodes: Vec<RenderPaintLayerContentNode>) -> Self {
         let shadow_pass = layer_content_has_shadow_pass(&nodes);
@@ -1544,6 +1582,7 @@ impl RenderPaintLayerContent {
             nodes,
             shadow_pass,
             source: ContentSource::next(),
+            copy: ContentCopy::next(),
         }
     }
 

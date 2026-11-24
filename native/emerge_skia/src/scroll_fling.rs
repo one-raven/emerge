@@ -253,12 +253,11 @@ fn place_layer(layer: &mut RenderPaintLayer, id: PaintLayerId, axis_y: bool, off
     if is_target(layer, id) || !content_holds(&layer.content.nodes, id) {
         return false;
     }
-    place_content(
-        &mut Arc::make_mut(&mut layer.content).nodes,
-        id,
-        axis_y,
-        offset,
-    )
+    let content = Arc::make_mut(&mut layer.content);
+    // Runs inside may be copied on write on the way: the content is a new
+    // copy as far as anything that indexed it is concerned.
+    content.copy = crate::render_scene::ContentCopy::next();
+    place_content(&mut content.nodes, id, axis_y, offset)
 }
 
 fn place_content(
