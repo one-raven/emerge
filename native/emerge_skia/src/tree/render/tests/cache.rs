@@ -725,6 +725,87 @@ fn moving_an_ancestor_reuses_its_clean_descendants() {
     }
 }
 
+// One Raven patch: a dragged sheet (an in_front nearby whose move_y changes
+// every frame) is rasterized once and then composited at each new offset.
+#[test]
+fn translated_nearby_reuses_its_payload_at_every_offset() {
+    let host_id = NodeId::from_term_bytes(vec![5]);
+    let sheet_id = NodeId::from_term_bytes(vec![42]);
+    let mut tree = build_tree_with_child_frame(
+        Attrs::default(),
+        frame(0.0, 0.0, 360.0, 480.0),
+        solid_fill_attrs((20, 24, 32)),
+        frame(0.0, 0.0, 360.0, 240.0),
+    );
+    mount_nearby(
+        &mut tree,
+        &host_id,
+        NearbySlot::InFront,
+        ElementKind::El,
+        solid_fill_attrs((248, 250, 252)),
+        frame(0.0, 200.0, 360.0, 220.0),
+        42,
+    );
+    let row_ids = (0u8..12)
+        .map(|index| {
+            let id = NodeId::from_term_bytes(vec![100 + index]);
+            tree.insert(element(
+                id,
+                ElementKind::El,
+                solid_fill_attrs((80 + index * 8, 120, 180)),
+                frame(16.0, 208.0 + f32::from(index) * 16.0, 200.0, 10.0),
+            ));
+            id
+        })
+        .collect();
+    let sheet = tree.get_mut(&sheet_id).expect("sheet");
+    sheet.children = row_ids;
+    sheet.layout.effective.move_y = Some(0.0);
+    tree.clear_refresh_dirty();
+
+    let mut cached = SceneRenderer::with_cache_config(RendererCacheConfig {
+        enabled: true,
+        max_new_payloads_per_frame: 64,
+        ..RendererCacheConfig::default()
+    });
+    let mut direct = SceneRenderer::with_cache_config(RendererCacheConfig {
+        enabled: false,
+        ..RendererCacheConfig::default()
+    });
+
+    let mut stored = 0;
+    for (step, dy) in [-8.0, -30.0, -31.0, -60.25, -61.5].into_iter().enumerate() {
+        tree.get_mut(&sheet_id).expect("sheet").layout.effective.move_y = Some(dy);
+        tree.mark_render_and_registry_refresh_dirty(&sheet_id);
+        let scene = super::super::render_tree_scene_with_scroll_layers(&tree).scene;
+        tree.clear_refresh_dirty();
+
+        let (pixels, timings) = super::pipeline::render_scene_with_renderer_to_pixels_and_timings(
+            &mut cached,
+            scene.clone(),
+            360,
+            480,
+        );
+        let (expected, _) = super::pipeline::render_scene_with_renderer_to_pixels_and_timings(
+            &mut direct,
+            scene,
+            360,
+            480,
+        );
+        assert!(pixels == expected, "step {step}: cached sheet drew wrong");
+
+        let stats = timings.renderer_cache.expect("cache stats").paint_layer;
+        assert_eq!(stats.rejected_fractional_placement, 0, "step {step}");
+        if step == 0 {
+            assert!(stats.stores >= 1, "step {step}: {stats:?}");
+            stored = stats.stores;
+        } else {
+            assert_eq!(stats.stores, 0, "step {step}: re-rasterized {stats:?}");
+            assert_eq!(stats.hits, stored, "step {step}: {stats:?}");
+        }
+    }
+}
+
 fn camera_fixture() -> CameraFixture {
     let root_id = NodeId::from_u64(10_000);
     let video_id = NodeId::from_u64(10_001);

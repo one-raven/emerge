@@ -1912,19 +1912,90 @@ fn wrap_nearby_subtree_with_nearby_layer_boundary(
         std::mem::take(&mut subtree.local),
         render_ctx.full_clip_shapes(),
     );
+    // One Raven patch: a nearby moved only by a translation (a dragged sheet's
+    // move_y) is cached without it and placed by a Transform outside the
+    // layer, as scroll content is. With the translation inside, the payload
+    // key changed every frame and the overlay was re-rasterized each time.
+    // The outside offset is snapped to whole pixels, as a browser compositor
+    // places layers, so text keeps one subpixel phase and one payload.
+    let (local, translation) = match common_pure_translation(&local) {
+        Some((dx, dy)) => (
+            strip_translation(local, dx, dy),
+            Affine2::translation(dx.round(), dy.round()),
+        ),
+        None => (local, Affine2::identity()),
+    };
     subtree.local = wrap_with_clips(
-        wrap_with_paint_layer(
-            local,
-            element.id.to_wire_u64(),
-            PaintLayerPlacement::Fixed,
-            PaintLayerPolicy::Cacheable,
-            PaintLayerReason::Nearby,
-            render_frame,
-            None,
+        wrap_with_transform(
+            wrap_with_paint_layer(
+                local,
+                element.id.to_wire_u64(),
+                PaintLayerPlacement::Fixed,
+                PaintLayerPolicy::Cacheable,
+                PaintLayerReason::Nearby,
+                render_frame,
+                None,
+            ),
+            translation,
         ),
         render_ctx.full_clip_shapes(),
     );
     subtree
+}
+
+// One Raven patch: the translation every top-level branch reaches first, if
+// they all reach the same pure-translation Transform through clips, alphas
+// and shadow passes only.
+fn common_pure_translation(nodes: &[RenderNode]) -> Option<(f32, f32)> {
+    fn visit(nodes: &[RenderNode], found: &mut Option<(f32, f32)>) -> bool {
+        !nodes.is_empty()
+            && nodes.iter().all(|node| match node {
+                RenderNode::Transform { transform, .. } => {
+                    let t = *transform;
+                    let pure = t.xx == 1.0
+                        && t.yx == 0.0
+                        && t.xy == 0.0
+                        && t.yy == 1.0
+                        && t.tx.is_finite()
+                        && t.ty.is_finite();
+                    pure && *found.get_or_insert((t.tx, t.ty)) == (t.tx, t.ty)
+                }
+                RenderNode::Clip { children, .. }
+                | RenderNode::RelaxedClip { children, .. }
+                | RenderNode::ShadowPass { children }
+                | RenderNode::Alpha { children, .. } => visit(children, found),
+                RenderNode::PaintLayer(_) | RenderNode::Primitive(_) => false,
+            })
+    }
+    let mut found = None;
+    visit(nodes, &mut found).then_some(found).flatten()
+}
+
+// One Raven patch: remove the translation `common_pure_translation` found;
+// clips above it move into the untranslated space.
+fn strip_translation(nodes: Vec<RenderNode>, dx: f32, dy: f32) -> Vec<RenderNode> {
+    nodes
+        .into_iter()
+        .flat_map(|node| match node {
+            RenderNode::Transform { children, .. } => children,
+            RenderNode::Clip { clips, children } => vec![RenderNode::Clip {
+                clips: clips.into_iter().map(|clip| clip.offset(dx, dy)).collect(),
+                children: strip_translation(children, dx, dy),
+            }],
+            RenderNode::RelaxedClip { clips, children } => vec![RenderNode::RelaxedClip {
+                clips: clips.into_iter().map(|clip| clip.offset(dx, dy)).collect(),
+                children: strip_translation(children, dx, dy),
+            }],
+            RenderNode::ShadowPass { children } => vec![RenderNode::ShadowPass {
+                children: strip_translation(children, dx, dy),
+            }],
+            RenderNode::Alpha { alpha, children } => vec![RenderNode::Alpha {
+                alpha,
+                children: strip_translation(children, dx, dy),
+            }],
+            node => vec![node],
+        })
+        .collect()
 }
 
 fn wrap_with_root_paint_layer(nodes: Vec<RenderNode>, root: Option<&Element>) -> Vec<RenderNode> {
