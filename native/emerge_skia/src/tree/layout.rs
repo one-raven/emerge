@@ -1157,6 +1157,24 @@ pub fn layout_tree_default(tree: &mut ElementTree, constraint: Constraint, scale
 // Pass 0: Scale Attributes
 // =============================================================================
 
+// One Raven patch: how many elements had their frame attrs re-derived, so
+// tests can tell an incremental preparation from a whole-tree one.
+#[cfg(test)]
+thread_local! {
+    static FRAME_ATTR_PREPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_frame_attr_prepare_count() -> usize {
+    FRAME_ATTR_PREPARES.with(|count| count.replace(0))
+}
+
+#[inline]
+fn count_frame_attr_prepare() {
+    #[cfg(test)]
+    FRAME_ATTR_PREPARES.with(|count| count.set(count.get() + 1));
+}
+
 fn prepare_all_attrs_for_frame(
     tree: &mut ElementTree,
     scale: f32,
@@ -1186,6 +1204,7 @@ fn prepare_attrs_flat(
 ) -> bool {
     let mut has_descendant_layout_scale = false;
     for element in tree.iter_nodes_mut() {
+        count_frame_attr_prepare();
         let frame_attrs = frame_declared_attrs(element, samples);
         has_descendant_layout_scale |=
             root_id != Some(element.id) && valid_layout_scale(frame_attrs.layout_scale).is_some();
@@ -1300,6 +1319,7 @@ fn prepare_attrs_for_node_ix(
         .unwrap_or(next_scale);
 
     let element = tree.get_ix_mut(ix)?;
+    count_frame_attr_prepare();
     let frame_attrs = frame_declared_attrs(element, samples);
     dimensions::prepare_scale(element, scale_factor);
     element.layout.effective = scale_attrs(&frame_attrs, scale_factor);
@@ -1318,6 +1338,7 @@ fn prepare_attrs_for_single_node(
     samples: &HashMap<NodeId, super::animation::AnimationSample>,
 ) {
     if let Some(element) = tree.get_mut(id) {
+        count_frame_attr_prepare();
         let frame_attrs = frame_declared_attrs(element, samples);
         dimensions::prepare_scale(element, scale_factor);
         element.layout.effective = scale_attrs(&frame_attrs, scale_factor);

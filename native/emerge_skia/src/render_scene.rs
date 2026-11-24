@@ -638,7 +638,7 @@ pub(crate) fn renderer_animation_snapshot_key(layer: &RenderPaintLayer) -> u64 {
         .renderer_animation
         .as_deref()
         .map(|animation| animation.current_transform);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = crate::fast_hash::FastHasher::new();
     hash_rect(&mut hasher, layer.bounds);
     hash_snapshot_content(&mut hasher, &layer.content.nodes, own);
     hasher.finish()

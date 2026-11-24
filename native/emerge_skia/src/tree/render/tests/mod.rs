@@ -6,6 +6,7 @@ pub(super) use crate::tree::element::*;
 mod cache;
 mod color;
 mod common;
+mod incremental;
 mod multiline;
 mod paint;
 mod paragraph;

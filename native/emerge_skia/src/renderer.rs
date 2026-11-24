@@ -7,9 +7,10 @@
 //! - Font cache for text rendering
 
 pub(crate) mod scene_images;
+use crate::fast_hash::FastHasher;
 use crate::render_color::RenderColor;
 pub use scene_images::{ImageSnapshot, ImageSnapshotRetention};
-use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -932,7 +933,7 @@ pub(crate) fn measure_text_visual_metrics_with_font(font: &Font, text: &str) -> 
 }
 
 fn text_visual_metrics_cache_hash(lookup: &TextVisualMetricsCacheLookup<'_>) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FastHasher::new();
     lookup.generation.hash(&mut hasher);
     lookup.family.hash(&mut hasher);
     lookup.weight.hash(&mut hasher);
@@ -1226,7 +1227,7 @@ fn font_render_generation() -> u64 {
                 context.font_cache_generation.load(Ordering::Relaxed),
             )
         });
-    let mut hash = DefaultHasher::new();
+    let mut hash = FastHasher::new();
     context.hash(&mut hash);
     hash.finish()
 }
@@ -1370,7 +1371,7 @@ fn asset_render_generation(id: &str) -> Option<u64> {
             )
         }
     };
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FastHasher::new();
     let identity = record
         .as_ref()
         .map(|r| Arc::as_ptr(&r.render_revision) as usize)
@@ -2304,7 +2305,7 @@ impl PaintLayerMovingPayloadKey {
             subpixel_phase,
         )
         .map(|mut key| {
-            let mut hasher = DefaultHasher::new();
+            let mut hasher = FastHasher::new();
             // A semantic layer generation covers all of its own runs. Including it here would
             // invalidate every static sibling run when one interleaved label or slider run
             // changes. Exact run nodes plus payload-affecting traversal options form the local
@@ -2849,6 +2850,184 @@ fn moving_paint_layer_payload_resource_generation(nodes: &[RenderNode]) -> Optio
     })
 }
 
+/// One Raven patch: the scene's root layer and the index where its trailing
+/// nearby overlays start, when it has a base below them. The tree emits the
+/// root's in_front/behind... nearbys (and every escaped nearby) after its own
+/// content, so the overlays are a suffix of the root layer's content.
+fn base_snapshot_split(scene: &RenderScene) -> Option<(&RenderPaintLayer, usize)> {
+    let [RenderNode::PaintLayer(root)] = scene.nodes.as_slice() else {
+        return None;
+    };
+    if root.id.role != PaintLayerReason::Root || root.renderer_animation.is_some() {
+        return None;
+    }
+    let nodes = &root.content.nodes;
+    let overlays = nodes
+        .iter()
+        .rev()
+        .take_while(|node| base_snapshot_is_overlay(node))
+        .count();
+    let split = nodes.len() - overlays;
+    (split > 0 && overlays > 0).then_some((root, split))
+}
+
+fn base_snapshot_is_overlay(node: &RenderPaintLayerContentNode) -> bool {
+    match node {
+        RenderPaintLayerContentNode::Own(_) => false,
+        RenderPaintLayerContentNode::Child(layer) => layer.id.role == PaintLayerReason::Nearby,
+        RenderPaintLayerContentNode::ShadowPass { children }
+        | RenderPaintLayerContentNode::Clip { children, .. }
+        | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+        | RenderPaintLayerContentNode::Transform { children, .. }
+        | RenderPaintLayerContentNode::Alpha { children, .. } => {
+            !children.is_empty() && children.iter().all(base_snapshot_is_overlay)
+        }
+    }
+}
+
+/// One Raven patch: what the base's pixels depend on beyond its nodes (image
+/// revisions and the font generation), or None when it can't be kept as a
+/// snapshot: it holds video, an image still loading or failed (both are
+/// replaced without a node change), or a layer the render thread animates.
+fn base_snapshot_resource_generation(content: &[RenderPaintLayerContentNode]) -> Option<u64> {
+    fn walk_nodes(nodes: &[RenderNode], generation: &mut u64, text: &mut bool) -> bool {
+        nodes.iter().all(|node| match node {
+            RenderNode::ShadowPass { children }
+            | RenderNode::Clip { children, .. }
+            | RenderNode::RelaxedClip { children, .. }
+            | RenderNode::Transform { children, .. }
+            | RenderNode::Alpha { children, .. } => walk_nodes(children, generation, text),
+            RenderNode::PaintLayer(layer) => walk_content(&layer.content.nodes, generation, text),
+            RenderNode::Primitive(primitive) => match primitive {
+                DrawPrimitive::Video(..)
+                | DrawPrimitive::ImageLoading(..)
+                | DrawPrimitive::ImageFailed(..) => false,
+                DrawPrimitive::TextWithFont(..) => {
+                    *text = true;
+                    true
+                }
+                DrawPrimitive::Image(_, _, _, _, image_id, _, _) => {
+                    match asset_render_generation(image_id) {
+                        Some(image) => {
+                            *generation = generation
+                                .wrapping_mul(1_099_511_628_211)
+                                .wrapping_add(image);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                _ => true,
+            },
+        })
+    }
+    fn walk_content(
+        nodes: &[RenderPaintLayerContentNode],
+        generation: &mut u64,
+        text: &mut bool,
+    ) -> bool {
+        nodes.iter().all(|node| match node {
+            RenderPaintLayerContentNode::Own(run) => walk_nodes(&run.nodes, generation, text),
+            RenderPaintLayerContentNode::Child(layer) => {
+                layer.renderer_animation.is_none()
+                    && layer.id.role != PaintLayerReason::DirectMedia
+                    && walk_content(&layer.content.nodes, generation, text)
+            }
+            RenderPaintLayerContentNode::ShadowPass { children }
+            | RenderPaintLayerContentNode::Clip { children, .. }
+            | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+            | RenderPaintLayerContentNode::Transform { children, .. }
+            | RenderPaintLayerContentNode::Alpha { children, .. } => {
+                walk_content(children, generation, text)
+            }
+        })
+    }
+    let mut generation = 0u64;
+    let mut text = false;
+    if !walk_content(content, &mut generation, &mut text) {
+        return None;
+    }
+    if text {
+        generation = generation
+            .wrapping_mul(1_099_511_628_211)
+            .wrapping_add(font_render_generation());
+    }
+    Some(generation)
+}
+
+/// One Raven patch: whether two bases paint the same. Subtrees the tree
+/// reused are the same `Arc` and compare in O(1); rebuilt ones (the root's own
+/// runs are rebuilt with the root every frame) compare by value.
+fn base_snapshot_content_eq(
+    a: &[RenderPaintLayerContentNode],
+    b: &[RenderPaintLayerContentNode],
+) -> bool {
+    use RenderPaintLayerContentNode as N;
+    a.len() == b.len()
+        && a.iter().zip(b).all(|pair| match pair {
+            (N::Own(a), N::Own(b)) => {
+                a.slot == b.slot
+                    && a.bounds == b.bounds
+                    && (Arc::ptr_eq(&a.nodes, &b.nodes) || a.nodes == b.nodes)
+            }
+            (N::Child(a), N::Child(b)) => {
+                a.id == b.id
+                    && a.bounds == b.bounds
+                    && a.placement == b.placement
+                    && a.policy == b.policy
+                    && a.content_generation == b.content_generation
+                    && a.renderer_animation.is_none()
+                    && b.renderer_animation.is_none()
+                    && (Arc::ptr_eq(&a.content, &b.content)
+                        || base_snapshot_content_eq(&a.content.nodes, &b.content.nodes))
+            }
+            (N::ShadowPass { children: a }, N::ShadowPass { children: b }) => {
+                base_snapshot_content_eq(a, b)
+            }
+            (
+                N::Clip {
+                    clips: clips_a,
+                    children: a,
+                },
+                N::Clip {
+                    clips: clips_b,
+                    children: b,
+                },
+            )
+            | (
+                N::RelaxedClip {
+                    clips: clips_a,
+                    children: a,
+                },
+                N::RelaxedClip {
+                    clips: clips_b,
+                    children: b,
+                },
+            ) => clips_a == clips_b && base_snapshot_content_eq(a, b),
+            (
+                N::Transform {
+                    transform: transform_a,
+                    children: a,
+                },
+                N::Transform {
+                    transform: transform_b,
+                    children: b,
+                },
+            ) => transform_a == transform_b && base_snapshot_content_eq(a, b),
+            (
+                N::Alpha {
+                    alpha: alpha_a,
+                    children: a,
+                },
+                N::Alpha {
+                    alpha: alpha_b,
+                    children: b,
+                },
+            ) => alpha_a == alpha_b && base_snapshot_content_eq(a, b),
+            _ => false,
+        })
+}
+
 fn paint_layer_apply_clip_state(
     current_transform: Affine2,
     current_clip: Option<PaintLayerDeviceRect>,
@@ -2952,6 +3131,58 @@ pub struct RendererCacheManager {
     payloads: PaintLayerPayloadCache<PaintLayerPayload>,
     /// One Raven patch: whole-subtree textures of renderer-driven layers.
     animation_snapshots: HashMap<PaintLayerId, AnimationSnapshot>,
+    /// One Raven patch: the root's base (everything under its trailing
+    /// nearby overlays) as one full-frame texture; see `BaseSnapshot`.
+    base_snapshot: Option<BaseSnapshot>,
+    base_snapshot_max_bytes: u64,
+    base_snapshot_counts: BaseSnapshotCounts,
+}
+
+/// One Raven patch: the root layer's base content (everything painted
+/// before its trailing nearby overlays: a sheet, its scrim, a toast) over the
+/// clear color, kept as one surface-sized texture, like a browser
+/// compositor's root layer. While the base is unchanged and only overlays
+/// move or fade, a frame is one texture copy plus the overlays, instead of a
+/// walk of the whole page that re-resolves its clips and composites every
+/// cached run.
+///
+/// `content` keeps the base's content nodes alive (cheap `Arc` clones), so a
+/// later frame's base is compared by pointer where the tree reused a subtree
+/// and by value where it rebuilt one, never by a hash that could collide or
+/// by an address that could be reused.
+#[derive(Debug)]
+struct BaseSnapshot {
+    root_id: PaintLayerId,
+    root_bounds: GeometryRect,
+    clear_color: Color,
+    dimensions: ISize,
+    color_type: ColorType,
+    /// What the snapshot's pixels drew from beyond its nodes, when it was made.
+    resource_generation: u64,
+    content: Vec<RenderPaintLayerContentNode>,
+    /// None until the same base is seen on two consecutive frames.
+    image: Option<Image>,
+}
+
+/// One Raven patch: what a frame does with the base snapshot.
+enum BaseSnapshotPlan<'s> {
+    Off,
+    Draw {
+        root: &'s RenderPaintLayer,
+        split: usize,
+    },
+    Rasterize {
+        root: &'s RenderPaintLayer,
+        split: usize,
+        target: Surface,
+    },
+}
+
+/// One Raven patch: base snapshot activity since the renderer was made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BaseSnapshotCounts {
+    pub rasterizations: u64,
+    pub draws: u64,
 }
 
 /// One Raven patch: a renderer-driven layer's subtree, rasterized once under
@@ -2993,6 +3224,12 @@ impl RendererCacheManager {
             visible_admissions: HashMap::new(),
             stored_run_families: HashMap::new(),
             animation_snapshots: HashMap::new(),
+            base_snapshot: None,
+            base_snapshot_max_bytes: config
+                .paint_layer
+                .max_entry_bytes
+                .min(config.paint_layer.max_bytes),
+            base_snapshot_counts: BaseSnapshotCounts::default(),
             payloads: PaintLayerPayloadCache::with_config(
                 renderer_paint_layer_payload_cache_config(config),
             ),
@@ -3023,7 +3260,8 @@ impl RendererCacheManager {
         let mut stats = frame.stats;
         let (entries, bytes, gpu_payloads, cpu_payloads) = self.payload_resident_stats();
         stats.paint_layer.current_entries = entries;
-        stats.paint_layer.current_bytes = bytes;
+        // One Raven patch: the base snapshot counts against the same memory.
+        stats.paint_layer.current_bytes = bytes.saturating_add(self.base_snapshot_bytes());
         stats.paint_layer.current_gpu_payloads = gpu_payloads;
         stats.paint_layer.current_cpu_payloads = cpu_payloads;
         stats
@@ -3034,6 +3272,7 @@ impl RendererCacheManager {
         self.visible_admissions.clear();
         self.stored_run_families.clear();
         self.payloads.clear();
+        self.base_snapshot = None;
     }
 
     pub fn enabled(&self) -> bool {
@@ -3042,6 +3281,25 @@ impl RendererCacheManager {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+        if !enabled {
+            self.base_snapshot = None;
+        }
+    }
+
+    fn base_snapshot_bytes(&self) -> u64 {
+        self.base_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.image.as_ref())
+            .map_or(0, |image| {
+                image.width() as u64
+                    * image.height() as u64
+                    * image.image_info().bytes_per_pixel() as u64
+            })
+    }
+
+    /// One Raven patch: how often the base snapshot was made and drawn.
+    pub fn base_snapshot_counts(&self) -> BaseSnapshotCounts {
+        self.base_snapshot_counts
     }
 
     pub fn generation(&self) -> u64 {
@@ -3739,7 +3997,7 @@ fn hash_visible_render_nodes(
     renderer_cache: &RendererCacheManager,
     eligibility: MovingLayerEligibility,
     alpha: f32,
-    hasher: &mut DefaultHasher,
+    hasher: &mut FastHasher,
 ) -> bool {
     if eligibility.clip_empty || alpha <= 0.0 {
         return true;
@@ -3757,7 +4015,7 @@ fn hash_visible_clip_scope(
     renderer_cache: &RendererCacheManager,
     eligibility: MovingLayerEligibility,
     alpha: f32,
-    hasher: &mut DefaultHasher,
+    hasher: &mut FastHasher,
 ) -> bool {
     if children.is_empty() {
         return true;
@@ -3804,7 +4062,7 @@ fn hash_visible_render_node(
     renderer_cache: &RendererCacheManager,
     eligibility: MovingLayerEligibility,
     alpha: f32,
-    hasher: &mut DefaultHasher,
+    hasher: &mut FastHasher,
 ) -> bool {
     match node {
         RenderNode::ShadowPass { children } => {
@@ -3898,7 +4156,7 @@ fn hash_visible_paint_layer(
     renderer_cache: &RendererCacheManager,
     eligibility: MovingLayerEligibility,
     alpha: f32,
-    hasher: &mut DefaultHasher,
+    hasher: &mut FastHasher,
 ) -> bool {
     let own_visible = layer.metrics.own_primitive_count > 0
         && paint_layer_payload_visible_device_rect_for_eligibility(layer, eligibility).is_some();
@@ -3934,7 +4192,7 @@ fn hash_visible_paint_layer_content(
     renderer_cache: &RendererCacheManager,
     eligibility: MovingLayerEligibility,
     alpha: f32,
-    hasher: &mut DefaultHasher,
+    hasher: &mut FastHasher,
 ) -> bool {
     if eligibility.clip_empty || alpha <= 0.0 {
         return true;
@@ -3951,7 +4209,7 @@ fn hash_visible_paint_layer_content_node(
     renderer_cache: &RendererCacheManager,
     eligibility: MovingLayerEligibility,
     alpha: f32,
-    hasher: &mut DefaultHasher,
+    hasher: &mut FastHasher,
 ) -> bool {
     match node {
         RenderPaintLayerContentNode::Own(run) => {
@@ -4047,7 +4305,7 @@ fn hash_visible_paint_layer_content_clip(
     renderer_cache: &RendererCacheManager,
     eligibility: MovingLayerEligibility,
     alpha: f32,
-    hasher: &mut DefaultHasher,
+    hasher: &mut FastHasher,
 ) -> bool {
     if children.is_empty() {
         return true;
@@ -4116,7 +4374,7 @@ fn visible_primitive_device_rect(
     }
 }
 
-fn hash_skia_color(hasher: &mut DefaultHasher, color: Color) {
+fn hash_skia_color(hasher: &mut FastHasher, color: Color) {
     color.a().hash(hasher);
     color.r().hash(hasher);
     color.g().hash(hasher);
@@ -4651,6 +4909,11 @@ impl SceneRenderer {
         cleanup
     }
 
+    /// One Raven patch: how often the root's base snapshot was made and drawn.
+    pub fn base_snapshot_counts(&self) -> BaseSnapshotCounts {
+        self.renderer_cache.base_snapshot_counts()
+    }
+
     pub fn invalidate_visible_frame_fingerprint(&mut self) {
         self.last_visible_frame_fingerprint = None;
     }
@@ -4687,7 +4950,7 @@ impl SceneRenderer {
             width: surface_dimensions.0.max(1),
             height: surface_dimensions.1.max(1),
         };
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = FastHasher::new();
         "visible-frame-v1".hash(&mut hasher);
         hash_skia_color(&mut hasher, state.clear_color);
         surface_clip.hash(&mut hasher);
@@ -4749,6 +5012,18 @@ impl SceneRenderer {
         let started_at = Instant::now();
         let draw_started_at = Instant::now();
         let root_eligibility = moving_layer_root_eligibility_for_surface(frame.surface);
+        // Keep no-candidate frames on the original renderer path. Routing every
+        // frame through cache-tracking traversal regressed mixed_ui_scene by
+        // 3.36%, so candidate tracking is only paid by candidate-bearing scenes.
+        let should_track_cache = state.has_cacheable_paint_layers
+            && (self.renderer_cache.enabled() || state.has_scroll_moving_paint_layers);
+        // One Raven patch: decide on the base snapshot before the canvas
+        // borrows the surface (a new snapshot is made on a surface like it).
+        let base_plan = if should_track_cache && (cfg!(test) || frame.direct_context.is_some()) {
+            self.plan_base_snapshot(state, frame.surface)
+        } else {
+            BaseSnapshotPlan::Off
+        };
         let canvas = frame.surface.canvas();
         // One Raven patch: partial redraw. Reset what the previous frame left
         // on this canvas, then clip to the damaged area if there is one.
@@ -4762,11 +5037,6 @@ impl SceneRenderer {
             );
         }
 
-        // Keep no-candidate frames on the original renderer path. Routing every
-        // frame through cache-tracking traversal regressed mixed_ui_scene by
-        // 3.36%, so candidate tracking is only paid by candidate-bearing scenes.
-        let should_track_cache = state.has_cacheable_paint_layers
-            && (self.renderer_cache.enabled() || state.has_scroll_moving_paint_layers);
         if !should_track_cache {
             let draw_detail = if profile_draw {
                 let mut detail = RenderDrawTimings::default();
@@ -4823,56 +5093,28 @@ impl SceneRenderer {
 
         let (draw_detail, renderer_cache) = if profile_draw {
             let mut detail = RenderDrawTimings::default();
-            let clear_started_at = Instant::now();
-            canvas.clear(state.clear_color);
             let mut instrumentation = TimingDrawInstrumentation {
                 detail: &mut detail,
             };
-            instrumentation.record_clear(clear_started_at.elapsed());
-
-            let mut cache_frame = self.renderer_cache.begin_frame();
-            let options = RenderTraversalOptions::unclipped(&self.video_state);
-            let mut cache_tracking = RenderCacheTracking {
-                renderer_cache: &mut self.renderer_cache,
-                frame: &mut cache_frame,
-                gpu_context: frame.direct_context.as_deref_mut(),
-            };
-            Self::render_nodes_with_cache_tracking(
+            let stats = self.render_cache_tracked_frame(
                 canvas,
-                &state.scene.nodes,
-                options,
-                &mut cache_tracking,
+                state,
+                base_plan,
+                frame.direct_context.as_deref_mut(),
                 root_eligibility,
                 &mut instrumentation,
             );
-
-            let stats = self.renderer_cache.end_frame(cache_frame);
-            let renderer_cache = (!stats.is_empty()).then(|| Box::new(stats));
-
-            (Some(detail), renderer_cache)
+            (Some(detail), (!stats.is_empty()).then(|| Box::new(stats)))
         } else {
-            canvas.clear(state.clear_color);
-            let mut instrumentation = NoDrawInstrumentation;
-
-            let mut cache_frame = self.renderer_cache.begin_frame();
-            let options = RenderTraversalOptions::unclipped(&self.video_state);
-            let mut cache_tracking = RenderCacheTracking {
-                renderer_cache: &mut self.renderer_cache,
-                frame: &mut cache_frame,
-                gpu_context: frame.direct_context.as_deref_mut(),
-            };
-            Self::render_nodes_with_cache_tracking(
+            let stats = self.render_cache_tracked_frame(
                 canvas,
-                &state.scene.nodes,
-                options,
-                &mut cache_tracking,
+                state,
+                base_plan,
+                frame.direct_context.as_deref_mut(),
                 root_eligibility,
-                &mut instrumentation,
+                &mut NoDrawInstrumentation,
             );
-            let stats = self.renderer_cache.end_frame(cache_frame);
-            let renderer_cache = (!stats.is_empty()).then(|| Box::new(stats));
-
-            (None, renderer_cache)
+            (None, (!stats.is_empty()).then(|| Box::new(stats)))
         };
 
         let draw = draw_started_at.elapsed();
@@ -4887,6 +5129,202 @@ impl SceneRenderer {
             submit: flush.submit,
             renderer_cache,
         }
+    }
+
+    /// One Raven patch: whether this frame draws the root's base from its
+    /// snapshot, makes the snapshot first, or draws everything as before. A
+    /// snapshot is made once the same base is seen on two frames running, so
+    /// a page that changes every frame never pays for it (only for comparing
+    /// its base up to the first difference).
+    fn plan_base_snapshot<'s>(
+        &mut self,
+        state: &'s RenderState,
+        surface: &mut Surface,
+    ) -> BaseSnapshotPlan<'s> {
+        let cache = &mut self.renderer_cache;
+        let split = cache
+            .enabled()
+            .then(|| base_snapshot_split(&state.scene))
+            .flatten();
+        let Some((root, split)) = split else {
+            cache.base_snapshot = None;
+            return BaseSnapshotPlan::Off;
+        };
+        let base = &root.content.nodes[..split];
+        let info = surface.image_info();
+        let unchanged = cache.base_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.root_id == root.id
+                && snapshot.root_bounds == root.bounds
+                && snapshot.clear_color == state.clear_color
+                && snapshot.dimensions == info.dimensions()
+                && snapshot.color_type == info.color_type()
+                && base_snapshot_content_eq(&snapshot.content, base)
+        });
+        if !unchanged {
+            cache.base_snapshot = Some(BaseSnapshot {
+                root_id: root.id,
+                root_bounds: root.bounds,
+                clear_color: state.clear_color,
+                dimensions: info.dimensions(),
+                color_type: info.color_type(),
+                resource_generation: 0,
+                content: base.to_vec(),
+                image: None,
+            });
+            return BaseSnapshotPlan::Off;
+        }
+        let Some(snapshot) = cache.base_snapshot.as_mut() else {
+            return BaseSnapshotPlan::Off;
+        };
+        // Same nodes; the pixels may still depend on an image revision or
+        // the font generation, or on something that can't be kept at all.
+        let Some(resource_generation) = base_snapshot_resource_generation(base) else {
+            snapshot.image = None;
+            return BaseSnapshotPlan::Off;
+        };
+        if snapshot.image.is_some() && snapshot.resource_generation == resource_generation {
+            return BaseSnapshotPlan::Draw { root, split };
+        }
+        snapshot.image = None;
+        snapshot.resource_generation = resource_generation;
+        if info.compute_min_byte_size() as u64 > cache.base_snapshot_max_bytes {
+            return BaseSnapshotPlan::Off;
+        }
+        match surface.new_surface(&info) {
+            Some(target) => BaseSnapshotPlan::Rasterize {
+                root,
+                split,
+                target,
+            },
+            None => BaseSnapshotPlan::Off,
+        }
+    }
+
+    fn render_cache_tracked_frame<I: DrawInstrumentation>(
+        &mut self,
+        canvas: &skia_safe::Canvas,
+        state: &RenderState,
+        base_plan: BaseSnapshotPlan<'_>,
+        gpu_context: Option<&mut gpu::DirectContext>,
+        root_eligibility: MovingLayerEligibility,
+        instrumentation: &mut I,
+    ) -> RendererCacheFrameStats {
+        let Self {
+            video_state,
+            renderer_cache,
+            ..
+        } = self;
+        let mut cache_frame = renderer_cache.begin_frame();
+        let options = RenderTraversalOptions::unclipped(video_state);
+        let mut cache_tracking = RenderCacheTracking {
+            renderer_cache: &mut *renderer_cache,
+            frame: &mut cache_frame,
+            gpu_context,
+        };
+        let clear = |canvas: &skia_safe::Canvas, instrumentation: &mut I| {
+            if I::ENABLED {
+                let clear_started_at = Instant::now();
+                canvas.clear(state.clear_color);
+                instrumentation.record_clear(clear_started_at.elapsed());
+            } else {
+                canvas.clear(state.clear_color);
+            }
+        };
+
+        let (root, split) = match base_plan {
+            BaseSnapshotPlan::Off => {
+                clear(canvas, instrumentation);
+                Self::render_nodes_with_cache_tracking(
+                    canvas,
+                    &state.scene.nodes,
+                    options,
+                    &mut cache_tracking,
+                    root_eligibility,
+                    instrumentation,
+                );
+                return renderer_cache.end_frame(cache_frame);
+            }
+            BaseSnapshotPlan::Rasterize {
+                root,
+                split,
+                mut target,
+            } => {
+                // Exactly what the frame itself would hold after the base:
+                // the clear color, then the base, on a surface of the same
+                // kind (color type, sample count, text properties).
+                let offscreen = target.canvas();
+                clear(offscreen, instrumentation);
+                let mut mode = CacheTrackingRenderMode {
+                    cache_tracking: &mut cache_tracking,
+                };
+                Self::render_paint_layer_content_in_mode(
+                    offscreen,
+                    root,
+                    &root.content.nodes[..split],
+                    &mut mode,
+                    options,
+                    root_eligibility,
+                    instrumentation,
+                );
+                let image = target.image_snapshot();
+                let cache = &mut *cache_tracking.renderer_cache;
+                if let Some(snapshot) = cache.base_snapshot.as_mut() {
+                    snapshot.image = Some(image);
+                    cache.base_snapshot_counts.rasterizations += 1;
+                }
+                (root, split)
+            }
+            BaseSnapshotPlan::Draw { root, split } => (root, split),
+        };
+
+        let image = cache_tracking
+            .renderer_cache
+            .base_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.image.clone());
+        if let Some(image) = image {
+            // Src replaces the clear (the snapshot holds it), so profiles
+            // count this draw as the clear.
+            let mut paint = Paint::default();
+            paint.set_blend_mode(BlendMode::Src);
+            let started_at = I::ENABLED.then(Instant::now);
+            canvas.draw_image(&image, (0, 0), Some(&paint));
+            if let Some(started_at) = started_at {
+                instrumentation.record_clear(started_at.elapsed());
+            }
+            let pixels = image.width() as u64 * image.height() as u64;
+            cache_tracking
+                .frame
+                .record_cached_image_draw(pixels, pixels);
+            cache_tracking.renderer_cache.base_snapshot_counts.draws += 1;
+        } else {
+            clear(canvas, instrumentation);
+            let mut mode = CacheTrackingRenderMode {
+                cache_tracking: &mut cache_tracking,
+            };
+            Self::render_paint_layer_content_in_mode(
+                canvas,
+                root,
+                &root.content.nodes[..split],
+                &mut mode,
+                options,
+                root_eligibility,
+                instrumentation,
+            );
+        }
+        let mut mode = CacheTrackingRenderMode {
+            cache_tracking: &mut cache_tracking,
+        };
+        Self::render_paint_layer_content_in_mode(
+            canvas,
+            root,
+            &root.content.nodes[split..],
+            &mut mode,
+            options,
+            root_eligibility,
+            instrumentation,
+        );
+        renderer_cache.end_frame(cache_frame)
     }
 
     #[cfg(not(test))]
@@ -9165,7 +9603,7 @@ mod tests {
         render_scene_graph_to_pixels_and_timings_with_renderer(&mut renderer, width, height, scene)
     }
 
-    fn render_scene_graph_to_pixels_and_timings_with_renderer(
+    pub(super) fn render_scene_graph_to_pixels_and_timings_with_renderer(
         renderer: &mut SceneRenderer,
         width: u32,
         height: u32,
@@ -15318,3 +15756,234 @@ mod svg_cache_tests;
 #[cfg(test)]
 #[path = "renderer_gradient_tests.rs"]
 mod gradient_tests;
+
+// One Raven patch: which scenes may keep a base snapshot, and how bases compare.
+#[cfg(test)]
+mod base_snapshot_tests {
+    use super::*;
+    use crate::render_scene::PaintLayerPlacement;
+
+    fn rect(x: f32, color: u32) -> RenderNode {
+        RenderNode::Primitive(DrawPrimitive::Rect(x, 0.0, 10.0, 10.0, color.into()))
+    }
+
+    fn bounds() -> GeometryRect {
+        GeometryRect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        }
+    }
+
+    fn layer(id: u64, reason: PaintLayerReason, children: Vec<RenderNode>) -> RenderPaintLayer {
+        let policy = if reason == PaintLayerReason::Root {
+            PaintLayerPolicy::DirectOnly
+        } else {
+            PaintLayerPolicy::Cacheable
+        };
+        RenderPaintLayer::from_children(
+            id,
+            bounds(),
+            PaintLayerPlacement::Fixed,
+            policy,
+            reason,
+            0,
+            children,
+        )
+    }
+
+    fn scene(children: Vec<RenderNode>) -> RenderScene {
+        RenderScene {
+            fonts: None,
+            images: None,
+            nodes: vec![RenderNode::PaintLayer(layer(
+                1,
+                PaintLayerReason::Root,
+                children,
+            ))],
+        }
+    }
+
+    fn overlay(dy: f32) -> RenderNode {
+        RenderNode::Transform {
+            transform: Affine2::translation(0.0, dy),
+            children: vec![RenderNode::PaintLayer(layer(
+                9,
+                PaintLayerReason::Nearby,
+                vec![rect(0.0, 0xFFFFFFFF)],
+            ))],
+        }
+    }
+
+    #[test]
+    fn the_base_is_the_root_content_under_its_trailing_nearby_overlays() {
+        let page = || {
+            vec![
+                rect(0.0, 0x112233FF),
+                RenderNode::PaintLayer(layer(
+                    2,
+                    PaintLayerReason::ScrollContent,
+                    vec![rect(20.0, 0x445566FF)],
+                )),
+                rect(40.0, 0x778899FF),
+            ]
+        };
+        let with_overlay = scene([page(), vec![overlay(5.0), overlay(6.0)]].concat());
+        let (_, split) = base_snapshot_split(&with_overlay).expect("split");
+        assert_eq!(split, 3);
+
+        // No overlay, nothing but overlays, own content painted over an
+        // overlay, or a root the render thread animates: no snapshot.
+        assert!(base_snapshot_split(&scene(page())).is_none());
+        assert!(base_snapshot_split(&scene(vec![overlay(1.0)])).is_none());
+        assert!(
+            base_snapshot_split(&scene(
+                [page(), vec![overlay(1.0), rect(0.0, 0xFF)]].concat()
+            ))
+            .is_none()
+        );
+        let mut not_root = with_overlay.clone();
+        if let RenderNode::PaintLayer(root) = &mut not_root.nodes[0] {
+            root.id.role = PaintLayerReason::Nearby;
+        }
+        assert!(base_snapshot_split(&not_root).is_none());
+    }
+
+    #[test]
+    fn video_loading_images_and_animated_layers_keep_no_snapshot() {
+        let content = |nodes: Vec<RenderNode>| layer(1, PaintLayerReason::Root, nodes).content;
+        assert!(base_snapshot_resource_generation(&content(vec![rect(0.0, 0xFF)]).nodes).is_some());
+        for primitive in [
+            DrawPrimitive::Video(0.0, 0.0, 10.0, 10.0, "cam".into(), ImageFit::Cover),
+            DrawPrimitive::ImageLoading(0.0, 0.0, 10.0, 10.0),
+            DrawPrimitive::ImageFailed(0.0, 0.0, 10.0, 10.0),
+        ] {
+            let nested = RenderNode::PaintLayer(layer(
+                2,
+                PaintLayerReason::ScrollContent,
+                vec![RenderNode::Primitive(primitive.clone())],
+            ));
+            assert!(
+                base_snapshot_resource_generation(&content(vec![nested]).nodes).is_none(),
+                "{primitive:?}"
+            );
+        }
+        let mut media = layer(3, PaintLayerReason::DirectMedia, vec![rect(0.0, 0xFF)]);
+        assert!(
+            base_snapshot_resource_generation(
+                &content(vec![RenderNode::PaintLayer(media.clone())]).nodes
+            )
+            .is_none()
+        );
+        media.id.role = PaintLayerReason::Animation;
+        media.renderer_animation = Some(Arc::new(crate::render_scene::LayerRendererAnimation {
+            spec: Arc::new(crate::tree::animation::AnimationSpec {
+                keyframes: vec![crate::tree::attrs::Attrs::default(); 2],
+                duration_ms: 1000.0,
+                curve: crate::tree::animation::AnimationCurve::Linear,
+                repeat: crate::tree::animation::AnimationRepeat::Loop,
+            }),
+            started_at: Instant::now(),
+            revision: 0,
+            frame: crate::tree::element::Frame::default(),
+            base: crate::tree::attrs::Attrs::default(),
+            current_transform: Affine2::identity(),
+            current_alpha: 1.0,
+            offset: (0.0, 0.0),
+            bounds_transform: Affine2::identity(),
+        }));
+        assert!(
+            base_snapshot_resource_generation(&content(vec![RenderNode::PaintLayer(media)]).nodes)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_new_image_revision_under_an_unchanged_base_remakes_the_snapshot() {
+        let id = "base_snapshot_revision_image";
+        let solid = |rgba: [u8; 4]| rgba.repeat(4);
+        insert_test_raster_asset_rgba(id, 2, 2, &solid([255, 0, 0, 255])).unwrap();
+        let frame_scene = |dy: f32| {
+            scene(vec![
+                rect(0.0, 0x112233FF),
+                RenderNode::Primitive(DrawPrimitive::Image(
+                    10.0,
+                    10.0,
+                    40.0,
+                    40.0,
+                    id.into(),
+                    ImageFit::Cover,
+                    None,
+                )),
+                overlay(dy),
+            ])
+        };
+        let mut cached = SceneRenderer::with_cache_config(RendererCacheConfig {
+            enabled: true,
+            ..RendererCacheConfig::default()
+        });
+        let mut direct = SceneRenderer::new();
+        let mut frame = |dy: f32| {
+            let (pixels, _) = tests::render_scene_graph_to_pixels_and_timings_with_renderer(
+                &mut cached,
+                100,
+                100,
+                frame_scene(dy),
+            );
+            let (expected, _) = tests::render_scene_graph_to_pixels_and_timings_with_renderer(
+                &mut direct,
+                100,
+                100,
+                frame_scene(dy),
+            );
+            assert!(pixels == expected, "dy {dy}: wrong pixels");
+            cached.base_snapshot_counts()
+        };
+        frame(1.0);
+        assert_eq!(frame(2.0).rasterizations, 1);
+        assert_eq!(frame(3.0).draws, 2);
+
+        insert_test_raster_asset_rgba(id, 2, 2, &solid([0, 255, 0, 255])).unwrap();
+        let counts = frame(4.0);
+        assert_eq!(counts.rasterizations, 2, "the new pixels must be drawn");
+        assert_eq!(counts.draws, 3);
+    }
+
+    #[test]
+    fn bases_compare_by_pointer_when_reused_and_by_value_when_rebuilt() {
+        let child = layer(
+            2,
+            PaintLayerReason::ScrollContent,
+            vec![rect(20.0, 0x445566FF)],
+        );
+        let base = |color: u32, child: &RenderPaintLayer| {
+            layer(
+                1,
+                PaintLayerReason::Root,
+                vec![rect(0.0, color), RenderNode::PaintLayer(child.clone())],
+            )
+            .content
+        };
+        let first = base(0x112233FF, &child);
+        // Rebuilt (fresh Arcs), same values.
+        let rebuilt = base(0x112233FF, &child);
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert!(base_snapshot_content_eq(&first.nodes, &rebuilt.nodes));
+        // One color differs.
+        assert!(!base_snapshot_content_eq(
+            &first.nodes,
+            &base(0x112234FF, &child).nodes
+        ));
+        // The child layer rebuilt with different content.
+        let changed_child = layer(
+            2,
+            PaintLayerReason::ScrollContent,
+            vec![rect(21.0, 0x445566FF)],
+        );
+        assert!(!base_snapshot_content_eq(
+            &first.nodes,
+            &base(0x112233FF, &changed_child).nodes
+        ));
+    }
+}

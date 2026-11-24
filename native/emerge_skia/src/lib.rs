@@ -40,6 +40,8 @@ mod display;
 #[cfg(all(feature = "drm", target_os = "linux"))]
 mod drm_input;
 pub mod events;
+// One Raven patch: fast hasher for the renderer's per-frame keys.
+mod fast_hash;
 pub mod input;
 pub mod keys;
 #[cfg(all(feature = "drm", target_os = "linux"))]

@@ -806,6 +806,278 @@ fn translated_nearby_reuses_its_payload_at_every_offset() {
     }
 }
 
+// One Raven patch: dragging a sheet over an unchanged page draws the page
+// (everything under the root's nearby overlays) once into a snapshot, then
+// reuses it as one texture while only the scrim and the sheet are walked.
+struct SheetOverPage {
+    tree: ElementTree,
+    scrim_id: NodeId,
+    sheet_id: NodeId,
+    first_row_id: NodeId,
+}
+
+fn sheet_over_page() -> SheetOverPage {
+    let root_id = NodeId::from_term_bytes(vec![4]);
+    let page_id = NodeId::from_term_bytes(vec![5]);
+    let nav_id = NodeId::from_term_bytes(vec![6]);
+    let content_id = NodeId::from_term_bytes(vec![7]);
+    let scrim_id = NodeId::from_term_bytes(vec![41]);
+    let sheet_id = NodeId::from_term_bytes(vec![42]);
+
+    let mut tree = ElementTree::new();
+    tree.set_root_id(root_id);
+    let mut root = element(
+        root_id,
+        ElementKind::Column,
+        solid_fill_attrs((12, 14, 20)),
+        frame(0.0, 0.0, 360.0, 640.0),
+    );
+    root.children = vec![page_id, nav_id];
+    tree.insert(root);
+
+    // The page: a scroll container (a cacheable layer of its own) of rows
+    // with rounded corners and borders, so edges are antialiased.
+    let mut page_attrs = solid_fill_attrs((24, 28, 40));
+    page_attrs.scrollbar_y = Some(true);
+    let mut page = element(
+        page_id,
+        ElementKind::El,
+        page_attrs,
+        frame(0.0, 0.0, 360.0, 560.0),
+    );
+    page.layout.scroll_y_max = 400.0;
+    page.children = vec![content_id];
+    tree.insert(page);
+    let mut content = element(
+        content_id,
+        ElementKind::Column,
+        Attrs::default(),
+        frame(0.0, 0.0, 360.0, 960.0),
+    );
+    let row_ids: Vec<NodeId> = (0u8..20)
+        .map(|index| {
+            let id = NodeId::from_term_bytes(vec![100 + index]);
+            let mut attrs = solid_fill_attrs((60 + index * 6, 110, 170));
+            attrs.border_radius = Some(BorderRadius::Uniform(6.5));
+            tree.insert(element(
+                id,
+                ElementKind::El,
+                attrs,
+                frame(12.0, 8.0 + f32::from(index) * 30.0, 336.0, 24.5),
+            ));
+            id
+        })
+        .collect();
+    let first_row_id = row_ids[0];
+    content.children = row_ids;
+    tree.insert(content);
+    tree.insert(element(
+        nav_id,
+        ElementKind::El,
+        solid_fill_attrs((200, 200, 210)),
+        frame(0.0, 560.0, 360.0, 80.0),
+    ));
+
+    // A full-screen scrim and the sheet over it, both in_front nearbys.
+    mount_nearby(
+        &mut tree,
+        &page_id,
+        NearbySlot::InFront,
+        ElementKind::El,
+        solid_fill_attrs((0, 0, 0)),
+        frame(0.0, 0.0, 360.0, 640.0),
+        41,
+    );
+    let mut sheet_attrs = solid_fill_attrs((248, 250, 252));
+    sheet_attrs.border_radius = Some(BorderRadius::Uniform(16.0));
+    mount_nearby(
+        &mut tree,
+        &nav_id,
+        NearbySlot::InFront,
+        ElementKind::El,
+        sheet_attrs,
+        frame(0.0, 300.0, 360.0, 340.0),
+        42,
+    );
+    let sheet_rows = (0u8..8)
+        .map(|index| {
+            let id = NodeId::from_term_bytes(vec![200 + index]);
+            tree.insert(element(
+                id,
+                ElementKind::El,
+                solid_fill_attrs((40 + index * 20, 60, 90)),
+                frame(16.0, 320.0 + f32::from(index) * 36.0, 300.0, 20.0),
+            ));
+            id
+        })
+        .collect();
+    let sheet = tree.get_mut(&sheet_id).expect("sheet");
+    sheet.children = sheet_rows;
+    sheet.layout.effective.move_y = Some(0.0);
+    tree.get_mut(&scrim_id)
+        .expect("scrim")
+        .layout
+        .effective
+        .alpha = Some(0.2);
+    tree.clear_refresh_dirty();
+    SheetOverPage {
+        tree,
+        scrim_id,
+        sheet_id,
+        first_row_id,
+    }
+}
+
+fn drag_sheet(
+    fixture: &mut SheetOverPage,
+    dy: f64,
+    alpha: f64,
+) -> crate::render_scene::RenderScene {
+    let tree = &mut fixture.tree;
+    tree.get_mut(&fixture.sheet_id)
+        .expect("sheet")
+        .layout
+        .effective
+        .move_y = Some(dy);
+    tree.mark_render_and_registry_refresh_dirty(&fixture.sheet_id);
+    tree.get_mut(&fixture.scrim_id)
+        .expect("scrim")
+        .layout
+        .effective
+        .alpha = Some(alpha);
+    tree.mark_render_and_registry_refresh_dirty(&fixture.scrim_id);
+    let scene = super::super::render_tree_scene_with_scroll_layers(tree).scene;
+    tree.clear_refresh_dirty();
+    scene
+}
+
+fn render_profiled_to_pixels(
+    renderer: &mut SceneRenderer,
+    scene: crate::render_scene::RenderScene,
+) -> (Vec<u8>, crate::renderer::RenderTimings) {
+    let info = skia_safe::ImageInfo::new(
+        (360, 640),
+        skia_safe::ColorType::RGBA8888,
+        skia_safe::AlphaType::Premul,
+        None,
+    );
+    let mut surface = skia_safe::surfaces::raster(&info, None, None).expect("test surface");
+    let state =
+        crate::renderer::RenderState::new(scene, skia_safe::Color::from_rgb(3, 4, 5), 1, false);
+    let mut frame = crate::renderer::RenderFrame::new(&mut surface, None);
+    let timings = renderer.render_profiled(&mut frame, &state);
+    let mut pixels = vec![0u8; 360 * 640 * 4];
+    surface.read_pixels(&info, pixels.as_mut_slice(), 360 * 4, (0, 0));
+    (pixels, timings)
+}
+
+fn cached_renderer() -> SceneRenderer {
+    SceneRenderer::with_cache_config(RendererCacheConfig {
+        enabled: true,
+        max_new_payloads_per_frame: 64,
+        ..RendererCacheConfig::default()
+    })
+}
+
+fn direct_renderer() -> SceneRenderer {
+    SceneRenderer::with_cache_config(RendererCacheConfig {
+        enabled: false,
+        ..RendererCacheConfig::default()
+    })
+}
+
+#[test]
+fn dragged_sheet_reuses_a_snapshot_of_the_unchanged_page() {
+    let mut fixture = sheet_over_page();
+    let mut cached = cached_renderer();
+    let mut direct = direct_renderer();
+
+    let steps = [
+        (-8.0, 0.2),
+        (-30.0, 0.25),
+        (-31.0, 0.3),
+        (-60.25, 0.35),
+        (-61.5, 0.4),
+    ];
+    for (step, (dy, alpha)) in steps.into_iter().enumerate() {
+        let scene = drag_sheet(&mut fixture, dy, alpha);
+        let (pixels, timings) = render_profiled_to_pixels(&mut cached, scene.clone());
+        let (expected, _) = render_profiled_to_pixels(&mut direct, scene);
+        assert!(
+            pixels == expected,
+            "step {step}: snapshot frame drew wrong pixels"
+        );
+
+        let counts = cached.base_snapshot_counts();
+        // The first frame sees the page; the second, seeing it unchanged,
+        // makes the snapshot; every later one only draws it.
+        assert_eq!(counts.rasterizations, u64::from(step >= 1), "step {step}");
+        assert_eq!(counts.draws, step as u64, "step {step}");
+        if step >= 2 {
+            // Only the overlays' own runs were walked: none of the page's.
+            let detail = timings.draw_detail.expect("profiled frame");
+            assert!(
+                detail
+                    .paint_run_details
+                    .iter()
+                    .all(|run| run.layer_id.role == PaintLayerReason::Nearby),
+                "step {step}: walked the page {:?}",
+                detail
+                    .paint_run_details
+                    .iter()
+                    .map(|run| run.layer_id)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                detail.paint_run_count <= 2,
+                "step {step}: {}",
+                detail.paint_run_count
+            );
+        }
+    }
+}
+
+#[test]
+fn a_changed_page_is_never_drawn_from_a_stale_snapshot() {
+    let mut fixture = sheet_over_page();
+    let mut cached = cached_renderer();
+    let mut direct = direct_renderer();
+
+    let mut frame = |fixture: &mut SheetOverPage, dy: f64| {
+        let scene = drag_sheet(fixture, dy, 0.3);
+        let (pixels, _) = render_profiled_to_pixels(&mut cached, scene.clone());
+        let (expected, _) = render_profiled_to_pixels(&mut direct, scene);
+        assert!(pixels == expected, "dy {dy}: drew wrong pixels");
+        cached.base_snapshot_counts()
+    };
+    frame(&mut fixture, -5.0);
+    let made = frame(&mut fixture, -6.0);
+    assert_eq!(made.rasterizations, 1);
+
+    // A row in the scroll layer changes color under the sheet.
+    let row = fixture.first_row_id;
+    fixture
+        .tree
+        .get_mut(&row)
+        .expect("row")
+        .layout
+        .effective
+        .background = Some(Background::Color(Color::Rgb {
+        r: 250,
+        g: 20,
+        b: 20,
+    }));
+    fixture.tree.mark_render_and_registry_refresh_dirty(&row);
+    let changed = frame(&mut fixture, -7.0);
+    assert_eq!(
+        changed, made,
+        "a changed page must be drawn, not snapshotted"
+    );
+    let remade = frame(&mut fixture, -8.0);
+    assert_eq!(remade.rasterizations, 2);
+    assert_eq!(remade.draws, made.draws + 1);
+}
+
 fn camera_fixture() -> CameraFixture {
     let root_id = NodeId::from_u64(10_000);
     let video_id = NodeId::from_u64(10_001);

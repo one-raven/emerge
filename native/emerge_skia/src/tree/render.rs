@@ -23,7 +23,8 @@ use self::text::{
 use super::animation::animation_spec_is_compositor_only;
 use super::attrs::{Attrs, effective_scrollbar_x, effective_scrollbar_y};
 use super::element::{
-    Element, ElementKind, ElementTree, Frame, NearbySlot, NodeIx, RenderFragmentCache,
+    Element, ElementKind, ElementTree, Frame, LayerRewrite, LayerRewriteOp, NearbySlot, NodeIx,
+    RenderFragmentCache,
     RenderFragmentCacheKey, RenderFragmentCacheKind, RetainedChildMode, RetainedLocalBranchRef,
 };
 use super::geometry::{ClipShape, Rect, host_clip_shape, self_shape as geometry_self_shape};
@@ -39,7 +40,7 @@ use crate::events::{RegistryRebuildPayload, registry_builder::RegistryRefreshCol
 use crate::render_scene::{
     DrawPrimitive, PaintLayerHashFloat, PaintLayerId, PaintLayerPlacement, PaintLayerPolicy,
     PaintLayerReason, RenderNode, RenderPaintLayer, RenderPaintLayerBuildParts,
-    RenderPaintLayerContent, RenderScene, hash_paint_layer_render_nodes,
+    RenderPaintLayerContent, RenderPaintLayerContentNode, RenderScene, hash_paint_layer_render_nodes,
     paint_layer_bounds_from_visual_bounds, paint_layer_own_content_visual_bounds,
 };
 use crate::renderer::{make_font_with_style, measure_text_visual_metrics_with_font};
@@ -815,12 +816,41 @@ fn element_render_fragment_cache_key(
         hash_f32_bits(&mut hasher, part);
     }
     hasher.write_usize(traversal.scene_ctx.interaction_clips.len());
-    hasher.write(format!("{:?}", inherited).as_bytes());
+    hash_font_context(&mut hasher, inherited);
     hasher.write_u8(traversal.disable_viewport_culling as u8);
     hasher.write_u8(traversal.inside_cacheable_semantic_layer as u8);
     key.kind = RenderFragmentCacheKind::Element;
     key.context = hasher.finish();
     Some(key)
+}
+
+// One Raven patch: hash the inherited font field by field. The key used to
+// hash `format!("{:?}", inherited)`, a string built for every element visited
+// on every refresh (5% of a one-text patch on a 1,400-node screen).
+fn hash_font_context(hasher: &mut DefaultHasher, font: &FontContext) {
+    use std::hash::Hash;
+    let FontContext {
+        font_family,
+        font_weight,
+        font_italic,
+        font_size,
+        font_color,
+        font_underline,
+        font_strike,
+        font_letter_spacing,
+        font_word_spacing,
+        text_align,
+    } = font;
+    font_family.hash(hasher);
+    font_weight.hash(hasher);
+    font_italic.hash(hasher);
+    font_color.hash(hasher);
+    font_underline.hash(hasher);
+    font_strike.hash(hasher);
+    for value in [font_size, font_letter_spacing, font_word_spacing] {
+        value.map(f32::to_bits).hash(hasher);
+    }
+    text_align.map(|align| align as u8).hash(hasher);
 }
 
 fn wrap_semantic_scroll_content_layer(
@@ -832,11 +862,14 @@ fn wrap_semantic_scroll_content_layer(
 ) -> Vec<RenderNode> {
     let scroll_x = element.layout.scroll_x;
     let scroll_y = element.layout.scroll_y;
+    let mut rewriter = LayerRewriter::take(element);
     let canonical_nodes = offset_render_nodes(
-        remove_composition_clips(nodes, child_render_ctx.full_clip_shapes()),
+        remove_composition_clips(nodes, child_render_ctx.full_clip_shapes(), &mut rewriter),
         scroll_x,
         scroll_y,
+        &mut rewriter,
     );
+    rewriter.store(element);
     let nominal_bounds = Rect::from_frame(render_frame);
     let content_bounds = paint_layer_bounds_from_visual_bounds(
         paint_layer_own_content_visual_bounds(&canonical_nodes),
@@ -864,103 +897,204 @@ fn wrap_semantic_scroll_content_layer(
     )
 }
 
+// One Raven patch: nodes go straight into the output. Upstream returned a
+// `Vec` per node (one allocation per primitive), and a scroll container
+// strips every node of its content on each rebuild.
 fn remove_composition_clips(
     nodes: Vec<RenderNode>,
     composition_clips: &[ClipShape],
+    rewriter: &mut LayerRewriter,
 ) -> Vec<RenderNode> {
-    nodes
-        .into_iter()
-        .flat_map(|node| remove_composition_clip_node(node, composition_clips))
-        .collect()
+    let mut out = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        remove_composition_clip_node(node, composition_clips, rewriter, &mut out);
+    }
+    out
 }
 
 fn remove_composition_clip_node(
     node: RenderNode,
     composition_clips: &[ClipShape],
-) -> Vec<RenderNode> {
+    rewriter: &mut LayerRewriter,
+    out: &mut Vec<RenderNode>,
+) {
     match node {
         RenderNode::Clip { clips, children } => rebuild_composition_clip_node(
             clips,
-            remove_composition_clips(children, composition_clips),
+            remove_composition_clips(children, composition_clips, rewriter),
             composition_clips,
             false,
+            out,
         ),
         RenderNode::RelaxedClip { clips, children } => rebuild_composition_clip_node(
             clips,
-            remove_composition_clips(children, composition_clips),
+            remove_composition_clips(children, composition_clips, rewriter),
             composition_clips,
             true,
+            out,
         ),
         // ShadowPass clips are axis-specific shadow boundaries, not ordinary inherited content
         // clips. Keep them in the reusable scroll payload even when their rectangle happens to
         // equal an inherited viewport clip.
-        RenderNode::ShadowPass { children } => vec![RenderNode::ShadowPass { children }],
+        RenderNode::ShadowPass { children } => out.push(RenderNode::ShadowPass { children }),
         RenderNode::Transform {
             transform,
             children,
-        } => vec![RenderNode::Transform {
+        } => out.push(RenderNode::Transform {
             transform,
-            children: remove_composition_clips(children, composition_clips),
-        }],
-        RenderNode::Alpha { alpha, children } => vec![RenderNode::Alpha {
+            children: remove_composition_clips(children, composition_clips, rewriter),
+        }),
+        RenderNode::Alpha { alpha, children } => out.push(RenderNode::Alpha {
             alpha,
-            children: remove_composition_clips(children, composition_clips),
-        }],
+            children: remove_composition_clips(children, composition_clips, rewriter),
+        }),
         RenderNode::PaintLayer(layer) => {
-            let children = remove_composition_clips(layer.content_nodes(), composition_clips);
-            vec![RenderNode::PaintLayer(layer.with_children(children))]
+            let op = LayerRewriteOp::StripClips(composition_clips.to_vec());
+            out.push(RenderNode::PaintLayer(rewriter.rewrite(&layer, op, |rewriter| {
+                let children =
+                    remove_composition_clips(layer.content_nodes(), composition_clips, rewriter);
+                layer.with_children(children)
+            })));
         }
-        RenderNode::Primitive(_) => vec![node],
+        RenderNode::Primitive(_) => out.push(node),
     }
+}
+
+// One Raven patch: a scroll container's content is canonicalized on every
+// rebuild (inherited clips stripped, scroll offset applied), and that copies
+// and rebuilds every paint layer inside it, nested scroll layers included.
+// So a one-text change in a screen under the panel's scroll body rebuilt the
+// clean list's layer each time: 20% of the tree actor's patch time on a
+// 1,400-node screen. A rewrite depends only on the input layer and the
+// operation, and a clean subtree hands back the same layer (same `Arc`
+// content) every frame, so the container keeps its last rewrites and
+// reuses those that come round again.
+struct LayerRewriter {
+    previous: Vec<LayerRewrite>,
+    current: Vec<LayerRewrite>,
+}
+
+impl LayerRewriter {
+    fn take(element: &Element) -> Self {
+        Self {
+            previous: std::mem::take(&mut *element.refresh.layer_rewrites.borrow_mut()),
+            current: Vec::new(),
+        }
+    }
+
+    fn store(self, element: &Element) {
+        *element.refresh.layer_rewrites.borrow_mut() = self.current;
+    }
+
+    fn rewrite(
+        &mut self,
+        layer: &RenderPaintLayer,
+        op: LayerRewriteOp,
+        compute: impl FnOnce(&mut Self) -> RenderPaintLayer,
+    ) -> RenderPaintLayer {
+        let matches = |entry: &LayerRewrite| entry.op == op && same_layer_input(&entry.input, layer);
+        if let Some(entry) = self.current.iter().find(|entry| matches(entry)) {
+            return entry.output.clone();
+        }
+        if let Some(index) = self.previous.iter().position(matches) {
+            let entry = self.previous.swap_remove(index);
+            let output = entry.output.clone();
+            self.current.push(entry);
+            return output;
+        }
+        #[cfg(test)]
+        LAYER_REWRITES_COMPUTED.with(|count| count.set(count.get() + 1));
+        let output = compute(self);
+        self.current.push(LayerRewrite {
+            input: layer.clone(),
+            op,
+            output: output.clone(),
+        });
+        output
+    }
+}
+
+fn same_layer_input(a: &RenderPaintLayer, b: &RenderPaintLayer) -> bool {
+    Arc::ptr_eq(&a.content, &b.content)
+        && a.id == b.id
+        && a.bounds == b.bounds
+        && a.placement == b.placement
+        && a.policy == b.policy
+        && a.content_generation == b.content_generation
+        && a.metrics == b.metrics
+        && match (&a.renderer_animation, &b.renderer_animation) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAYER_REWRITES_COMPUTED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Paint-layer rewrites computed (not reused) since the last call.
+#[cfg(test)]
+pub(crate) fn take_layer_rewrites_computed() -> usize {
+    LAYER_REWRITES_COMPUTED.with(|count| count.replace(0))
 }
 
 fn rebuild_composition_clip_node(
-    clips: Vec<ClipShape>,
+    mut clips: Vec<ClipShape>,
     children: Vec<RenderNode>,
     composition_clips: &[ClipShape],
     relaxed: bool,
-) -> Vec<RenderNode> {
+    out: &mut Vec<RenderNode>,
+) {
     if children.is_empty() {
-        return Vec::new();
+        return;
     }
-    let clips = clips
-        .into_iter()
-        .filter(|clip| !composition_clips.contains(clip))
-        .collect::<Vec<_>>();
+    clips.retain(|clip| !composition_clips.contains(clip));
     if clips.is_empty() {
-        children
+        out.extend(children);
     } else if relaxed {
-        vec![RenderNode::RelaxedClip { clips, children }]
+        out.push(RenderNode::RelaxedClip { clips, children });
     } else {
-        vec![RenderNode::Clip { clips, children }]
+        out.push(RenderNode::Clip { clips, children });
     }
 }
 
-fn offset_render_nodes(nodes: Vec<RenderNode>, dx: f32, dy: f32) -> Vec<RenderNode> {
+fn offset_render_nodes(
+    nodes: Vec<RenderNode>,
+    dx: f32,
+    dy: f32,
+    rewriter: &mut LayerRewriter,
+) -> Vec<RenderNode> {
     nodes
         .into_iter()
-        .map(|node| offset_render_node(node, dx, dy))
+        .map(|node| offset_render_node(node, dx, dy, rewriter))
         .collect()
 }
 
-fn offset_render_node(node: RenderNode, dx: f32, dy: f32) -> RenderNode {
+fn offset_render_node(
+    node: RenderNode,
+    dx: f32,
+    dy: f32,
+    rewriter: &mut LayerRewriter,
+) -> RenderNode {
     match node {
         RenderNode::Clip { clips, children } => RenderNode::Clip {
             clips: clips
                 .into_iter()
                 .map(|clip| clip.offset(-dx, -dy))
                 .collect(),
-            children: offset_render_nodes(children, dx, dy),
+            children: offset_render_nodes(children, dx, dy, rewriter),
         },
         RenderNode::RelaxedClip { clips, children } => RenderNode::RelaxedClip {
             clips: clips
                 .into_iter()
                 .map(|clip| clip.offset(-dx, -dy))
                 .collect(),
-            children: offset_render_nodes(children, dx, dy),
+            children: offset_render_nodes(children, dx, dy, rewriter),
         },
         RenderNode::ShadowPass { children } => RenderNode::ShadowPass {
-            children: offset_render_nodes(children, dx, dy),
+            children: offset_render_nodes(children, dx, dy, rewriter),
         },
         RenderNode::Transform {
             transform,
@@ -971,38 +1105,53 @@ fn offset_render_node(node: RenderNode, dx: f32, dy: f32) -> RenderNode {
         },
         RenderNode::Alpha { alpha, children } => RenderNode::Alpha {
             alpha,
-            children: offset_render_nodes(children, dx, dy),
+            children: offset_render_nodes(children, dx, dy, rewriter),
         },
         RenderNode::PaintLayer(layer) => {
-            let bounds = Rect {
-                x: layer.bounds.x + dx,
-                y: layer.bounds.y + dy,
-                ..layer.bounds
+            let op = LayerRewriteOp::Offset {
+                dx: dx.to_bits(),
+                dy: dy.to_bits(),
             };
-            let children = offset_render_nodes(layer.content_nodes(), dx, dy);
-            let mut layer = layer.with_bounds_and_children(bounds, children);
-            // One Raven patch: the offset prepended a translation to this
-            // layer's Transform nodes; the renderer animation must match.
-            if let Some(animation) = layer.renderer_animation.as_mut() {
-                let animation = Arc::make_mut(animation);
-                animation.offset = (animation.offset.0 + dx, animation.offset.1 + dy);
-                animation.current_transform =
-                    Affine2::translation(dx, dy).then(animation.current_transform);
-                animation.bounds_transform =
-                    Affine2::translation(dx, dy).then(animation.bounds_transform);
-            }
-            if layer.policy.allows_payload_cache() {
-                layer.content_generation = paint_layer_content_generation(
-                    &layer.content.own_payload_render_nodes(),
-                    bounds,
-                );
-            }
-            RenderNode::PaintLayer(layer)
+            RenderNode::PaintLayer(rewriter.rewrite(&layer, op, |rewriter| {
+                offset_layer(&layer, dx, dy, rewriter)
+            }))
         }
         RenderNode::Primitive(primitive) => {
             RenderNode::Primitive(offset_draw_primitive(primitive, dx, dy))
         }
     }
+}
+
+fn offset_layer(
+    layer: &RenderPaintLayer,
+    dx: f32,
+    dy: f32,
+    rewriter: &mut LayerRewriter,
+) -> RenderPaintLayer {
+    let bounds = Rect {
+        x: layer.bounds.x + dx,
+        y: layer.bounds.y + dy,
+        ..layer.bounds
+    };
+    let children = offset_render_nodes(layer.content_nodes(), dx, dy, rewriter);
+    let mut layer = layer.with_bounds_and_children(bounds, children);
+    // One Raven patch: the offset prepended a translation to this
+    // layer's Transform nodes; the renderer animation must match.
+    if let Some(animation) = layer.renderer_animation.as_mut() {
+        let animation = Arc::make_mut(animation);
+        animation.offset = (animation.offset.0 + dx, animation.offset.1 + dy);
+        animation.current_transform =
+            Affine2::translation(dx, dy).then(animation.current_transform);
+        animation.bounds_transform =
+            Affine2::translation(dx, dy).then(animation.bounds_transform);
+    }
+    if layer.policy.allows_payload_cache() {
+        layer.content_generation = paint_layer_content_generation(
+            &layer.content.own_payload_render_nodes(),
+            bounds,
+        );
+    }
+    layer
 }
 
 fn offset_draw_primitive(primitive: DrawPrimitive, dx: f32, dy: f32) -> DrawPrimitive {
@@ -1815,10 +1964,7 @@ fn wrap_with_clip_kind(
 fn render_node_has_shadow_escape(node: &RenderNode) -> bool {
     match node {
         RenderNode::ShadowPass { .. } => true,
-        RenderNode::PaintLayer(layer) => layer
-            .content_nodes()
-            .iter()
-            .any(render_node_contains_shadow_pass),
+        RenderNode::PaintLayer(layer) => layer_content_contains_shadow_pass(&layer.content.nodes),
         RenderNode::Clip { children, .. }
         | RenderNode::RelaxedClip { children, .. }
         | RenderNode::Transform { children, .. }
@@ -1838,12 +1984,32 @@ fn render_node_contains_shadow_pass(node: &RenderNode) -> bool {
         | RenderNode::Alpha { children, .. } => {
             children.iter().any(render_node_contains_shadow_pass)
         }
-        RenderNode::PaintLayer(layer) => layer
-            .content_nodes()
-            .iter()
-            .any(render_node_contains_shadow_pass),
+        RenderNode::PaintLayer(layer) => layer_content_contains_shadow_pass(&layer.content.nodes),
         RenderNode::Primitive(_) => false,
     }
+}
+
+// One Raven patch: search a paint layer's content in place. Upstream called
+// `content_nodes()`, which copies the layer's whole content into new render
+// nodes, and every clip wrap on the path to a change asks this of everything
+// below it, so a one-text patch above a scroll list copied the list's layers
+// once per ancestor (29% of the tree actor's time on the hub's Stress screen).
+fn layer_content_contains_shadow_pass(content: &[RenderPaintLayerContentNode]) -> bool {
+    content.iter().any(|node| match node {
+        RenderPaintLayerContentNode::Own(run) => {
+            run.nodes.iter().any(render_node_contains_shadow_pass)
+        }
+        RenderPaintLayerContentNode::Child(layer) => {
+            layer_content_contains_shadow_pass(&layer.content.nodes)
+        }
+        RenderPaintLayerContentNode::ShadowPass { .. } => true,
+        RenderPaintLayerContentNode::Clip { children, .. }
+        | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+        | RenderPaintLayerContentNode::Transform { children, .. }
+        | RenderPaintLayerContentNode::Alpha { children, .. } => {
+            layer_content_contains_shadow_pass(children)
+        }
+    })
 }
 
 fn push_clipped_group(
@@ -1908,10 +2074,13 @@ fn wrap_nearby_subtree_with_nearby_layer_boundary(
         y: raw_render_frame.y - scene_ctx.scroll_dy,
         ..raw_render_frame
     };
+    let mut rewriter = LayerRewriter::take(element);
     let local = remove_composition_clips(
         std::mem::take(&mut subtree.local),
         render_ctx.full_clip_shapes(),
+        &mut rewriter,
     );
+    rewriter.store(element);
     // One Raven patch: a nearby moved only by a translation (a dragged sheet's
     // move_y) is cached without it and placed by a Transform outside the
     // layer, as scroll content is. With the translation inside, the payload

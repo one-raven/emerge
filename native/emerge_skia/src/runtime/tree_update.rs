@@ -302,6 +302,9 @@ impl TreeUpdateEngine {
                             self.tree.replace_with_uploaded(decoded);
                             self.application_tree_initialized = true;
                             invalidation.add(TreeInvalidation::Structure);
+                            // One Raven patch: a new tree has no prepared attrs to
+                            // keep, whatever patches share its batch.
+                            frame_attr_dirty_ids_complete = false;
                         }
                         Err(err) => {
                             handle_message_error(
@@ -727,11 +730,16 @@ impl TreeUpdateEngine {
             let can_prepare_dirty_incrementally = plan.invalidation.can_refresh_only()
                 && frame_attr_dirty_ids_complete
                 && !had_transient_animations;
+            // One Raven patch: a patch whose hints are complete (SetAttrs ids,
+            // inserted subtree roots) prepares only those nodes even when it
+            // changes layout. Upstream required no SetAttrs here, so one text
+            // change re-derived every element's attrs (two `Attrs` clones per
+            // node): 40% of a one-switch patch on a 1,400-node screen.
             let can_prepare_patch_recompute_incrementally = patch_frame_active
                 && plan.invalidation.requires_recompute()
                 && frame_attr_dirty_ids_complete
-                && frame_attr_dirty_ids.is_empty()
-                && (!frame_attr_dirty_subtree_roots.is_empty()
+                && (!frame_attr_dirty_ids.is_empty()
+                    || !frame_attr_dirty_subtree_roots.is_empty()
                     || !self.animation_runtime.is_empty());
             let prepare_started_at = patch_frame_active.then(Instant::now);
             let preparation = if animation_sample_requested
@@ -1181,7 +1189,9 @@ fn record_frame_attr_dirty_id(
     id: NodeId,
     invalidation: TreeInvalidation,
 ) {
-    if invalidation.can_refresh_only() && !frame_attr_dirty_ids.contains(&id) {
+    // One Raven patch: record layout-changing updates too (was refresh-only),
+    // so a patch frame that prepares incrementally also re-derives their attrs.
+    if invalidation.is_dirty() && !frame_attr_dirty_ids.contains(&id) {
         frame_attr_dirty_ids.push(id);
     }
 }
@@ -3072,5 +3082,123 @@ mod tests {
                 TreeUpdateEffect::Skip
             ));
         }
+    }
+
+    // One Raven patch: a 40-row column and a SetAttrs that resizes one row.
+    fn sized_column_tree(rows: u8) -> ElementTree {
+        let root_id = NodeId::from_term_bytes(vec![0]);
+        let mut tree = ElementTree::new();
+        tree.insert(Element::with_attrs(
+            root_id,
+            ElementKind::Column,
+            Vec::new(),
+            Attrs {
+                width: Some(Length::Px(300.0)),
+                ..Attrs::default()
+            },
+        ));
+        let ids: Vec<NodeId> = (1..=rows).map(|i| NodeId::from_term_bytes(vec![i])).collect();
+        for id in &ids {
+            let raw = encoded_size_attrs_raw(10.0, 10.0);
+            let attrs = crate::tree::attrs::decode_attrs(&raw).unwrap();
+            tree.insert(Element::with_attrs(*id, ElementKind::El, raw, attrs));
+        }
+        tree.set_children(&root_id, ids).unwrap();
+        tree.set_root_id(root_id);
+        tree
+    }
+
+    fn encoded_resize_patch(id: NodeId, width: f64, height: f64) -> Vec<u8> {
+        let attrs_raw = encoded_size_attrs_raw(width, height);
+        let mut out = vec![1];
+        out.extend_from_slice(&id.to_wire_u64().to_be_bytes());
+        out.extend_from_slice(&(attrs_raw.len() as u32).to_be_bytes());
+        out.extend_from_slice(&attrs_raw);
+        out
+    }
+
+    #[test]
+    fn layout_changing_set_attrs_prepares_only_the_patched_node() {
+        for scale in [1.0_f32, 2.0] {
+            let resized = NodeId::from_term_bytes(vec![7]);
+            let below = NodeId::from_term_bytes(vec![8]);
+            let mut engine = TreeUpdateEngine::new(sized_column_tree(40), 300, 600);
+            let options = || TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr);
+            let _ = layout_output(
+                engine
+                    .process_messages(
+                        vec![TreeMsg::Resize {
+                            width: 300.0 * scale,
+                            height: 600.0 * scale,
+                            scale,
+                        }],
+                        options(),
+                    )
+                    .unwrap(),
+            );
+            let below_y = engine.tree().get(&below).unwrap().layout.frame.unwrap().y;
+            let _ = crate::tree::layout::take_frame_attr_prepare_count();
+
+            let _ = layout_output(
+                engine
+                    .process_messages(
+                        vec![TreeMsg::PatchTree {
+                            bytes: encoded_resize_patch(resized, 20.0, 20.0),
+                            submitted_at: None,
+                        }],
+                        options(),
+                    )
+                    .unwrap(),
+            );
+
+            assert_eq!(
+                crate::tree::layout::take_frame_attr_prepare_count(),
+                1,
+                "only the patched row's attrs are re-derived"
+            );
+            let node = engine.tree().get(&resized).unwrap();
+            assert_eq!(node.layout.effective.width, Some(Length::Px(20.0 * scale as f64)));
+            assert_eq!(node.layout.frame.unwrap().height, 20.0 * scale);
+            assert_eq!(
+                engine.tree().get(&below).unwrap().layout.frame.unwrap().y,
+                below_y + 10.0 * scale,
+                "the rows below move down"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_in_a_patch_batch_still_prepares_the_whole_tree() {
+        let resized = NodeId::from_term_bytes(vec![7]);
+        let mut engine = TreeUpdateEngine::new(sized_column_tree(5), 300, 600);
+        let options = || TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr);
+        let _ = layout_output(
+            engine
+                .process_messages(vec![TreeMsg::RebuildRegistry], options())
+                .unwrap(),
+        );
+        let _ = crate::tree::layout::take_frame_attr_prepare_count();
+        let _ = layout_output(
+            engine
+                .process_messages(
+                    vec![
+                        TreeMsg::UploadTree {
+                            bytes: encode_tree(&sized_column_tree(10)),
+                            submitted_at: None,
+                        },
+                        TreeMsg::PatchTree {
+                            bytes: encoded_resize_patch(resized, 20.0, 20.0),
+                            submitted_at: None,
+                        },
+                    ],
+                    options(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(crate::tree::layout::take_frame_attr_prepare_count(), 11);
+        assert_eq!(
+            engine.tree().get(&resized).unwrap().layout.frame.unwrap().width,
+            20.0
+        );
     }
 }

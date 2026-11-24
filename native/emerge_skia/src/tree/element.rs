@@ -634,6 +634,25 @@ pub struct NodeRefreshState {
     pub render_fragment_cache: RefCell<Option<RenderFragmentCache>>,
     pub registry_subtree_affects: bool,
     pub paint_generation: u64,
+    /// One Raven patch: the paint-layer rewrites this element's last scroll
+    /// or nearby canonicalization made (see `rewrite_layer` in tree/render.rs).
+    pub layer_rewrites: RefCell<Vec<LayerRewrite>>,
+}
+
+/// One Raven patch: a paint layer as canonicalization rewrote it. The input
+/// layer pins its content `Arc`, so a pointer match is the same content.
+#[derive(Clone, Debug)]
+pub struct LayerRewrite {
+    pub input: crate::render_scene::RenderPaintLayer,
+    pub op: LayerRewriteOp,
+    pub output: crate::render_scene::RenderPaintLayer,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayerRewriteOp {
+    StripClips(Vec<super::geometry::ClipShape>),
+    /// The offset's f32 bits.
+    Offset { dx: u32, dy: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -672,6 +691,7 @@ impl Default for NodeRefreshState {
             render_fragment_cache: RefCell::new(None),
             registry_subtree_affects: false,
             paint_generation: 1,
+            layer_rewrites: RefCell::new(Vec::new()),
         }
     }
 }
@@ -984,6 +1004,7 @@ impl Element {
                 ),
                 registry_subtree_affects: self.refresh.registry_subtree_affects,
                 paint_generation: self.refresh.paint_generation,
+                layer_rewrites: RefCell::new(self.refresh.layer_rewrites.borrow().clone()),
             },
             lifecycle: self.lifecycle.clone(),
             #[cfg(test)]
