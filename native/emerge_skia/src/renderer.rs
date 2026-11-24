@@ -82,6 +82,16 @@ pub struct RenderState {
     /// One Raven patch: where this scene's renderer-driven layers are, and
     /// how fast each moves.
     pub renderer_animations: crate::render_scene::RendererAnimationIndex,
+    /// One Raven patch: a process-unique number for the scene this state
+    /// holds, so per-scene decisions can be remembered across the frames that
+    /// only advance its renderer-driven animations. 0 means unknown.
+    pub scene_epoch: u64,
+}
+
+static NEXT_SCENE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_scene_epoch() -> u64 {
+    NEXT_SCENE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -540,6 +550,7 @@ impl Default for RenderState {
             video_target_ids: HashSet::new(),
             damage: None,
             renderer_animations: Default::default(),
+            scene_epoch: 0,
         }
     }
 }
@@ -563,6 +574,7 @@ impl RenderState {
             video_target_ids,
             damage: None,
             renderer_animations: Default::default(),
+            scene_epoch: next_scene_epoch(),
         }
     }
 
@@ -583,6 +595,7 @@ impl RenderState {
 
     pub fn set_scene(&mut self, scene: RenderScene) {
         self.renderer_animations.invalidate();
+        self.scene_epoch = next_scene_epoch();
         self.has_cacheable_paint_layers = scene.has_payload_cache_candidate_layers();
         self.has_scroll_moving_paint_layers = scene.has_scroll_moving_paint_layers();
         self.video_target_ids = scene.video_target_ids();
@@ -3146,9 +3159,18 @@ pub struct RendererCacheManager {
     /// One Raven patch: the root's base (everything under its trailing
     /// nearby overlays) as one full-frame texture; see `BaseSnapshot`.
     base_snapshot: Option<BaseSnapshot>,
+    /// One Raven patch: the scene epoch whose base was found unkeepable
+    /// (renderer-driven animation, video, loading images). Frames that only
+    /// advance that scene's animations skip comparing the base again.
+    base_snapshot_unkeepable_epoch: Option<u64>,
     base_snapshot_max_bytes: u64,
     base_snapshot_counts: BaseSnapshotCounts,
     last_frame_work: FrameWork,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BASE_SNAPSHOT_COMPARES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// One Raven patch: the root layer's base content (everything painted
@@ -3238,6 +3260,7 @@ impl RendererCacheManager {
             stored_run_families: HashMap::new(),
             animation_snapshots: HashMap::new(),
             base_snapshot: None,
+            base_snapshot_unkeepable_epoch: None,
             base_snapshot_max_bytes: config
                 .paint_layer
                 .max_entry_bytes
@@ -3318,6 +3341,7 @@ impl RendererCacheManager {
         self.stored_run_families.clear();
         self.payloads.clear();
         self.base_snapshot = None;
+        self.base_snapshot_unkeepable_epoch = None;
     }
 
     pub fn enabled(&self) -> bool {
@@ -5240,7 +5264,13 @@ impl SceneRenderer {
             cache.base_snapshot = None;
             return BaseSnapshotPlan::Off;
         };
+        if state.scene_epoch != 0 && cache.base_snapshot_unkeepable_epoch == Some(state.scene_epoch)
+        {
+            return BaseSnapshotPlan::Off;
+        }
         let base = &root.content.nodes[..split];
+        #[cfg(test)]
+        BASE_SNAPSHOT_COMPARES.with(|count| count.set(count.get() + 1));
         let info = surface.image_info();
         let unchanged = cache.base_snapshot.as_ref().is_some_and(|snapshot| {
             snapshot.root_id == root.id
@@ -5270,6 +5300,7 @@ impl SceneRenderer {
         // the font generation, or on something that can't be kept at all.
         let Some(resource_generation) = base_snapshot_resource_generation(base) else {
             snapshot.image = None;
+            cache.base_snapshot_unkeepable_epoch = Some(state.scene_epoch);
             return BaseSnapshotPlan::Off;
         };
         if snapshot.image.is_some() && snapshot.resource_generation == resource_generation {
@@ -16006,6 +16037,55 @@ mod base_snapshot_tests {
             base_snapshot_resource_generation(&content(vec![RenderNode::PaintLayer(media)]).nodes)
                 .is_none()
         );
+    }
+
+    // One Raven patch: a frame that only advances the renderer-driven
+    // animations of a scene whose base can't be kept doesn't compare it again.
+    #[test]
+    fn an_unkeepable_base_is_compared_once_per_scene() {
+        let video = RenderNode::PaintLayer(layer(
+            2,
+            PaintLayerReason::ScrollContent,
+            vec![RenderNode::Primitive(DrawPrimitive::Video(
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+                "cam".into(),
+                ImageFit::Cover,
+            ))],
+        ));
+        let frame_scene = || scene(vec![rect(0.0, 0x112233FF), video.clone(), overlay(1.0)]);
+        let mut renderer = SceneRenderer::with_cache_config(RendererCacheConfig {
+            enabled: true,
+            ..RendererCacheConfig::default()
+        });
+        let info = skia_safe::ImageInfo::new(
+            (100, 100),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        let mut surface = skia_safe::surfaces::raster(&info, None, None).unwrap();
+        let compares = || BASE_SNAPSHOT_COMPARES.with(|count| count.get());
+        let mut draw = |state: &RenderState| {
+            let mut frame = RenderFrame::new(&mut surface, None);
+            renderer.render(&mut frame, state);
+        };
+
+        let state = RenderState::new(frame_scene(), Color::TRANSPARENT, 1, false);
+        let before = compares();
+        for _ in 0..3 {
+            draw(&state);
+        }
+        // Two frames to learn the base is unkeepable (store, then check).
+        assert_eq!(compares() - before, 2);
+
+        let mut next = RenderState::new(frame_scene(), Color::TRANSPARENT, 2, false);
+        next.set_scene(frame_scene());
+        let before = compares();
+        draw(&next);
+        assert_eq!(compares() - before, 1, "a new scene is compared again");
     }
 
     #[test]
