@@ -98,6 +98,8 @@ pub struct TreeUpdateEngine {
     latest_animation_sample_time: Option<Instant>,
     animation_retry: AnimationRetry,
     listener_barrier: Option<crate::actors::ListenerBarrier>,
+    /// One Raven patch: compositor scrolling (kept across tree uploads).
+    compositor_scroll: bool,
 }
 
 impl TreeUpdateEngine {
@@ -115,6 +117,7 @@ impl TreeUpdateEngine {
             latest_animation_sample_time: None,
             animation_retry: AnimationRetry::default(),
             listener_barrier: None,
+            compositor_scroll: true,
         }
     }
 
@@ -260,7 +263,10 @@ impl TreeUpdateEngine {
             if self.tree.is_empty() && matches!(message, TreeMsg::FontMetricsChanged { .. }) {
                 continue;
             }
-            registry_requested |= message.requires_listener_registry_response();
+            // One Raven patch: scroll motion does not ask for a registry (the
+            // event runtime asks with a barrier when it needs one).
+            registry_requested |=
+                message.requires_listener_registry_response() && !message.is_scroll_motion();
             if let TreeMsg::EventBatch {
                 target_mounts,
                 messages,
@@ -425,6 +431,40 @@ impl TreeUpdateEngine {
                     position,
                 } => {
                     invalidation.add(self.tree.set_scroll_position(&element_id, position));
+                }
+                TreeMsg::SetScrollOverscroll {
+                    element_id,
+                    overscroll,
+                } => {
+                    invalidation.add(self.tree.set_scroll_overscroll(&element_id, overscroll));
+                }
+                TreeMsg::SetScrollMode { compositor, bounce } => {
+                    if self.compositor_scroll != compositor {
+                        self.compositor_scroll = compositor;
+                        self.tree.compositor_scroll = compositor;
+                        if let Some(root) = self.tree.root_id() {
+                            self.tree.mark_render_and_registry_refresh_dirty(&root);
+                            invalidation.add(TreeInvalidation::Paint);
+                        }
+                    }
+                    // Registries are built on this thread; every scroll
+                    // container's listeners follow the flag.
+                    if crate::events::registry_builder::set_drag_overscroll(bounce) {
+                        let hosts: Vec<_> = self
+                            .tree
+                            .iter_node_pairs()
+                            .filter(|(_, element)| {
+                                let attrs = &element.layout.effective;
+                                attrs.scrollbar_x.unwrap_or(false)
+                                    || attrs.scrollbar_y.unwrap_or(false)
+                            })
+                            .map(|(id, _)| id)
+                            .collect();
+                        for id in hosts {
+                            self.tree.mark_registry_refresh_dirty(&id);
+                        }
+                        invalidation.add(TreeInvalidation::Paint);
+                    }
                 }
                 TreeMsg::ScrollRequest { element_id, dx, dy } => {
                     let entry = scroll_acc.entry((element_id, mount)).or_insert((0.0, 0.0));
@@ -603,6 +643,8 @@ impl TreeUpdateEngine {
             stats.record_pipeline_submit_to_tree_start(submitted_at, tree_batch_started_at);
         }
 
+        // One Raven patch: an upload replaces the tree; keep the setting.
+        self.tree.compositor_scroll = self.compositor_scroll;
         for ((id, mount), (dx, dy)) in scroll_acc {
             if !self.is_current_mount(&id, mount) {
                 registry_requested = true;
@@ -674,6 +716,17 @@ impl TreeUpdateEngine {
             self.width,
             self.height,
         ));
+        // One Raven patch: a registry built now must see every scroll offset
+        // that moved since the last one (see `deferred_scroll_registry`).
+        // Marked before frame preparation, which a later mark would make stale.
+        if self.tree.has_deferred_scroll_registry()
+            && (registry_requested
+                || self.cached_rebuild.is_none()
+                || invalidation.requires_recompute()
+                || self.tree.has_registry_refresh_damage())
+        {
+            self.tree.flush_deferred_scroll_registry();
+        }
         let update_started_at = Instant::now();
         let patch_frame_active = !patch_processing_started_ats.is_empty();
         let mut patch_animation_sync_duration = None;
@@ -2139,6 +2192,153 @@ mod tests {
         tree
     }
 
+    // One Raven patch: with renderer-driven animations, a scroll frame does
+    // not rebuild the scroll content around a looping animation the render
+    // thread samples; the content layer is reused as it is.
+    #[test]
+    fn scrolling_past_a_renderer_driven_animation_reuses_the_content_layer() {
+        let root = NodeId::from_term_bytes(vec![1]);
+        let column = NodeId::from_term_bytes(vec![2]);
+        let mut tree = ElementTree::new();
+        tree.insert(Element::with_attrs(
+            root,
+            ElementKind::El,
+            Vec::new(),
+            Attrs {
+                width: Some(Length::Px(100.0)),
+                height: Some(Length::Px(100.0)),
+                scrollbar_y: Some(true),
+                ..Attrs::default()
+            },
+        ));
+        tree.insert(Element::with_attrs(
+            column,
+            ElementKind::Column,
+            Vec::new(),
+            Attrs {
+                width: Some(Length::Fill),
+                ..Attrs::default()
+            },
+        ));
+        let rows: Vec<NodeId> = (10..20u8).map(|i| NodeId::from_term_bytes(vec![i])).collect();
+        for (index, id) in rows.iter().enumerate() {
+            let spin = |deg| Attrs {
+                rotate: Some(deg),
+                ..Attrs::default()
+            };
+            tree.insert(Element::with_attrs(
+                *id,
+                ElementKind::El,
+                Vec::new(),
+                Attrs {
+                    width: Some(Length::Fill),
+                    height: Some(Length::Px(40.0)),
+                    background: Some(Background::Color(Color::Rgb {
+                        r: 40,
+                        g: 40 + index as u8,
+                        b: 40,
+                    })),
+                    animate: (index == 1).then(|| AnimationSpec {
+                        keyframes: vec![spin(0.0), spin(360.0)],
+                        duration_ms: 1000.0,
+                        curve: AnimationCurve::Linear,
+                        repeat: AnimationRepeat::Loop,
+                    }),
+                    ..Attrs::default()
+                },
+            ));
+        }
+        tree.set_children(&column, rows).unwrap();
+        tree.set_children(&root, vec![column]).unwrap();
+        tree.set_root_id(root);
+
+        fn scroll_layer(nodes: &[RenderNode]) -> Option<crate::render_scene::RenderPaintLayer> {
+            use crate::render_scene::{PaintLayerReason, RenderPaintLayerContentNode as C};
+            fn content(nodes: &[C]) -> Option<crate::render_scene::RenderPaintLayer> {
+                nodes.iter().find_map(|node| match node {
+                    C::Own(run) => scroll_layer(&run.nodes),
+                    C::Child(layer) if layer.id.role == PaintLayerReason::ScrollContent => {
+                        Some(layer.clone())
+                    }
+                    C::Child(layer) => content(&layer.content.nodes),
+                    C::ShadowPass { children }
+                    | C::Clip { children, .. }
+                    | C::RelaxedClip { children, .. }
+                    | C::Transform { children, .. }
+                    | C::Alpha { children, .. } => content(children),
+                })
+            }
+            nodes.iter().find_map(|node| match node {
+                RenderNode::PaintLayer(layer)
+                    if layer.id.role == crate::render_scene::PaintLayerReason::ScrollContent =>
+                {
+                    Some(layer.clone())
+                }
+                RenderNode::PaintLayer(layer) => content(&layer.content.nodes),
+                RenderNode::ShadowPass { children }
+                | RenderNode::Clip { children, .. }
+                | RenderNode::RelaxedClip { children, .. }
+                | RenderNode::Transform { children, .. }
+                | RenderNode::Alpha { children, .. } => scroll_layer(children),
+                RenderNode::Primitive(_) => None,
+            })
+        }
+
+        let mut engine = TreeUpdateEngine::new(tree, 100, 100);
+        engine.set_renderer_driven_animations(true);
+        let options = || TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr);
+        let scroll_to = |engine: &mut TreeUpdateEngine, fraction: f64| {
+            let started = Instant::now();
+            layout_output(
+                engine
+                    .process_messages(
+                        vec![
+                            TreeMsg::SetScrollPosition {
+                                element_id: root,
+                                position: [0.0, fraction],
+                            },
+                            TreeMsg::AnimationPulse {
+                                presented_at: started,
+                                predicted_next_present_at: started + Duration::from_millis(16),
+                                trace: None,
+                            },
+                        ],
+                        options(),
+                    )
+                    .unwrap(),
+            )
+        };
+        let _ = layout_output(
+            engine
+                .process_messages(vec![TreeMsg::RebuildRegistry], options())
+                .unwrap(),
+        );
+        let first = scroll_to(&mut engine, 0.1);
+        std::thread::sleep(Duration::from_millis(20));
+        let second = scroll_to(&mut engine, 0.2);
+        let first = scroll_layer(&first.scene.nodes).expect("scroll layer");
+        let second = scroll_layer(&second.scene.nodes).expect("scroll layer");
+        assert!(first.content.nodes.iter().any(|_| true));
+        assert!(Arc::ptr_eq(&first.content, &second.content));
+
+        // A scroll step does not re-sample the animation the render thread plays.
+        let _ = crate::tree::animation::take_element_samples();
+        let third = layout_output(
+            engine
+                .process_messages(
+                    vec![TreeMsg::SetScrollPosition {
+                        element_id: root,
+                        position: [0.0, 0.15],
+                    }],
+                    options(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(crate::tree::animation::take_element_samples(), 0);
+        let third = scroll_layer(&third.scene.nodes).expect("scroll layer");
+        assert!(Arc::ptr_eq(&first.content, &third.content));
+    }
+
     #[test]
     fn predictive_samples_cannot_anchor_or_finish_an_unpresented_enter() {
         let mut engine = TreeUpdateEngine::new(sidepane_enter_tree_at_start(), 360, 240);
@@ -2531,8 +2731,10 @@ mod tests {
         );
     }
 
+    // One Raven patch: scroll motion does not make the event runtime wait for
+    // a registry, so a scroll request (even one an edge blocks) asks for none.
     #[test]
-    fn blocked_scroll_request_publishes_cached_registry_response() {
+    fn blocked_scroll_request_needs_no_registry_response() {
         let id = NodeId::from_term_bytes(vec![1]);
         let mut engine = TreeUpdateEngine::new(scrollable_tree_at_start(), 100, 100);
         let options = TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr);
@@ -2552,6 +2754,14 @@ mod tests {
             options,
         );
 
+        assert!(!matches!(
+            effect,
+            Ok(TreeUpdateEffect::RegistryUpdate { .. })
+        ));
+        // A barrier still gets one.
+        let options = TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr);
+        let barrier = crate::actors::ListenerBarrier::default();
+        let effect = engine.process_messages(vec![TreeMsg::ListenerBarrier(barrier)], options);
         assert!(matches!(
             effect,
             Ok(TreeUpdateEffect::RegistryUpdate { .. })

@@ -9,6 +9,7 @@ fn node() -> ScrollNode {
         proposals: Default::default(),
         targets: [None; 2],
         emit: true,
+        viewport: [100.0; 2],
     }
 }
 fn proposal(id: u64, fraction: f64) -> ScrollProposal {

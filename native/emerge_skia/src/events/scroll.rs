@@ -30,6 +30,8 @@ pub struct ScrollNode {
     pub proposals: [ScrollProposal; 2],
     pub targets: [Option<f64>; 2],
     pub emit: bool,
+    /// One Raven patch: the viewport's size, for the rubber band.
+    pub viewport: [f64; 2],
 }
 impl ScrollNode {
     pub fn from_element(tree: &ElementTree, element: &Element) -> Self {
@@ -73,6 +75,10 @@ impl ScrollNode {
             proposals,
             targets,
             emit: element.layout.effective.on_scroll.unwrap_or(false),
+            viewport: element
+                .layout
+                .frame
+                .map_or([0.0; 2], |frame| [f64::from(frame.width), f64::from(frame.height)]),
         }
     }
 }
@@ -129,6 +135,10 @@ fn target_fraction(
 pub struct ScrollSession {
     pub node: ScrollNode,
     pub position: [f64; 2],
+    /// One Raven patch: rubber band. How far the finger is past the edge,
+    /// and how far that draws the content past it (pixels per axis).
+    pub excess: [f64; 2],
+    pub overscroll: [f64; 2],
     processed: [u64; 2],
     echoes: [VecDeque<(f64, Instant)>; 2],
 }
@@ -137,6 +147,8 @@ impl ScrollSession {
         Self {
             position: node.position,
             node,
+            excess: [0.0; 2],
+            overscroll: [0.0; 2],
             processed: [0; 2],
             echoes: Default::default(),
         }
@@ -196,6 +208,27 @@ impl ScrollSession {
         }
         before != self.position
     }
+    /// One Raven patch: a drag that may pull past the edges. Returns whether
+    /// the overscroll changed; the position changes as `move_by`'s would.
+    pub fn drag_by(&mut self, delta: [f64; 2]) -> bool {
+        let before = self.overscroll;
+        for (axis, delta) in delta.into_iter().enumerate() {
+            let range = self.node.range[axis];
+            if !self.node.enabled[axis] || range <= 0.0 || !delta.is_finite() {
+                continue;
+            }
+            let raw = self.position[axis] * range + self.excess[axis] - delta;
+            let clamped = raw.clamp(0.0, range);
+            self.position[axis] = clamped / range;
+            self.excess[axis] = raw - clamped;
+            self.overscroll[axis] = f64::from(crate::events::runtime_rubber_band(
+                self.excess[axis] as f32,
+                self.node.viewport[axis] as f32,
+            ));
+        }
+        before != self.overscroll
+    }
+
     pub fn expect_echo(&mut self, now: Instant) {
         for (axis, queue) in self.echoes.iter_mut().enumerate() {
             prune_echoes(queue, now);

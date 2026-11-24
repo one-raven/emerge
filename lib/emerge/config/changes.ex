@@ -18,7 +18,7 @@ defmodule Emerge.Config.Changes do
     %{
       output: static_output(config.output),
       renderer: Map.drop(config.renderer, [:target_fps]),
-      input: Map.drop(config.input, [:events]),
+      input: Map.drop(config.input, [:events, :scroll]),
       assets: config.assets,
       diagnostics: config.diagnostics,
       runtime: Map.drop(config.runtime, [:health_check_interval_ms])

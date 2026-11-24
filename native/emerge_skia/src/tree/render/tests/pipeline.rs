@@ -315,7 +315,7 @@ fn build_nested_child_tree(
     tree
 }
 
-fn build_manual_scroll_row_tree(row_count: usize) -> ElementTree {
+pub(super) fn build_manual_scroll_row_tree(row_count: usize) -> ElementTree {
     let root_id = NodeId::from_u64(800_000);
     let content_id = NodeId::from_u64(800_001);
     let row_height = 10.0;
@@ -414,7 +414,10 @@ pub(super) fn render_scene_with_renderer_to_pixels_and_timings(
 
 #[test]
 fn test_scroll_viewport_culling_skips_offscreen_child_roots_before_render_visit() {
-    let tree = build_manual_scroll_row_tree(120);
+    let mut tree = build_manual_scroll_row_tree(120);
+    // One Raven patch: culled to the viewport, without compositor scrolling
+    // (which culls to a wider window; see `compositor_scroll` tests).
+    tree.compositor_scroll = false;
 
     super::super::reset_render_traversal_diagnostics_for_benchmark();
     let output = super::super::render_tree_scene(&tree);
@@ -4511,7 +4514,7 @@ fn test_outer_shadow_clips_only_on_vertical_scroll_axis() {
         ..Attrs::default()
     };
 
-    let tree = build_nested_child_tree(
+    let mut tree = build_nested_child_tree(
         root_attrs,
         Frame {
             x: 0.0,
@@ -4540,6 +4543,8 @@ fn test_outer_shadow_clips_only_on_vertical_scroll_axis() {
             content_height: 15.0,
         },
     );
+    // One Raven patch: the scroll layer as built without compositor scrolling.
+    tree.compositor_scroll = false;
 
     let trace = trace_tree(&tree);
     let draws = &trace.draws;
@@ -4606,7 +4611,7 @@ fn test_outer_shadow_clips_only_on_horizontal_scroll_axis() {
         ..Attrs::default()
     };
 
-    let tree = build_nested_child_tree(
+    let mut tree = build_nested_child_tree(
         root_attrs,
         Frame {
             x: 0.0,
@@ -4635,6 +4640,8 @@ fn test_outer_shadow_clips_only_on_horizontal_scroll_axis() {
             content_height: 15.0,
         },
     );
+    // One Raven patch: the scroll layer as built without compositor scrolling.
+    tree.compositor_scroll = false;
 
     let trace = trace_tree(&tree);
     let draws = &trace.draws;
@@ -4703,7 +4710,7 @@ fn test_outer_shadow_reuses_full_rounded_clip_when_both_scroll_axes_enabled() {
         ..Attrs::default()
     };
 
-    let tree = build_nested_child_tree(
+    let mut tree = build_nested_child_tree(
         root_attrs,
         Frame {
             x: 0.0,
@@ -4732,6 +4739,8 @@ fn test_outer_shadow_reuses_full_rounded_clip_when_both_scroll_axes_enabled() {
             content_height: 15.0,
         },
     );
+    // One Raven patch: the scroll layer as built without compositor scrolling.
+    tree.compositor_scroll = false;
 
     let trace = trace_tree(&tree);
     let draws = &trace.draws;
@@ -4943,6 +4952,8 @@ fn test_nested_scroll_host_clip_uses_canonical_geometry_with_local_translation()
     });
 
     let mut tree = ElementTree::new();
+    // One Raven patch: the scroll layer as built without compositor scrolling.
+    tree.compositor_scroll = false;
     tree.set_root_id(root_id);
     tree.insert(root);
     tree.insert(inner);

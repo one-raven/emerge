@@ -184,13 +184,15 @@ impl ImageSnapshot {
             return Self::default();
         }
         let visits = std::cell::Cell::new(0);
-        let bindings = image_ids(nodes, &visits)
-            .filter_map(|id| {
-                self.0
-                    .get(id)
-                    .map(|binding| (id.to_owned(), binding.clone()))
-            })
-            .collect();
+        let mut bindings = HashMap::new();
+        let mut add = |id: &str| {
+            if !bindings.contains_key(id)
+                && let Some(binding) = self.0.get(id)
+            {
+                bindings.insert(id.to_owned(), binding.clone());
+            }
+        };
+        collect_image_ids(nodes, &visits, &mut add);
         Self(Arc::new(bindings), visits.get())
     }
     pub(crate) fn enter(&self) -> ImageGuard {
@@ -220,6 +222,90 @@ impl ImageSnapshot {
                 total
             })
     }
+}
+
+// One Raven patch: the image ids under a scroll content layer, kept by its
+// content `Arc` (held, so the pointer is not reused). A compositor scroll
+// frame publishes the same content layer at a new offset; walking all of it
+// for image references was 16% of the tree actor's time per scroll frame.
+const LAYER_IMAGE_IDS_MEMO: usize = 4;
+
+thread_local! {
+    static LAYER_IMAGE_IDS: RefCell<
+        Vec<(Arc<crate::render_scene::RenderPaintLayerContent>, Arc<[String]>)>,
+    > = const { RefCell::new(Vec::new()) };
+}
+
+fn collect_image_ids(nodes: &[RenderNode], visits: &std::cell::Cell<usize>, add: &mut dyn FnMut(&str)) {
+    for node in nodes {
+        visits.set(visits.get() + 1);
+        match node {
+            RenderNode::Primitive(DrawPrimitive::Image(_, _, _, _, id, _, _)) => add(id),
+            RenderNode::Primitive(_) => {}
+            RenderNode::PaintLayer(layer) => collect_layer_image_ids(layer, visits, add),
+            RenderNode::ShadowPass { children }
+            | RenderNode::Clip { children, .. }
+            | RenderNode::RelaxedClip { children, .. }
+            | RenderNode::Transform { children, .. }
+            | RenderNode::Alpha { children, .. } => collect_image_ids(children, visits, add),
+        }
+    }
+}
+
+fn collect_content_image_ids(
+    nodes: &[RenderPaintLayerContentNode],
+    visits: &std::cell::Cell<usize>,
+    add: &mut dyn FnMut(&str),
+) {
+    for node in nodes {
+        visits.set(visits.get() + 1);
+        match node {
+            RenderPaintLayerContentNode::Own(run) => collect_image_ids(&run.nodes, visits, add),
+            RenderPaintLayerContentNode::Child(layer) => collect_layer_image_ids(layer, visits, add),
+            RenderPaintLayerContentNode::ShadowPass { children }
+            | RenderPaintLayerContentNode::Clip { children, .. }
+            | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+            | RenderPaintLayerContentNode::Transform { children, .. }
+            | RenderPaintLayerContentNode::Alpha { children, .. } => {
+                collect_content_image_ids(children, visits, add)
+            }
+        }
+    }
+}
+
+fn collect_layer_image_ids(
+    layer: &crate::render_scene::RenderPaintLayer,
+    visits: &std::cell::Cell<usize>,
+    add: &mut dyn FnMut(&str),
+) {
+    if layer.id.role != crate::render_scene::PaintLayerReason::ScrollContent {
+        collect_content_image_ids(&layer.content.nodes, visits, add);
+        return;
+    }
+    let memo = LAYER_IMAGE_IDS.with(|memo| {
+        memo.borrow()
+            .iter()
+            .find(|(content, _)| Arc::ptr_eq(content, &layer.content))
+            .map(|(_, ids)| Arc::clone(ids))
+    });
+    let ids = memo.unwrap_or_else(|| {
+        let mut ids: Vec<String> = Vec::new();
+        collect_content_image_ids(&layer.content.nodes, visits, &mut |id| {
+            if !ids.iter().any(|seen| seen == id) {
+                ids.push(id.to_owned());
+            }
+        });
+        let ids: Arc<[String]> = ids.into();
+        LAYER_IMAGE_IDS.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.len() >= LAYER_IMAGE_IDS_MEMO {
+                memo.remove(0);
+            }
+            memo.push((Arc::clone(&layer.content), Arc::clone(&ids)));
+        });
+        ids
+    });
+    ids.iter().for_each(|id| add(id));
 }
 
 // Stack traversal borrows cached render content, without cloning subtrees or

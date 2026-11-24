@@ -3408,6 +3408,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                 // One Raven patch: the generation the unchanged-frame
                 // fingerprint was last taken for (see `primary_pipeline`).
                 let mut fingerprinted_generation: Option<u64> = None;
+                let mut scene_known_changed = false;
                 render_state.animation_frame.observed(first_presented_at);
                 production.submitted(render_state.animation_frame.clone(), first_presented_at + frame_interval);
                 // The blocking modeset already displayed generation zero. Only
@@ -3708,6 +3709,12 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                             } => {
                                 let received_at = Instant::now();
                                 let scene = *scene;
+                                // One Raven patch: a scene known to differ
+                                // is drawn without the visible-frame hash.
+                                scene_known_changed |= crate::render_scene::render_nodes_differ(
+                                    &render_state.scene.nodes,
+                                    &scene.nodes,
+                                );
                                 render_state.set_scene(scene);
                                 if let Err(error) = video_registry
                                     .set_active_targets(&render_state.video_target_ids)
@@ -3824,10 +3831,19 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                             cursor_visible,
                             render_state.animate,
                         );
+                    // One Raven patch: a scene that differs from the one
+                    // before it needs no visible-frame hash to be drawn.
+                    let known_changed = consider_skip && scene_known_changed;
                     if consider_skip {
-                        fingerprinted_generation = Some(desired_primary_generation);
+                        scene_known_changed = false;
+                        fingerprinted_generation =
+                            (!known_changed).then_some(desired_primary_generation);
+                    }
+                    if known_changed {
+                        renderer.invalidate_visible_frame_fingerprint();
                     }
                     if consider_skip
+                        && !known_changed
                         && renderer.can_skip_unchanged_visible_frame(&render_state, dimensions)
                     {
                         committed_primary_generation = desired_primary_generation;
@@ -3989,6 +4005,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                     );
                                 }
                                 last_drawn_scene_version = Some(render_state.render_version);
+                                scene_known_changed = false;
                                 // One Raven patch: a primary drawn without its own
                                 // unchanged-frame check must not leave the fingerprint
                                 // describing an older frame.

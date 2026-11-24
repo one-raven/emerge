@@ -57,6 +57,7 @@ pub mod test_support;
 pub mod text_ops;
 
 pub use runtime::{HostEventRuntime, HostEventSink};
+pub(crate) use runtime::{Overscroll, ScrollPhysics, rubber_band as runtime_rubber_band};
 pub(crate) use runtime::{SpawnEventActorConfig, spawn_event_actor};
 use scrollbar::ScrollbarNode;
 

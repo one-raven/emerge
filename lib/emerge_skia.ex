@@ -144,6 +144,7 @@ defmodule EmergeSkia do
 
         with {:ok, renderer} <- transport.start_session(native_opts, asset_config) do
           :ok = transport.set_input_mask(renderer, Emerge.Config.Native.input_mask(config.input))
+          :ok = configure_scroll(renderer, nil, config)
           {:ok, renderer}
         end
 
@@ -223,7 +224,8 @@ defmodule EmergeSkia do
   end
 
   def configure(renderer, previous, config) do
-    with :ok <- validate_config_change(previous, config) do
+    with :ok <- validate_config_change(previous, config),
+         :ok <- configure_scroll(renderer, previous, config) do
       title =
         case config.output do
           %Emerge.Config.Window{title: title} -> title
@@ -286,6 +288,27 @@ defmodule EmergeSkia do
 
       true ->
         :ok
+    end
+  end
+
+  # One Raven patch: scroll physics go to the native event runtime directly
+  # (the macOS host keeps its defaults).
+  defp configure_scroll(%Renderer{}, _previous, _config), do: :ok
+
+  defp configure_scroll(renderer, previous, config) do
+    scroll = config.input.scroll
+
+    if previous != nil and previous.input.scroll == scroll do
+      :ok
+    else
+      case Native.set_scroll_config(
+             Transport.Native.native_renderer(renderer),
+             Emerge.Config.Scroll.native(scroll)
+           ) do
+        :ok -> :ok
+        {:ok, :ok} -> :ok
+        {:error, reason} -> {:error, {:scroll, reason}}
+      end
     end
   end
 
@@ -655,6 +678,35 @@ defmodule EmergeSkia do
   # ===========================================================================
   # Input Handling
   # ===========================================================================
+
+  @doc """
+  Replay a touch gesture into the renderer's input pipeline, as the
+  touchscreen would deliver it (One Raven patch; native renderers only).
+
+  Each sample is `{at_ms, contact_id, phase, x, y}`: `at_ms` is the offset
+  from the call (a float), `phase` is `:down`, `:move`, `:up` or `:cancel`,
+  and `x`/`y` are logical pixels. A native thread paces the samples and the
+  call returns at once.
+
+      EmergeSkia.inject_touch(renderer, [
+        {0, 1, :down, 600, 1400},
+        {16, 1, :move, 600, 1300},
+        {32, 1, :up, 600, 1200}
+      ])
+  """
+  @spec inject_touch(renderer(), [
+          {number(), non_neg_integer(), :down | :move | :up | :cancel, number(), number()}
+        ]) :: :ok
+  def inject_touch(renderer, samples) when is_list(samples) do
+    phases = %{down: 0, move: 1, up: 2, cancel: 3}
+
+    samples =
+      Enum.map(samples, fn {at_ms, id, phase, x, y} ->
+        {round(at_ms * 1000), id, Map.fetch!(phases, phase), x / 1, y / 1}
+      end)
+
+    EmergeSkia.Native.inject_touch(renderer, samples)
+  end
 
   @doc """
   Set the target process to receive renderer events.

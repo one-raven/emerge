@@ -38,7 +38,7 @@ const CHANGED_ROW: u64 = 120;
 /// A scrolled body holding a page of rows of every shape: plain, rounded and
 /// shadowed, see-through, rotated, an image, a nearby overlay, and a nested
 /// scrolled list.
-fn screen() -> ElementTree {
+pub(super) fn screen() -> ElementTree {
     let mut tree = ElementTree::new();
     let root = NodeId::from_u64(1);
     tree.set_root_id(root);
@@ -370,9 +370,10 @@ fn an_overlay_does_not_rebuild_a_changed_list_layer_it_has_nothing_to_strip_from
     let _ = super::super::take_canonicalized_nodes();
     let warm = super::super::render_tree_scene_with_scroll_layers(&tree).scene;
     // The row's own nodes and the overlay's top level; the list's content
-    // is not copied out and stripped again (88 when it is).
+    // is not copied out and stripped again (88 when it is). One Raven patch:
+    // 9 with compositor scrolling, whose content window holds one more row.
     let canonicalized = super::super::take_canonicalized_nodes();
-    assert!(canonicalized <= 8, "{canonicalized}");
+    assert!(canonicalized <= 9, "{canonicalized}");
 
     let mut cold_tree = overlay_with_list();
     change(&mut cold_tree, 110);

@@ -19,6 +19,8 @@ defmodule Emerge.Config.Input do
   - `scroll_line_pixels` — positive pixel distance per wheel/line-scroll step;
     defaults to `30.0`. Precise pixel-scroll input is not converted into line steps.
   - `cursor` — `Emerge.Config.Cursor`, defaulting to its built-in cursor settings.
+  - `scroll` — `Emerge.Config.Scroll`: scroll physics and compositor scrolling
+    (One Raven patch). Can change while running.
 
   Subscriptions filter only raw callbacks, not buttons, element key bindings,
   text editing, scrolling or `c:Emerge.handle_close/2`. The `:text` category includes
@@ -34,7 +36,8 @@ defmodule Emerge.Config.Input do
   """
   defstruct events: [],
             scroll_line_pixels: 30.0,
-            cursor: %Emerge.Config.Cursor{}
+            cursor: %Emerge.Config.Cursor{},
+            scroll: %Emerge.Config.Scroll{}
 
   @typedoc "Raw input category. `:text` includes committed text and IME events; enter/focus refer to the window, not an element."
   @type event_kind ::
@@ -50,19 +53,22 @@ defmodule Emerge.Config.Input do
   @type t :: %__MODULE__{
           events: [event_kind()],
           scroll_line_pixels: number(),
-          cursor: Emerge.Config.Cursor.t() | Emerge.Config.Cursor.options()
+          cursor: Emerge.Config.Cursor.t() | Emerge.Config.Cursor.options(),
+          scroll: Emerge.Config.Scroll.t() | Emerge.Config.Scroll.options()
         }
   @typedoc "Typed keyword shorthand accepted in this record's parent field."
   @type options :: [
           {:events, [event_kind()]}
           | {:scroll_line_pixels, number()}
           | {:cursor, Emerge.Config.Cursor.t() | Emerge.Config.Cursor.options()}
+          | {:scroll, Emerge.Config.Scroll.t() | Emerge.Config.Scroll.options()}
         ]
   @typedoc "Canonical form after nested keyword records have been expanded."
   @type normalized_t :: %__MODULE__{
           events: [event_kind()],
           scroll_line_pixels: number(),
-          cursor: Emerge.Config.Cursor.normalized_t()
+          cursor: Emerge.Config.Cursor.normalized_t(),
+          scroll: Emerge.Config.Scroll.normalized_t()
         }
 
   @doc false
@@ -83,7 +89,8 @@ defmodule Emerge.Config.Input do
             :touch
           ]}},
       scroll_line_pixels: :positive_number,
-      cursor: {:record, Emerge.Config.Cursor}
+      cursor: {:record, Emerge.Config.Cursor},
+      scroll: {:record, Emerge.Config.Scroll}
     ]
 
   @doc "Returns every supported raw input category."

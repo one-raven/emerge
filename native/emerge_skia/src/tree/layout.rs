@@ -857,14 +857,21 @@ fn prepare_frame_attrs_measured<M: TextMeasurer>(
             .err()
     });
     let runtime = runtime.as_deref();
-    let ids = ids.map(|ids| {
-        unique_frame_attr_prepare_ids(
-            &ids,
-            &runtime
-                .map(AnimationRuntime::active_node_ids)
-                .unwrap_or_default(),
-        )
-    });
+    // One Raven patch: an incremental preparation leaves out animations the
+    // render thread is already playing (see `settled_renderer_driven`).
+    let active = match (&ids, runtime) {
+        (Some(explicit), Some(runtime)) => {
+            let explicit: std::collections::HashSet<NodeId> = explicit.iter().copied().collect();
+            runtime
+                .active_node_ids()
+                .into_iter()
+                .filter(|id| explicit.contains(id) || !settled_renderer_driven(tree, id))
+                .collect()
+        }
+        (_, Some(runtime)) => runtime.active_node_ids(),
+        (_, None) => Vec::new(),
+    };
+    let ids = ids.map(|ids| unique_frame_attr_prepare_ids(&ids, &active));
     // Scale changes affect every node's effective attrs and footprint units,
     // including static siblings outside an active/dirty preparation's id set.
     let (ids, subtrees) = if scale != tree.current_scale() {
@@ -897,12 +904,7 @@ fn prepare_frame_attrs_measured<M: TextMeasurer>(
     let mut samples = if ids.is_some() {
         runtime
             .map(|runtime| {
-                sample_animation_overlays_for_ids(
-                    tree,
-                    runtime,
-                    &runtime.active_node_ids(),
-                    sample_time,
-                )
+                sample_animation_overlays_for_ids(tree, runtime, &active, sample_time)
             })
             .unwrap_or_default()
     } else {
@@ -965,6 +967,19 @@ fn prepare_frame_attrs_measured<M: TextMeasurer>(
     }
 }
 
+/// One Raven patch: a renderer-driven animation whose layer the render
+/// thread already plays. Re-sampling it in the tree changes nothing drawn
+/// (patch 4), so a frame that refreshes for anything else (a scroll step) skips
+/// it, as an idle frame does.
+fn settled_renderer_driven(tree: &ElementTree, id: &NodeId) -> bool {
+    tree.get(id).is_some_and(|element| {
+        element.layout.renderer_animation.as_ref().is_some_and(|animation| {
+            element.refresh.built_renderer_animation.get()
+                == Some((animation.revision, animation.started_at))
+        })
+    })
+}
+
 pub(crate) fn prepare_frame_attrs_for_update(
     tree: &mut ElementTree,
     scale: f32,
@@ -1017,10 +1032,8 @@ pub(crate) fn prepare_dirty_frame_attrs_with_subtrees_for_update(
     ids: &[NodeId],
     subtrees: &[NodeId],
 ) -> FrameAttrsPreparation {
-    let active = runtime
-        .as_deref()
-        .map(AnimationRuntime::active_node_ids)
-        .unwrap_or_default();
+    // One Raven patch: the active animations are added (and filtered) by
+    // `prepare_frame_attrs_measured`.
     prepare_frame_attrs_measured(
         tree,
         scale,
@@ -1028,7 +1041,7 @@ pub(crate) fn prepare_dirty_frame_attrs_with_subtrees_for_update(
         sample_time,
         &SkiaTextMeasurer,
         &FontContext::default(),
-        Some(unique_frame_attr_prepare_ids(&active, ids)),
+        Some(unique_frame_attr_prepare_ids(ids, &[])),
         subtrees.to_vec(),
     )
 }
@@ -1122,6 +1135,21 @@ fn mark_animation_refresh_effects_dirty(
         };
 
         if effect.transform_only && refresh_invalidation == TreeInvalidation::Paint {
+            // One Raven patch: the render thread animates this element on the
+            // retained scene; rebuilding it with this frame's sample changes
+            // nothing it draws, but dirtied every ancestor (a whole scroll
+            // content layer) on every frame anything else refreshed.
+            if tree.get(&effect.id).is_some_and(|element| {
+                element.layout.renderer_animation.as_ref().is_some_and(|animation| {
+                    element.refresh.built_renderer_animation.get()
+                        == Some((animation.revision, animation.started_at))
+                })
+            }) {
+                if registry_refresh {
+                    tree.mark_registry_refresh_dirty(&effect.id);
+                }
+                continue;
+            }
             tree.mark_transform_animation_refresh_dirty(&effect.id, registry_refresh);
             continue;
         }

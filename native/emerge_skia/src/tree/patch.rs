@@ -1700,6 +1700,7 @@ fn clone_as_ghost(
             mouse_down_active: false,
             focused_active: false,
             scrollbar_hover_axis: None,
+            scroll_overscroll: [0; 2],
         },
         layout: crate::tree::element::NodeLayoutState {
             renderer_animation: None,

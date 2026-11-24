@@ -14,7 +14,8 @@ use self::paint::{
 };
 use self::registry_walk::{
     BuildRegistryTraversal, HostRegistryTraversalSink, RegistryTraversalSink,
-    ReuseCleanRegistryTraversal, children_scene_context, nearby_scene_context,
+    ReuseCleanHostRegistryTraversal, ReuseCleanRegistryTraversal, children_scene_context,
+    nearby_scene_context,
 };
 use self::text::{
     TextDecorationSpec, render_multiline_text_input_items, render_text_input_items,
@@ -69,6 +70,8 @@ thread_local! {
 pub struct RenderTraversalDiagnostics {
     pub element_visits: u64,
     pub culled_subtrees: u64,
+    /// One Raven patch: visits answered from the element's fragment cache.
+    pub fragment_reuses: u64,
 }
 
 #[cfg(any(test, feature = "bench-diagnostics"))]
@@ -77,7 +80,13 @@ impl RenderTraversalDiagnostics {
         Self {
             element_visits: 0,
             culled_subtrees: 0,
+            fragment_reuses: 0,
         }
+    }
+
+    fn with_fragment_reuse(mut self) -> Self {
+        self.fragment_reuses = self.fragment_reuses.saturating_add(1);
+        self
     }
 
     fn with_element_visit(mut self) -> Self {
@@ -135,6 +144,14 @@ fn record_render_traversal_culled_subtree() {
 
 #[cfg(not(any(test, feature = "bench-diagnostics")))]
 fn record_render_traversal_culled_subtree() {}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+fn record_render_traversal_fragment_reuse() {
+    update_render_traversal_diagnostics(RenderTraversalDiagnostics::with_fragment_reuse);
+}
+
+#[cfg(not(any(test, feature = "bench-diagnostics")))]
+fn record_render_traversal_fragment_reuse() {}
 
 #[cfg(test)]
 pub(crate) struct RenderOutput {
@@ -320,6 +337,11 @@ struct RenderTraversal<'a> {
     /// One Raven patch: set while building the content of a scroll container
     /// (see `ScrollCanon`); the element's local nodes come back canonical.
     scroll_canon: Option<Rc<ScrollCanon>>,
+    /// One Raven patch: inside compositor scroll content, culled against a
+    /// window wider than the viewport (see `CompositorScroll`). A child wholly
+    /// inside that window is built without the window in its context, so its
+    /// fragment survives the window moving.
+    scroll_window: bool,
 }
 
 impl<'a> RenderTraversal<'a> {
@@ -336,6 +358,7 @@ impl<'a> RenderTraversal<'a> {
             inside_cacheable_semantic_layer,
             is_root: false,
             scroll_canon: self.scroll_canon.clone(),
+            scroll_window: self.scroll_window,
         }
     }
 
@@ -351,6 +374,7 @@ impl<'a> RenderTraversal<'a> {
             inside_cacheable_semantic_layer: self.inside_cacheable_semantic_layer,
             is_root: false,
             scroll_canon: self.scroll_canon.clone(),
+            scroll_window: self.scroll_window,
         }
     }
 
@@ -370,6 +394,11 @@ impl<'a> RenderTraversal<'a> {
 
     fn with_scroll_canon(mut self, scroll_canon: Option<Rc<ScrollCanon>>) -> Self {
         self.scroll_canon = scroll_canon;
+        self
+    }
+
+    fn with_scroll_window(mut self, scroll_window: bool) -> Self {
+        self.scroll_window = scroll_window;
         self
     }
 
@@ -517,6 +546,7 @@ fn build_refresh_output_with_semantic_layers(
         inside_cacheable_semantic_layer: false,
         is_root: true,
         scroll_canon: None,
+        scroll_window: false,
     };
     let subtree = match registry_collector.as_mut() {
         Some(collector) => build_element_subtree(
@@ -629,6 +659,7 @@ fn build_element_subtree<R: RegistryTraversalSink>(
             .filter(|cache| cache.key == cache_key)
             .map(RenderSubtree::from_fragment_cache)
     {
+        record_render_traversal_fragment_reuse();
         registry.collect_registry_for_render_skipped_subtree(tree, ix);
         apply_subtree_outputs(outputs, &subtree);
         return subtree;
@@ -638,6 +669,9 @@ fn build_element_subtree<R: RegistryTraversalSink>(
     let element_context = inherited.merge_with_attrs(attrs);
     let declared_animation = !traversal.is_root && element_has_declared_animation(element);
     let scroll_content = is_declared_scroll_container(element);
+    let compositor = scroll_content
+        .then(|| CompositorScroll::plan(tree, ix, element, scene_state.as_ref()))
+        .flatten();
     let semantic_descendants =
         traversal.inside_cacheable_semantic_layer || declared_animation || scroll_content;
 
@@ -675,10 +709,16 @@ fn build_element_subtree<R: RegistryTraversalSink>(
         && transform.is_identity()
         && !matches!(element.spec.kind, ElementKind::Image | ElementKind::Video);
     let scroll_canon = scroll_content.then(|| {
-        Rc::new(ScrollCanon::take(
-            element,
-            child_render_ctx.inherited_clip_shapes.clone(),
-        ))
+        Rc::new(match &compositor {
+            // Content coordinates: nothing to add back, only clips to strip.
+            Some(plan) => ScrollCanon::with_offset(
+                element,
+                arc_slice_with(&host_content_render_ctx.inherited_clip_shapes, plan.content_clip),
+                0.0,
+                0.0,
+            ),
+            None => ScrollCanon::take(element, child_render_ctx.inherited_clip_shapes.clone()),
+        })
     });
     let canonicalize_after_build = canonicalize_scroll_content_after_build();
     let content_canon = if scroll_content {
@@ -688,30 +728,81 @@ fn build_element_subtree<R: RegistryTraversalSink>(
     } else {
         None
     };
-    let mut host_content = build_host_content_subtree(
-        tree,
-        HostContentBuild {
-            element,
-            element_ix: ix,
-            render_frame,
-            element_context: &element_context,
-            scene_state: scene_state.clone(),
-        },
-        &mut outputs.reborrow(),
-        traversal
-            .for_host_content(
-                host_content_render_ctx,
-                traversal.disable_viewport_culling,
-                semantic_descendants,
+    let compositor_cache_key = compositor.as_ref().and_then(|plan| {
+        element_render_fragment_cache_key(tree, ix, element, &traversal, inherited)
+            .map(|key| plan.cache_key(key))
+    });
+    let cached_compositor_content = compositor_cache_key.and_then(|key| {
+        (!element.refresh.scroll_content_dirty.get())
+            .then(|| element.refresh.scroll_content_cache.borrow().clone())
+            .flatten()
+            .filter(|cache| cache.key == key)
+    });
+    let mut host_content = if let Some(plan) = &compositor {
+        // One Raven patch: the registry sees the content at its real offset;
+        // the render side builds it in content coordinates, or reuses it.
+        let mut host_registry = host_registry;
+        collect_compositor_scroll_registry(tree, ix, element, scene_state.as_ref(), &mut host_registry);
+        if let Some(cache) = &cached_compositor_content {
+            RenderSubtree {
+                local: cache.content.clone(),
+                escapes: cache.escapes.clone(),
+                text_input_focused: cache.text_input_focused,
+                text_input_cursor_area: cache.text_input_cursor_area,
+            }
+        } else {
+            build_host_content_subtree(
+                tree,
+                HostContentBuild {
+                    element,
+                    element_ix: ix,
+                    render_frame,
+                    element_context: &element_context,
+                    scene_state: Some(plan.content_state.clone()),
+                },
+                &mut outputs.reborrow(),
+                traversal
+                    .for_host_content(
+                        host_content_render_ctx,
+                        traversal.disable_viewport_culling,
+                        semantic_descendants,
+                    )
+                    .with_scroll_canon(content_canon)
+                    .with_scroll_window(true),
+                ReuseCleanHostRegistryTraversal,
             )
-            .with_scroll_canon(content_canon),
-        host_registry,
-    );
+        }
+    } else {
+        build_host_content_subtree(
+            tree,
+            HostContentBuild {
+                element,
+                element_ix: ix,
+                render_frame,
+                element_context: &element_context,
+                scene_state: scene_state.clone(),
+            },
+            &mut outputs.reborrow(),
+            traversal
+                .for_host_content(
+                    host_content_render_ctx,
+                    traversal.disable_viewport_culling,
+                    semantic_descendants,
+                )
+                .with_scroll_canon(content_canon),
+            host_registry,
+        )
+    };
     if let Some(canon) = scroll_canon {
-        if canonicalize_after_build {
+        if canonicalize_after_build && cached_compositor_content.is_none() {
             host_content.local = canon.nodes(std::mem::take(&mut host_content.local));
         }
-        canon.store(element);
+        if cached_compositor_content.is_none() {
+            canon.store(element);
+        }
+    }
+    if cached_compositor_content.is_some() {
+        apply_subtree_outputs(outputs, &host_content);
     }
     let own_canon = outer_canon.as_ref().filter(|_| distributive);
     let canonical = |nodes: Vec<RenderNode>| match own_canon {
@@ -751,7 +842,39 @@ fn build_element_subtree<R: RegistryTraversalSink>(
     normal_nodes.extend(canonical(background_nodes));
     normal_nodes.extend(canonical(inset_shadow_nodes));
 
-    if scroll_content {
+    if let Some(plan) = &compositor {
+        let content = match cached_compositor_content {
+            Some(cache) => cache.content,
+            None => {
+                let content = wrap_compositor_scroll_content_layer(
+                    std::mem::take(&mut host_content.local),
+                    element,
+                    render_frame,
+                    plan,
+                    traversal.render_ctx.scene_bounds,
+                );
+                if let Some(key) = compositor_cache_key {
+                    element.refresh.scroll_content_cache.replace(Some(
+                        crate::tree::element::ScrollContentCache {
+                            key,
+                            window: plan.window,
+                            content: content.clone(),
+                            escapes: host_content.escapes.clone(),
+                            text_input_focused: host_content.text_input_focused,
+                            text_input_cursor_area: host_content.text_input_cursor_area,
+                        },
+                    ));
+                    element.refresh.scroll_content_dirty.set(false);
+                }
+                content
+            }
+        };
+        normal_nodes.extend(plan.place(content, current_host_clip, traversal.render_ctx.scene_bounds));
+        // Escapes from the content were built in content coordinates too.
+        host_content.escapes =
+            plan.place_escapes(std::mem::take(&mut host_content.escapes), current_host_clip.clip);
+        normal_nodes.extend(wrap_with_host_clip(scrollbar_nodes, current_host_clip.clip));
+    } else if scroll_content {
         normal_nodes.extend(wrap_semantic_scroll_content_layer(
             host_content.local,
             element,
@@ -818,6 +941,11 @@ fn build_element_subtree<R: RegistryTraversalSink>(
             wrap_with_alpha(local, alpha)
         };
         local = wrap_with_compositor_animation_layer(wrapped, element, render_frame);
+        element.refresh.built_renderer_animation.set(
+            renderer_animation
+                .as_ref()
+                .map(|animation| (animation.revision, animation.started_at)),
+        );
         if let Some(animation) = renderer_animation {
             attach_renderer_animation(&mut local, animation, attrs, render_frame, transform, alpha);
         }
@@ -846,6 +974,7 @@ fn build_element_subtree<R: RegistryTraversalSink>(
         text_input_cursor_area: None,
     };
     if let Some(cache_key) = element_cache_key
+        && !element.refresh.scroll_moving.replace(false)
         && render_subtree_has_cacheable_fragment(&subtree)
     {
         element
@@ -1091,10 +1220,14 @@ struct ScrollCanon {
 
 impl ScrollCanon {
     fn take(element: &Element, clips: Arc<[ClipShape]>) -> Self {
+        Self::with_offset(element, clips, element.layout.scroll_x, element.layout.scroll_y)
+    }
+
+    fn with_offset(element: &Element, clips: Arc<[ClipShape]>, dx: f32, dy: f32) -> Self {
         Self {
             clips,
-            dx: element.layout.scroll_x,
-            dy: element.layout.scroll_y,
+            dx,
+            dy,
             rewriter: RefCell::new(LayerRewriter::take(element)),
         }
     }
@@ -1585,6 +1718,294 @@ fn is_declared_scroll_container(element: &Element) -> bool {
         || effective_scrollbar_y(&element.layout.effective)
 }
 
+// One Raven patch: compositor scrolling. Upstream rebuilt a scroll
+// container's content on every offset change: the content was culled to the
+// viewport at that offset, so every element's fragment key changed and the
+// whole visible content was rebuilt and canonicalized, and its paint layer
+// changed every frame, so the renderer could not reuse anything (Home on the
+// hub: 65 ms of tree and 45 ms of render per scroll step). Now the content is
+// built in content coordinates (as at offset zero), culled to a window that
+// reaches one viewport beyond each edge of the viewport along the scrolling
+// axes and moves in quarter-viewport steps, and the layer is placed with a
+// whole-pixel translation by the real offset. While the offset stays inside
+// the window and nothing in the content changed, the built layer is reused
+// as it is (`ScrollContentCache`); when the window moves, only elements that
+// straddle its edges or newly enter it are built, since a child wholly
+// inside the window is built without the window in its context.
+const COMPOSITOR_SCROLL_UNBOUNDED: f32 = 1.0e7;
+
+struct CompositorScroll {
+    /// The children's scene state: no own scroll offset, culled to `window`.
+    content_state: ResolvedNodeState,
+    /// Culling window in content coordinates (screen position at offset zero).
+    window: Rect,
+    /// The container clip as content sees it: unbounded along the
+    /// scrolling axes (the viewport is clipped outside the layer).
+    content_clip: ClipShape,
+    axes: (bool, bool),
+    /// The real offset, snapped to whole pixels (attrs are device-scaled).
+    offset: (f32, f32),
+}
+
+impl CompositorScroll {
+    fn plan(
+        tree: &ElementTree,
+        ix: NodeIx,
+        element: &Element,
+        scene_state: Option<&ResolvedNodeState>,
+    ) -> Option<Self> {
+        if !tree.compositor_scroll
+            || !matches!(
+                element.spec.kind,
+                ElementKind::El
+                    | ElementKind::Row
+                    | ElementKind::WrappedRow
+                    | ElementKind::Column
+                    | ElementKind::TextColumn
+                    | ElementKind::None
+            )
+            // A container's own nearby does not scroll with its content.
+            || tree.has_nearby_mounts_ix(ix)
+        {
+            return None;
+        }
+        let state = scene_state?;
+        let attrs = &element.layout.effective;
+        let axes = (effective_scrollbar_x(attrs), effective_scrollbar_y(attrs));
+        if !axes.0 && !axes.1 {
+            return None;
+        }
+        let scroll = (
+            if axes.0 { element.layout.scroll_x } else { 0.0 },
+            if axes.1 { element.layout.scroll_y } else { 0.0 },
+        );
+        let overscroll = element.runtime.scroll_overscroll.map(f32::from_bits);
+        let viewport = state.host_clip.rect;
+        let window_axis = |start: f32, len: f32, offset: f32| -> (f32, f32) {
+            let step = (len / 4.0).max(64.0);
+            let anchor = (offset / step).floor() * step;
+            (start + anchor - len, len * 3.0 + step)
+        };
+        let unbounded = |start: f32, len: f32, scrolls: bool| -> (f32, f32) {
+            if scrolls {
+                (-COMPOSITOR_SCROLL_UNBOUNDED, 2.0 * COMPOSITOR_SCROLL_UNBOUNDED)
+            } else {
+                (start, len)
+            }
+        };
+        let (wx, ww) = if axes.0 {
+            window_axis(viewport.x, viewport.width, scroll.0)
+        } else {
+            (viewport.x, viewport.width)
+        };
+        let (wy, wh) = if axes.1 {
+            window_axis(viewport.y, viewport.height, scroll.1)
+        } else {
+            (viewport.y, viewport.height)
+        };
+        let window = Rect {
+            x: wx,
+            y: wy,
+            width: ww,
+            height: wh,
+        };
+        let (cx, cw) = unbounded(viewport.x, viewport.width, axes.0);
+        let (cy, ch) = unbounded(viewport.y, viewport.height, axes.1);
+        let content_clip = ClipShape {
+            rect: Rect {
+                x: cx,
+                y: cy,
+                width: cw,
+                height: ch,
+            },
+            radii: None,
+        };
+        // Culling: the window on the scrolling axes, what the viewport and
+        // its ancestors leave on the others.
+        let cull = |clip: ClipShape| -> ClipShape {
+            let rect = clip.rect;
+            ClipShape {
+                rect: Rect {
+                    x: if axes.0 { window.x } else { rect.x },
+                    y: if axes.1 { window.y } else { rect.y },
+                    width: if axes.0 { window.width } else { rect.width },
+                    height: if axes.1 { window.height } else { rect.height },
+                },
+                radii: None,
+            }
+        };
+        let mut content_state = state.clone();
+        content_state.local_scroll_x = 0.0;
+        content_state.local_scroll_y = 0.0;
+        content_state.host_clip = content_clip;
+        content_state.child_visible_clip = cull(state.child_visible_clip);
+        content_state.content_nearby_visible_clip =
+            Some(cull(state.content_nearby_visible_clip.unwrap_or(state.child_visible_clip)));
+        Some(Self {
+            content_state,
+            window,
+            content_clip,
+            axes,
+            offset: (
+                (scroll.0 + overscroll[0]).round(),
+                (scroll.1 + overscroll[1]).round(),
+            ),
+        })
+    }
+
+    fn cache_key(&self, fragment: RenderFragmentCacheKey) -> u64 {
+        let mut hasher = FastHasher::new();
+        hasher.write_u64(fragment.context);
+        hash_rect_bits(&mut hasher, fragment.bounds);
+        hasher.write_u64(fragment.topology.children_version);
+        hasher.write_u64(fragment.topology.nearby_version);
+        hasher.write_usize(fragment.topology.child_count);
+        hasher.write_usize(fragment.topology.nearby_count);
+        hash_rect_bits(&mut hasher, self.window);
+        hash_rect_bits(&mut hasher, self.content_clip.rect);
+        hasher.finish()
+    }
+
+    /// The content layer at the real offset, clipped to the viewport (and,
+    /// for shadows, to the shadow boundary) outside the layer.
+    fn place(
+        &self,
+        content: Vec<RenderNode>,
+        host_clip: HostClipDescriptor,
+        scene_bounds: Rect,
+    ) -> Vec<RenderNode> {
+        let outer = if host_clip.clip.radii.is_some() {
+            host_clip.clip
+        } else {
+            shadow_boundary_clip(host_clip, scene_bounds)
+        };
+        vec![clip_node(
+            vec![outer],
+            false,
+            wrap_with_transform_forced(
+                content,
+                Affine2::translation(-self.offset.0, -self.offset.1),
+            ),
+        )]
+    }
+
+    /// Escapes from the content (its nearby content) at the real offset. A
+    /// scroll container clips the nearby content of its content.
+    fn place_escapes(&self, escapes: Vec<RenderNode>, host_clip: ClipShape) -> Vec<RenderNode> {
+        if escapes.is_empty() {
+            return escapes;
+        }
+        vec![clip_node(
+            vec![host_clip],
+            false,
+            wrap_with_transform(escapes, Affine2::translation(-self.offset.0, -self.offset.1)),
+        )]
+    }
+}
+
+// One Raven patch: the registry of compositor scroll content, collected at
+// the real offset, as `build_host_content_subtree` would while rendering.
+fn collect_compositor_scroll_registry<H: HostRegistryTraversalSink>(
+    tree: &ElementTree,
+    ix: NodeIx,
+    element: &Element,
+    scene_state: Option<&ResolvedNodeState>,
+    registry: &mut H,
+) {
+    let child_scene_ctx = children_scene_context(scene_state);
+    element.for_each_retained_local_branch(tree, |branch| match branch {
+        RetainedLocalBranchRef::Nearby(mount) => {
+            let mut branch = registry.local_nearby_traversal(scene_state);
+            branch.collect_registry_for_render_skipped_subtree(tree, mount.ix);
+        }
+        RetainedLocalBranchRef::Child(child) => {
+            if !registry.should_skip_child(tree, child.ix, &child_scene_ctx) {
+                let context = registry.child_context(child_scene_ctx.clone());
+                registry.collect_child_subtree(tree, child.ix, context);
+            }
+        }
+    });
+    for mount in tree.escape_nearby_mounts_ix(ix) {
+        registry.defer_escape_nearby_subtree(tree, mount.ix, mount.slot, scene_state);
+    }
+}
+
+// One Raven patch: a child wholly inside the culling window of compositor
+// scroll content is built without the window (nothing under it is culled by
+// it), so its fragment key does not change when the window moves. A child
+// with nearby content or inline fragments keeps the window.
+fn unwindowed_scene_context(
+    tree: &ElementTree,
+    child_ix: NodeIx,
+    scene_ctx: &SceneContext,
+) -> Option<SceneContext> {
+    let clip = scene_ctx.visible_clip?;
+    if scene_ctx.front_nearby_subtree || tree.has_nearby_mounts_ix(child_ix) {
+        return None;
+    }
+    let element = tree.get_ix(child_ix)?;
+    if !element.layout.paragraph_boxes.is_empty() {
+        return None;
+    }
+    let state = resolve_node_state(element, scene_ctx.clone())?;
+    let attrs = &element.layout.effective;
+    let transform = element_transform(state.adjusted_render_frame, attrs);
+    let bounds = scene_ctx.interaction_transform.then(transform).map_rect_aabb(
+        super::viewport_culling::element_visual_bounds(state.adjusted_render_frame, attrs),
+    );
+    let clip = scene_ctx.interaction_transform.map_rect_aabb(clip.rect);
+    let inside = bounds.x >= clip.x
+        && bounds.y >= clip.y
+        && bounds.x + bounds.width <= clip.x + clip.width
+        && bounds.y + bounds.height <= clip.y + clip.height;
+    inside.then(|| SceneContext {
+        visible_clip: None,
+        nearby_visible_clip: None,
+        ..scene_ctx.clone()
+    })
+}
+
+// One Raven patch: the content layer of compositor scroll content. As
+// `wrap_semantic_scroll_content_layer`, without the translation (see
+// `CompositorScroll::place`); the clips are the content's own.
+fn wrap_compositor_scroll_content_layer(
+    canonical_nodes: Vec<RenderNode>,
+    element: &Element,
+    render_frame: Frame,
+    plan: &CompositorScroll,
+    scene_bounds: Rect,
+) -> Vec<RenderNode> {
+    let nominal_bounds = Rect::from_frame(render_frame);
+    let content_bounds = paint_layer_bounds_from_visual_bounds(
+        paint_layer_own_content_visual_bounds(&canonical_nodes),
+        nominal_bounds,
+    );
+    let descriptor = HostClipDescriptor {
+        clip: plan.content_clip,
+        scroll_x: plan.axes.0,
+        scroll_y: plan.axes.1,
+    };
+    let canonical_nodes = wrap_scroll_content_with_clips(
+        canonical_nodes,
+        plan.content_clip,
+        shadow_boundary_clip(descriptor, scene_bounds),
+    );
+    let content = RenderPaintLayerContent::from_composition_nodes(canonical_nodes);
+    let content_generation =
+        paint_layer_content_generation(&content.own_payload_render_nodes(), content_bounds);
+    vec![RenderNode::PaintLayer(RenderPaintLayer::from_prepared_children(
+        RenderPaintLayerBuildParts {
+            id: PaintLayerId::new(element.id.to_wire_u64(), PaintLayerReason::ScrollContent),
+            bounds: content_bounds,
+            placement: PaintLayerPlacement::ScrollMoving,
+            policy: PaintLayerPolicy::Cacheable,
+            content_generation,
+            visual_bounds: Some(content_bounds),
+        },
+        content,
+    ))]
+}
+
 fn element_has_declared_animation(element: &Element) -> bool {
     let specs = [
         element.spec.declared.animate.as_ref(),
@@ -1748,8 +2169,15 @@ fn build_host_content_subtree<H: HostRegistryTraversalSink>(
                     .flatten();
                 let branch_registry =
                     registry.child_traversal(child_registry_skipped, child_registry_ctx);
-                let child_traversal =
-                    traversal.for_child(child_scene_ctx.clone(), content_render_ctx);
+                let render_scene_ctx = if traversal.scroll_window {
+                    unwindowed_scene_context(tree, child.ix, &child_scene_ctx)
+                } else {
+                    None
+                };
+                let child_traversal = traversal.for_child(
+                    render_scene_ctx.unwrap_or_else(|| child_scene_ctx.clone()),
+                    content_render_ctx,
+                );
                 let child_traversal = if slider_value_slot {
                     child_traversal.within_cacheable_semantic_layer().raw()
                 } else {
@@ -2637,12 +3065,13 @@ fn wrap_with_paint_layer(
     };
     let visual_bounds = paint_layer_own_content_visual_bounds(&nodes);
     let content = RenderPaintLayerContent::from_nodes(nodes);
-    let own_nodes = content.own_render_nodes();
     let bounds = paint_layer_bounds_from_visual_bounds(visual_bounds, nominal_bounds);
+    // One Raven patch: the own nodes are copied only to hash them; a given
+    // generation (the root's, every frame) needs no copy.
     let content_generation = if let Some(content_generation) = content_generation {
         content_generation
     } else if policy.allows_payload_cache() {
-        paint_layer_content_generation(&own_nodes, bounds)
+        paint_layer_content_generation(&content.own_render_nodes(), bounds)
     } else {
         0
     };

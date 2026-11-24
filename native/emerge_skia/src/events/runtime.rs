@@ -57,8 +57,10 @@ use super::{
     swipe_down_atom, swipe_left_atom, swipe_right_atom, swipe_up_atom, virtual_key_hold_atom,
 };
 
+mod physics;
 mod scroll;
 mod touch;
+pub(crate) use physics::{Overscroll, ScrollPhysics, rubber_band};
 
 pub trait HostEventSink: Send + Sync {
     fn send_raw_input(&self, event: &InputEvent);
@@ -180,6 +182,18 @@ impl EventRuntimeDriver {
         let mut messages = self
             .runtime
             .resolve_scroll_commands(commands.0.into_inner());
+        // One Raven patch: content moved without a registry round trip; once
+        // the motion settles, ask for a registry at the final offsets so the
+        // next tap does not wait for it.
+        if messages.iter().any(TreeMsg::is_scroll_motion) {
+            self.runtime.listener_lane.scroll_geometry_pending = true;
+        }
+        if self.runtime.listener_lane.scroll_geometry_pending
+            && !self.runtime.listener_lane.is_stale()
+            && self.runtime.scroll_motion_settled()
+        {
+            self.runtime.listener_lane.mark_stale();
+        }
         if std::mem::take(&mut self.runtime.listener_lane.needs_barrier) {
             let barrier = crate::actors::ListenerBarrier::default();
             self.awaiting_registry = Some(barrier.clone());
@@ -396,6 +410,10 @@ impl EventRuntimeDriver {
                 self.set_input_mask(mask);
                 true
             }
+            EventMsg::SetScrollPhysics(physics) => {
+                self.dispatch(|runtime, tx, log| runtime.set_scroll_physics(physics, tx, log));
+                true
+            }
             EventMsg::SetInputTarget(target) => {
                 self.log_event_diagnostic(|| {
                     format!("set input target\n  present: {}", target.is_some())
@@ -562,6 +580,9 @@ struct DragMotionState {
     sampled_pointer_axis: f32,
     last_sample_at: Instant,
     velocity_px_per_sec: f32,
+    /// One Raven patch: recent pointer samples, for a windowed velocity
+    /// (`ScrollPhysics::velocity_window`).
+    samples: VecDeque<(Instant, f32)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -579,14 +600,19 @@ struct TextCommitSuppression {
 }
 
 impl AdaptiveScrollSimulation {
+    #[cfg(test)]
     fn new(initial_position: f32, initial_velocity: f32) -> Option<Self> {
+        Self::with_friction(initial_position, initial_velocity, ADAPTIVE_SCROLL_FRICTION)
+    }
+
+    fn with_friction(initial_position: f32, initial_velocity: f32, friction: f32) -> Option<Self> {
         let abs_velocity = initial_velocity.abs();
         if abs_velocity < f32::EPSILON {
             return None;
         }
 
         let reference_velocity =
-            ADAPTIVE_SCROLL_FRICTION * ADAPTIVE_SCROLL_PHYSICAL_COEFF / ADAPTIVE_SCROLL_INFLEXION;
+            friction * ADAPTIVE_SCROLL_PHYSICAL_COEFF / ADAPTIVE_SCROLL_INFLEXION;
         let android_duration = (abs_velocity / reference_velocity)
             .powf(1.0 / (ADAPTIVE_SCROLL_DECELERATION_RATE - 1.0));
         let duration_secs =
@@ -776,7 +802,15 @@ impl PendingDispatchEffects {
                     if runtime.touch_key_pressed(*element_id)
             )
         });
-        let tree_msg_requires_stale = self.tree_msgs.iter().any(tree_msg_requires_listener_stale);
+        // One Raven patch: scroll motion does not wait for a registry round
+        // trip (see `ListenerLaneState::scroll_geometry_pending`).
+        let tree_msg_requires_stale = self
+            .tree_msgs
+            .iter()
+            .any(|msg| tree_msg_requires_listener_stale(msg) && !msg.is_scroll_motion());
+        if self.tree_msgs.iter().any(TreeMsg::is_scroll_motion) {
+            runtime.listener_lane.scroll_geometry_pending = true;
+        }
         if self.elixir_event_requires_rebuild && !tree_msg_requires_stale {
             self.tree_msgs.push(TreeMsg::RebuildRegistry);
         }
@@ -864,6 +898,8 @@ fn tree_msg_label(msg: &TreeMsg) -> &'static str {
         TreeMsg::PatchTree { .. } => "patch_tree",
         TreeMsg::Resize { .. } => "resize",
         TreeMsg::SetScrollPosition { .. } => "set_scroll_position",
+        TreeMsg::SetScrollOverscroll { .. } => "set_scroll_overscroll",
+        TreeMsg::SetScrollMode { .. } => "set_scroll_mode",
         TreeMsg::ScrollRequest { .. } => "scroll_request",
         TreeMsg::ScrollbarThumbDragX { .. } => "scrollbar_thumb_drag_x",
         TreeMsg::ScrollbarThumbDragY { .. } => "scrollbar_thumb_drag_y",
@@ -896,6 +932,7 @@ fn event_msg_label(msg: &EventMsg) -> &'static str {
         EventMsg::Configure(_) => "configure",
         EventMsg::ConfigureInput(_) => "configure_input",
         EventMsg::SetInputMask(_) => "set_input_mask",
+        EventMsg::SetScrollPhysics(_) => "set_scroll_physics",
         EventMsg::SetInputTarget(_) => "set_input_target",
         EventMsg::Stop => "stop",
     }
@@ -1043,6 +1080,15 @@ struct ListenerLaneState {
     stale: bool,
     needs_barrier: bool,
     buffered_inputs: VecDeque<PendingInput>,
+    /// One Raven patch: a scroll moved content since the registry this lane
+    /// holds was built. Upstream marked the lane stale on every scroll step,
+    /// so each touch move waited for the tree to rebuild the registry (a
+    /// whole-screen walk) before the next move was taken: on a big screen a
+    /// drag fell seconds behind the finger. Moves and releases of a captured
+    /// drag (and wheel steps) hit-test nothing, so they go straight through;
+    /// any other input first asks for a registry at the new offsets and waits
+    /// for it, as a stale lane does. Ending the motion asks for one too.
+    scroll_geometry_pending: bool,
 }
 
 impl ListenerLaneState {
@@ -1051,6 +1097,7 @@ impl ListenerLaneState {
             stale: true,
             needs_barrier: false,
             buffered_inputs: VecDeque::new(),
+            scroll_geometry_pending: false,
         }
     }
 
@@ -1061,6 +1108,7 @@ impl ListenerLaneState {
     fn mark_stale(&mut self) {
         self.stale = true;
         self.needs_barrier = true;
+        self.scroll_geometry_pending = false;
     }
 
     fn buffer_input(&mut self, event: InputEvent) {
@@ -1148,6 +1196,10 @@ struct DirectEventRuntime {
     scroll_line_pixels: f32,
     native_log: Arc<NativeLogRelay>,
     stats: Option<Arc<RendererStatsCollector>>,
+    /// One Raven patch: tunable scroll physics (see events/runtime/physics.rs).
+    physics: ScrollPhysics,
+    /// One Raven patch: overscrolls springing back, by container and axis.
+    springs: HashMap<(NodeId, usize), physics::SpringBack>,
 }
 
 impl DirectEventRuntime {
@@ -1209,6 +1261,8 @@ impl DirectEventRuntime {
             scroll_line_pixels: SCROLL_LINE_PIXELS,
             native_log,
             stats,
+            physics: ScrollPhysics::default(),
+            springs: HashMap::new(),
         }
     }
 
@@ -1373,7 +1427,10 @@ impl DirectEventRuntime {
             sampled_pointer_axis: pointer_axis,
             last_sample_at: now,
             velocity_px_per_sec: 0.0,
+            samples: VecDeque::from([(now, pointer_axis)]),
         });
+        // One Raven patch: a drag catches an overscroll springing back.
+        self.catch_springs();
     }
 
     fn update_drag_motion(&mut self, last_x: f32, last_y: f32, now: Instant) {
@@ -1395,6 +1452,16 @@ impl DirectEventRuntime {
     }
 
     fn sample_drag_motion_velocity(motion: &mut DragMotionState, now: Instant) {
+        // One Raven patch: keep the last half second of samples for a
+        // windowed velocity.
+        motion.samples.push_back((now, motion.last_pointer_axis));
+        while motion
+            .samples
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > Duration::from_millis(500))
+        {
+            motion.samples.pop_front();
+        }
         let dt = now.saturating_duration_since(motion.last_sample_at);
         if dt < DRAG_VELOCITY_SAMPLE_MIN_DT {
             return;
@@ -1476,17 +1543,50 @@ impl DirectEventRuntime {
             return;
         };
 
-        let velocity = motion
-            .velocity_px_per_sec
-            .clamp(-ADAPTIVE_SCROLL_MAX_VELOCITY, ADAPTIVE_SCROLL_MAX_VELOCITY);
+        // One Raven patch: velocity, limits and friction from `ScrollPhysics`.
+        let estimate = match self.physics.velocity_window {
+            Some(window) => {
+                let samples: Vec<_> = motion
+                    .samples
+                    .iter()
+                    .copied()
+                    .filter(|(at, _)| now.saturating_duration_since(*at) <= window)
+                    .collect();
+                physics::least_squares_velocity(&samples)
+            }
+            None => motion.velocity_px_per_sec,
+        };
+        let velocity = estimate.clamp(-self.physics.max_velocity, self.physics.max_velocity);
 
-        if velocity.abs() < ADAPTIVE_SCROLL_MIN_VELOCITY
+        // One Raven patch: released past the edge, the overscroll springs back.
+        let axis = usize::from(motion.axis == ScrollbarAxis::Y);
+        if self.physics.overscroll == Overscroll::Bounce
+            && let Some(session) = self.scroll_sessions.get_mut(&motion.element_id)
+            && session.overscroll[axis] != 0.0
+        {
+            let from = session.overscroll[axis] as f32;
+            session.excess[axis] = 0.0;
+            self.springs.insert(
+                (motion.element_id, axis),
+                physics::SpringBack {
+                    from,
+                    velocity: -velocity,
+                    started_at: now,
+                },
+            );
+            self.backend_wake.request_redraw();
+            return;
+        }
+
+        if velocity.abs() < self.physics.min_velocity
             || self.edge_blocks_inertial_scroll(&motion.element_id, motion.axis, velocity)
         {
             return;
         }
 
-        let Some(simulation) = AdaptiveScrollSimulation::new(0.0, velocity) else {
+        let Some(simulation) =
+            AdaptiveScrollSimulation::with_friction(0.0, velocity, self.physics.friction)
+        else {
             return;
         };
 
@@ -1550,7 +1650,24 @@ impl DirectEventRuntime {
             );
         }
 
-        if hit_boundary || simulation_done {
+        if hit_boundary {
+            // One Raven patch: a fling into the edge carries its velocity into
+            // a rubber band that springs back.
+            if self.physics.overscroll == Overscroll::Bounce {
+                let axis = usize::from(inertia.axis == ScrollbarAxis::Y);
+                self.springs.insert(
+                    (inertia.element_id, axis),
+                    physics::SpringBack {
+                        from: 0.0,
+                        velocity: -current_velocity,
+                        started_at: now,
+                    },
+                );
+                self.backend_wake.request_redraw();
+            }
+            return;
+        }
+        if simulation_done {
             return;
         }
 
@@ -1561,8 +1678,10 @@ impl DirectEventRuntime {
     }
 
     fn next_timer_deadline(&self) -> Option<Instant> {
+        let spring = (!self.springs.is_empty()).then(|| self.next_inertial_watchdog_deadline(Instant::now()));
         self.virtual_key_deadline
             .into_iter()
+            .chain(spring)
             .chain(
                 (!self.listener_lane.is_stale())
                     .then(|| self.touch_key_deadline())
@@ -1601,6 +1720,13 @@ impl DirectEventRuntime {
             self.host_event_sink.as_deref(),
         );
         self.clear_text_commit_suppressions_for_event(&event);
+
+        if self.listener_lane.scroll_geometry_pending
+            && !self.listener_lane.is_stale()
+            && !self.input_continues_scroll_capture(&event)
+        {
+            self.listener_lane.mark_stale();
+        }
 
         if self.listener_lane.is_stale() {
             let buffered_before = self.listener_lane.buffered_inputs.len();
@@ -2047,9 +2173,74 @@ impl DirectEventRuntime {
             self.log_event_diagnostic(log_render, || "inertial scroll watchdog due".to_string());
             self.step_inertial_scroll(now, tree_tx, log_render);
         }
+        self.step_springs(now, tree_tx, log_render);
         self.log_event_diagnostic(log_render, || {
             format!("timers end\n  {}", self.diagnostic_summary())
         });
+    }
+
+    /// One Raven patch: advance overscrolls springing back to the edge.
+    fn step_springs(&mut self, now: Instant, tree_tx: &dyn TreeSink, log_render: bool) {
+        if self.springs.is_empty() {
+            return;
+        }
+        let mut changed = Vec::new();
+        self.springs.retain(|(id, axis), spring| {
+            let (offset, done) = spring.at(now);
+            if let Some(session) = self.scroll_sessions.get_mut(id) {
+                session.overscroll[*axis] = f64::from(offset);
+                changed.push((*id, session.overscroll));
+            }
+            !done
+        });
+        changed.sort_unstable_by_key(|(id, _)| id.0);
+        changed.dedup_by_key(|(id, _)| *id);
+        for (element_id, overscroll) in changed {
+            send_tree(
+                tree_tx,
+                TreeMsg::SetScrollOverscroll {
+                    element_id,
+                    overscroll: overscroll.map(|v| v as f32),
+                },
+                log_render,
+            );
+        }
+        if !self.springs.is_empty() {
+            self.backend_wake.request_redraw();
+        }
+    }
+
+    /// One Raven patch: a new drag takes over overscrolls springing back
+    /// from where they are.
+    fn catch_springs(&mut self) {
+        for ((id, axis), _) in std::mem::take(&mut self.springs) {
+            if let Some(session) = self.scroll_sessions.get_mut(&id) {
+                session.excess[axis] = f64::from(physics::rubber_band_inverse(
+                    session.overscroll[axis] as f32,
+                    session.node.viewport[axis] as f32,
+                ));
+            }
+        }
+    }
+
+    /// One Raven patch: apply new scroll physics.
+    fn set_scroll_physics(&mut self, physics: ScrollPhysics, tree_tx: &dyn TreeSink, log: bool) {
+        let mode_changed = physics.compositor != self.physics.compositor
+            || physics.overscroll != self.physics.overscroll;
+        registry_builder::set_drag_slop(physics.touch_slop);
+        crate::renderer::set_scroll_tiles_enabled(physics.compositor);
+        self.physics = physics;
+        self.recompose_overlay_registry();
+        if mode_changed {
+            send_tree(
+                tree_tx,
+                TreeMsg::SetScrollMode {
+                    compositor: self.physics.compositor,
+                    bounce: self.physics.overscroll == Overscroll::Bounce,
+                },
+                log,
+            );
+        }
     }
 
     fn handle_present_timing(
@@ -2060,6 +2251,7 @@ impl DirectEventRuntime {
         log_render: bool,
     ) {
         self.note_present_timing(presented_at, predicted_next_present_at);
+        self.step_springs(presented_at, tree_tx, log_render);
         if self.inertial_scroll.is_none() {
             return;
         }
@@ -2160,6 +2352,43 @@ impl DirectEventRuntime {
             log_render,
             DispatchMode::CursorRevalidate,
         );
+    }
+
+    /// One Raven patch: input that only continues a captured drag (or a wheel
+    /// scroll) and so needs no hit test against the moved content.
+    fn input_continues_scroll_capture(&self, event: &InputEvent) -> bool {
+        let captured = matches!(
+            self.runtime_overlay.drag,
+            registry_builder::DragTrackerState::Active { .. }
+        ) || self.runtime_overlay.scrollbar.is_some();
+        match event {
+            InputEvent::Touch { id, phase, .. } => {
+                captured
+                    && self.primary_touch == Some(*id)
+                    && matches!(
+                        phase,
+                        crate::input::TouchPhase::Move
+                            | crate::input::TouchPhase::Up
+                            | crate::input::TouchPhase::Cancel
+                    )
+            }
+            InputEvent::CursorPos { .. } => captured,
+            InputEvent::CursorButton { action, .. } => {
+                captured && *action == crate::input::ACTION_RELEASE
+            }
+            InputEvent::CursorScroll { .. } | InputEvent::CursorScrollLines { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// One Raven patch: no drag or fling is moving content any more.
+    fn scroll_motion_settled(&self) -> bool {
+        self.inertial_scroll.is_none()
+            && self.runtime_overlay.scrollbar.is_none()
+            && !matches!(
+                self.runtime_overlay.drag,
+                registry_builder::DragTrackerState::Active { .. }
+            )
     }
 
     fn has_active_pointer_overlay(&self) -> bool {
@@ -4057,7 +4286,10 @@ mod tests {
             false,
         );
 
-        runtime.handle_registry_update(rebuild.clone(), &tree_tx, false);
+        // One Raven patch: the final motion's scroll does not wait for another
+        // registry, so the release replays right behind it and starts inertia
+        // (upstream held the release for a second registry round trip).
+        runtime.handle_registry_update(rebuild, &tree_tx, false);
         assert!(drain_msgs(&tree_rx).iter().any(|msg| matches!(
             msg,
             TreeMsg::ScrollRequest { element_id: id, dx, dy }
@@ -4065,17 +4297,7 @@ mod tests {
                     && dx.abs() < f32::EPSILON
                     && (*dy + 25.0).abs() < 0.001
         )));
-        assert!(matches!(
-            runtime.runtime_overlay.drag,
-            registry_builder::DragTrackerState::Active { .. }
-        ));
-        assert!(matches!(
-            runtime.listener_lane.buffered_inputs.make_contiguous(),
-            [PendingInput::Raw(InputEvent::CursorButton { action, .. })]
-                if *action == crate::input::ACTION_RELEASE
-        ));
-
-        runtime.handle_registry_update(rebuild, &tree_tx, false);
+        assert!(runtime.listener_lane.buffered_inputs.is_empty());
         assert!(matches!(
             runtime.runtime_overlay.drag,
             registry_builder::DragTrackerState::Inactive
@@ -5068,7 +5290,9 @@ mod tests {
 
         runtime.handle_input_event(InputEvent::CursorPos { x: 30.0, y: 10.0 }, &tree_tx, false);
 
-        assert!(runtime.listener_lane.is_stale());
+        // One Raven patch: scroll motion does not wait for a registry.
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(runtime.listener_lane.scroll_geometry_pending);
         let msgs = drain_msgs(&tree_rx);
         assert!(msgs.iter().any(|msg| matches!(
             msg,
@@ -5077,6 +5301,226 @@ mod tests {
                     && (*dx - 6.0).abs() < f32::EPSILON
                     && dy.abs() < f32::EPSILON
         )));
+    }
+
+    fn scroll_physics_runtime(
+        id: u8,
+        scroll_y: f32,
+        physics: ScrollPhysics,
+    ) -> (DirectEventRuntime, Sender<TreeMsg>, Receiver<TreeMsg>) {
+        let attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(scroll_y as f64),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
+        let element = with_interaction(make_element(id, ElementKind::El, attrs));
+        let rebuild = RegistryRebuildPayload {
+            scrolls: Default::default(),
+            listener_barrier: None,
+            mount_focus_targets: Default::default(),
+            base_registry: registry_builder::registry_for_elements(&[element]),
+            text_inputs: HashMap::new(),
+            sliders: HashMap::new(),
+            scrollbars: HashMap::new(),
+            focused_id: None,
+            focus_on_mount: None,
+        };
+        let (tree_tx, tree_rx) = bounded(256);
+        let mut runtime = DirectEventRuntime::new(false);
+        runtime.set_scroll_physics(physics, &tree_tx, false);
+        runtime.handle_registry_update(rebuild, &tree_tx, false);
+        let node = crate::events::scroll::ScrollNode {
+            mount: 0,
+            position: [0.0, f64::from(scroll_y) / 100.0],
+            range: [0.0, 100.0],
+            enabled: [false, true],
+            proposals: Default::default(),
+            targets: [None, None],
+            emit: false,
+            viewport: [100.0, 50.0],
+        };
+        runtime.scroll_sessions.insert(
+            NodeId::from_term_bytes(vec![id]),
+            crate::events::scroll::ScrollSession::new(node),
+        );
+        let _ = drain_msgs(&tree_rx);
+        (runtime, tree_tx, tree_rx)
+    }
+
+    fn mouse(action: u8, y: f32) -> InputEvent {
+        InputEvent::CursorButton {
+            button: "left".to_string(),
+            action,
+            mods: 0,
+            x: 10.0,
+            y,
+        }
+    }
+
+    // One Raven patch: `Overscroll::Bounce` rubber-bands a drag past the
+    // start and springs back on release.
+    #[test]
+    fn a_bounce_drag_past_the_edge_rubber_bands_then_springs_back() {
+        let (mut runtime, tree_tx, tree_rx) = scroll_physics_runtime(
+            45,
+            0.0,
+            ScrollPhysics {
+                overscroll: Overscroll::Bounce,
+                ..ScrollPhysics::default()
+            },
+        );
+        let id = NodeId::from_term_bytes(vec![45]);
+        let now = Instant::now();
+        runtime.sync_drag_motion_start(id, GestureAxis::Vertical, 10.0, 10.0, now);
+        let mut overscroll = 0.0;
+        for step in 1..=4 {
+            // The finger pulls down 20 px at a time: content would scroll up.
+            runtime.update_drag_motion(10.0, 10.0 + 20.0 * step as f32, now);
+            let request = TreeMsg::ScrollRequest { element_id: id, dx: 0.0, dy: 20.0 };
+            for message in runtime.resolve_scroll_commands(vec![request]) {
+                if let TreeMsg::SetScrollOverscroll { element_id, overscroll: o } = message {
+                    assert_eq!(element_id, id);
+                    overscroll = o[1];
+                }
+            }
+        }
+        // Pulled 80 px past the start: the content follows, but less.
+        assert!(overscroll < -10.0 && overscroll > -80.0, "{overscroll}");
+        assert_eq!(runtime.scroll_sessions[&id].position[1], 0.0);
+
+        runtime.maybe_start_inertial_scroll(now);
+        assert!(runtime.springs.contains_key(&(id, 1)));
+        assert!(runtime.inertial_scroll.is_none());
+        runtime.step_springs(now + Duration::from_secs(2), &tree_tx, false);
+        assert!(runtime.springs.is_empty());
+        assert!(drain_msgs(&tree_rx).iter().any(|message| matches!(
+            message,
+            TreeMsg::SetScrollOverscroll { overscroll, .. } if overscroll[1] == 0.0
+        )));
+        assert_eq!(runtime.scroll_sessions[&id].overscroll[1], 0.0);
+    }
+
+    // One Raven patch: without bounce the edge clamps (the default).
+    #[test]
+    fn without_bounce_a_drag_past_the_edge_does_not_overscroll() {
+        let (mut runtime, tree_tx, tree_rx) =
+            scroll_physics_runtime(46, 0.0, ScrollPhysics::default());
+        runtime.handle_input_event(mouse(crate::input::ACTION_PRESS, 10.0), &tree_tx, false);
+        for y in [30.0, 60.0] {
+            runtime.handle_input_event(InputEvent::CursorPos { x: 10.0, y }, &tree_tx, false);
+        }
+        let commands = runtime.resolve_scroll_commands(drain_msgs(&tree_rx));
+        assert!(!commands
+            .iter()
+            .any(|message| matches!(message, TreeMsg::SetScrollOverscroll { .. })));
+    }
+
+    // One Raven patch: a windowed velocity ignores a fling that stopped
+    // before the release; the default filter keeps the last moving value.
+    #[test]
+    fn a_velocity_window_does_not_fling_a_finger_that_stopped() {
+        for (window, flings) in [(None, true), (Some(Duration::from_millis(60)), false)] {
+            let (mut runtime, _tree_tx, _tree_rx) = scroll_physics_runtime(
+                47,
+                50.0,
+                ScrollPhysics {
+                    velocity_window: window,
+                    ..ScrollPhysics::default()
+                },
+            );
+            let id = NodeId::from_term_bytes(vec![47]);
+            let now = Instant::now();
+            runtime.sync_drag_motion_start(id, GestureAxis::Vertical, 10.0, 80.0, now);
+            for step in 1..=4u64 {
+                let y = 80.0 - 20.0 * step as f32;
+                runtime.update_drag_motion(10.0, y, now + Duration::from_millis(8 * step));
+            }
+            // The finger rests for 100 ms before lifting.
+            runtime.maybe_start_inertial_scroll(now + Duration::from_millis(132));
+            assert_eq!(runtime.inertial_scroll.is_some(), flings, "{window:?}");
+        }
+    }
+
+    // One Raven patch: `touch_slop` sets the drag threshold.
+    #[test]
+    fn touch_slop_sets_the_drag_threshold() {
+        for (slop, scrolls) in [(10.0, true), (40.0, false)] {
+            let (mut runtime, tree_tx, tree_rx) = scroll_physics_runtime(
+                48,
+                50.0,
+                ScrollPhysics {
+                    touch_slop: slop,
+                    ..ScrollPhysics::default()
+                },
+            );
+            runtime.handle_input_event(mouse(crate::input::ACTION_PRESS, 40.0), &tree_tx, false);
+            runtime.handle_input_event(InputEvent::CursorPos { x: 10.0, y: 15.0 }, &tree_tx, false);
+            runtime.handle_input_event(InputEvent::CursorPos { x: 10.0, y: 10.0 }, &tree_tx, false);
+            let scrolled = drain_msgs(&tree_rx)
+                .iter()
+                .any(|message| matches!(message, TreeMsg::ScrollRequest { .. }));
+            assert_eq!(scrolled, scrolls, "slop {slop}");
+        }
+        registry_builder::set_drag_slop(10.0);
+    }
+
+    // One Raven patch: a drag's moves and release go straight through while
+    // the scroll moved content; the next press waits for a registry at the
+    // new offset (upstream made every move wait for one).
+    #[test]
+    fn direct_runtime_drag_scroll_does_not_wait_but_the_next_press_does() {
+        let attrs = Attrs {
+            scrollbar_y: Some(true),
+            scroll_y: Some(10.0),
+            scroll_y_max: Some(100.0),
+            ..Attrs::default()
+        };
+        let element = with_interaction(make_element(44, ElementKind::El, attrs));
+        let rebuild = RegistryRebuildPayload {
+            scrolls: Default::default(),
+            listener_barrier: None,
+            mount_focus_targets: Default::default(),
+            base_registry: registry_builder::registry_for_elements(&[element]),
+            text_inputs: HashMap::new(),
+            sliders: HashMap::new(),
+            scrollbars: HashMap::new(),
+            focused_id: None,
+            focus_on_mount: None,
+        };
+        let (tree_tx, tree_rx) = bounded(64);
+        let mut runtime = DirectEventRuntime::new(false);
+        runtime.handle_registry_update(rebuild, &tree_tx, false);
+        let button = |action, y| InputEvent::CursorButton {
+            button: "left".to_string(),
+            action,
+            mods: 0,
+            x: 10.0,
+            y,
+        };
+        runtime.handle_input_event(button(crate::input::ACTION_PRESS, 40.0), &tree_tx, false);
+        let mut scrolls = 0;
+        for y in [30.0, 20.0, 10.0, 5.0] {
+            runtime.handle_input_event(InputEvent::CursorPos { x: 10.0, y }, &tree_tx, false);
+            assert!(!runtime.listener_lane.is_stale());
+            scrolls += drain_msgs(&tree_rx)
+                .iter()
+                .filter(|msg| matches!(msg, TreeMsg::ScrollRequest { .. }))
+                .count();
+        }
+        // Every move after the drag threshold scrolled at once.
+        assert_eq!(scrolls, 3);
+        assert!(runtime.listener_lane.scroll_geometry_pending);
+        runtime.handle_input_event(button(crate::input::ACTION_RELEASE, 5.0), &tree_tx, false);
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(runtime.listener_lane.buffered_inputs.is_empty());
+
+        // A new press needs the moved geometry: it asks for a registry and waits.
+        runtime.handle_input_event(button(crate::input::ACTION_PRESS, 40.0), &tree_tx, false);
+        assert!(runtime.listener_lane.is_stale());
+        assert!(runtime.listener_lane.needs_barrier);
+        assert!(!runtime.listener_lane.scroll_geometry_pending);
+        assert_eq!(runtime.listener_lane.buffered_inputs.len(), 1);
     }
 
     #[test]
@@ -5262,7 +5706,9 @@ mod tests {
 
         runtime.handle_input_event(InputEvent::CursorPos { x: 20.0, y: 50.0 }, &tree_tx, false);
 
-        assert!(runtime.listener_lane.is_stale());
+        // One Raven patch: scroll motion does not wait for a registry.
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(runtime.listener_lane.scroll_geometry_pending);
         let msgs = drain_msgs(&tree_rx);
         assert!(msgs.iter().any(|msg| matches!(
             msg,
@@ -5505,6 +5951,7 @@ mod tests {
                 proposals: Default::default(),
                 targets: [None, None],
                 emit: false,
+                viewport: [100.0, 100.0],
             }),
         );
 
@@ -5992,7 +6439,9 @@ mod tests {
 
         runtime.handle_input_event(InputEvent::CursorPos { x: 96.0, y: 20.0 }, &tree_tx, false);
 
-        assert!(runtime.listener_lane.is_stale());
+        // One Raven patch: scroll motion does not wait for a registry.
+        assert!(!runtime.listener_lane.is_stale());
+        assert!(runtime.listener_lane.scroll_geometry_pending);
         let msgs = drain_msgs(&tree_rx);
         assert!(msgs.iter().any(|msg| matches!(
             msg,

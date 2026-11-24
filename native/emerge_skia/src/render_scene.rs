@@ -56,9 +56,7 @@ fn collect_video_target_ids(nodes: &[RenderNode], targets: &mut HashSet<String>)
         | RenderNode::RelaxedClip { children, .. }
         | RenderNode::Transform { children, .. }
         | RenderNode::Alpha { children, .. } => collect_video_target_ids(children, targets),
-        RenderNode::PaintLayer(layer) => {
-            collect_video_target_ids_from_layer_content(layer.content.nodes.as_slice(), targets)
-        }
+        RenderNode::PaintLayer(layer) => collect_layer_video_target_ids(layer, targets),
         RenderNode::Primitive(DrawPrimitive::Video(_, _, _, _, target, _)) => {
             targets.insert(target.clone());
         }
@@ -72,9 +70,7 @@ fn collect_video_target_ids_from_layer_content(
 ) {
     content.iter().for_each(|node| match node {
         RenderPaintLayerContentNode::Own(run) => collect_video_target_ids(&run.nodes, targets),
-        RenderPaintLayerContentNode::Child(layer) => {
-            collect_video_target_ids_from_layer_content(&layer.content.nodes, targets)
-        }
+        RenderPaintLayerContentNode::Child(layer) => collect_layer_video_target_ids(layer, targets),
         RenderPaintLayerContentNode::ShadowPass { children }
         | RenderPaintLayerContentNode::Clip { children, .. }
         | RenderPaintLayerContentNode::RelaxedClip { children, .. }
@@ -83,6 +79,43 @@ fn collect_video_target_ids_from_layer_content(
             collect_video_target_ids_from_layer_content(children, targets)
         }
     });
+}
+
+// One Raven patch: a compositor scroll frame publishes the same scroll
+// content layer at a new offset; its video targets are kept by its content
+// `Arc` (held, so the pointer is not reused) instead of walking all of it
+// again on the render thread for every scene.
+thread_local! {
+    static LAYER_VIDEO_TARGETS: std::cell::RefCell<
+        Vec<(Arc<RenderPaintLayerContent>, Arc<[String]>)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn collect_layer_video_target_ids(layer: &RenderPaintLayer, targets: &mut HashSet<String>) {
+    if layer.id.role != PaintLayerReason::ScrollContent {
+        collect_video_target_ids_from_layer_content(&layer.content.nodes, targets);
+        return;
+    }
+    let memo = LAYER_VIDEO_TARGETS.with(|memo| {
+        memo.borrow()
+            .iter()
+            .find(|(content, _)| Arc::ptr_eq(content, &layer.content))
+            .map(|(_, ids)| Arc::clone(ids))
+    });
+    let ids = memo.unwrap_or_else(|| {
+        let mut found = HashSet::new();
+        collect_video_target_ids_from_layer_content(&layer.content.nodes, &mut found);
+        let ids: Arc<[String]> = found.into_iter().collect::<Vec<_>>().into();
+        LAYER_VIDEO_TARGETS.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.len() >= 4 {
+                memo.remove(0);
+            }
+            memo.push((Arc::clone(&layer.content), Arc::clone(&ids)));
+        });
+        ids
+    });
+    targets.extend(ids.iter().cloned());
 }
 
 fn nodes_have_payload_cache_candidate_layers(nodes: &[RenderNode]) -> bool {
@@ -354,6 +387,136 @@ pub enum RenderNode {
     },
     PaintLayer(RenderPaintLayer),
     Primitive(DrawPrimitive),
+}
+
+/// One Raven patch: whether two scenes' nodes differ, stopping at the first
+/// difference. Layers and runs sharing content compare by pointer. A scroll
+/// step's scene differs near its root, so the presenter learns it must draw
+/// without hashing every visible node (`visible_frame_fingerprint`).
+pub(crate) fn render_nodes_differ(a: &[RenderNode], b: &[RenderNode]) -> bool {
+    a.len() != b.len() || a.iter().zip(b).any(|(a, b)| render_node_differs(a, b))
+}
+
+fn render_node_differs(a: &RenderNode, b: &RenderNode) -> bool {
+    use RenderNode as N;
+    match (a, b) {
+        (N::PaintLayer(a), N::PaintLayer(b)) => paint_layer_differs(a, b),
+        (N::ShadowPass { children: a }, N::ShadowPass { children: b }) => {
+            render_nodes_differ(a, b)
+        }
+        (
+            N::Clip {
+                clips: ca,
+                children: a,
+            },
+            N::Clip {
+                clips: cb,
+                children: b,
+            },
+        )
+        | (
+            N::RelaxedClip {
+                clips: ca,
+                children: a,
+            },
+            N::RelaxedClip {
+                clips: cb,
+                children: b,
+            },
+        ) => ca != cb || render_nodes_differ(a, b),
+        (
+            N::Transform {
+                transform: ta,
+                children: a,
+            },
+            N::Transform {
+                transform: tb,
+                children: b,
+            },
+        ) => ta != tb || render_nodes_differ(a, b),
+        (
+            N::Alpha {
+                alpha: aa,
+                children: a,
+            },
+            N::Alpha {
+                alpha: ab,
+                children: b,
+            },
+        ) => aa != ab || render_nodes_differ(a, b),
+        (N::Primitive(a), N::Primitive(b)) => a != b,
+        _ => true,
+    }
+}
+
+fn paint_layer_differs(a: &RenderPaintLayer, b: &RenderPaintLayer) -> bool {
+    a.id != b.id
+        || a.bounds != b.bounds
+        || a.placement != b.placement
+        || a.policy != b.policy
+        || a.content_generation != b.content_generation
+        || a.metrics != b.metrics
+        || a.renderer_animation != b.renderer_animation
+        || (!Arc::ptr_eq(&a.content, &b.content)
+            && layer_content_differs(&a.content.nodes, &b.content.nodes))
+}
+
+fn layer_content_differs(a: &[RenderPaintLayerContentNode], b: &[RenderPaintLayerContentNode]) -> bool {
+    use RenderPaintLayerContentNode as C;
+    a.len() != b.len()
+        || a.iter().zip(b).any(|(a, b)| match (a, b) {
+            (C::Own(a), C::Own(b)) => {
+                a.slot != b.slot
+                    || a.bounds != b.bounds
+                    || a.metrics != b.metrics
+                    || (!Arc::ptr_eq(&a.nodes, &b.nodes) && render_nodes_differ(&a.nodes, &b.nodes))
+            }
+            (C::Child(a), C::Child(b)) => paint_layer_differs(a, b),
+            (C::ShadowPass { children: a }, C::ShadowPass { children: b }) => {
+                layer_content_differs(a, b)
+            }
+            (
+                C::Clip {
+                    clips: ca,
+                    children: a,
+                },
+                C::Clip {
+                    clips: cb,
+                    children: b,
+                },
+            )
+            | (
+                C::RelaxedClip {
+                    clips: ca,
+                    children: a,
+                },
+                C::RelaxedClip {
+                    clips: cb,
+                    children: b,
+                },
+            ) => ca != cb || layer_content_differs(a, b),
+            (
+                C::Transform {
+                    transform: ta,
+                    children: a,
+                },
+                C::Transform {
+                    transform: tb,
+                    children: b,
+                },
+            ) => ta != tb || layer_content_differs(a, b),
+            (
+                C::Alpha {
+                    alpha: aa,
+                    children: a,
+                },
+                C::Alpha {
+                    alpha: ab,
+                    children: b,
+                },
+            ) => aa != ab || layer_content_differs(a, b),
+            _ => true,
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1826,7 +1989,7 @@ fn render_nodes_visual_bounds(nodes: &[RenderNode], transform: Affine2) -> Optio
         .reduce(union_rect)
 }
 
-fn render_node_visual_bounds(node: &RenderNode, transform: Affine2) -> Option<Rect> {
+pub(crate) fn render_node_visual_bounds(node: &RenderNode, transform: Affine2) -> Option<Rect> {
     match node {
         RenderNode::ShadowPass { children } | RenderNode::Alpha { children, .. } => {
             render_nodes_visual_bounds(children, transform)
@@ -2424,6 +2587,58 @@ mod tests {
     use crate::tree::attrs::ImageFit;
     use crate::tree::geometry::Rect;
     use std::collections::HashSet;
+
+    // One Raven patch: scene comparison for the presenter.
+    #[test]
+    fn render_nodes_differ_finds_a_moved_layer_and_ignores_a_rebuilt_copy() {
+        use super::render_nodes_differ;
+        use crate::render_color::RenderColor;
+        use crate::tree::transform::Affine2;
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 32.0,
+        };
+        let rect = |w| RenderNode::Primitive(DrawPrimitive::Rect(0.0, 0.0, w, 8.0, RenderColor::from(0xff0000ff)));
+        let content = RenderPaintLayer::from_children(
+            2,
+            bounds,
+            PaintLayerPlacement::Fixed,
+            PaintLayerPolicy::Cacheable,
+            PaintLayerReason::ScrollContent,
+            7,
+            vec![rect(10.0), rect(20.0)],
+        );
+        let scene = |dy: f32, layer: &RenderPaintLayer| {
+            vec![rect(64.0), RenderNode::Transform {
+                transform: Affine2::translation(0.0, dy),
+                children: vec![RenderNode::PaintLayer(layer.clone())],
+            }]
+        };
+        let rebuilt = RenderPaintLayer::from_children(
+            2,
+            bounds,
+            PaintLayerPlacement::Fixed,
+            PaintLayerPolicy::Cacheable,
+            PaintLayerReason::ScrollContent,
+            7,
+            vec![rect(10.0), rect(20.0)],
+        );
+        assert!(!render_nodes_differ(&scene(-5.0, &content), &scene(-5.0, &content)));
+        assert!(!render_nodes_differ(&scene(-5.0, &content), &scene(-5.0, &rebuilt)));
+        assert!(render_nodes_differ(&scene(-5.0, &content), &scene(-6.0, &content)));
+        let changed = RenderPaintLayer::from_children(
+            2,
+            bounds,
+            PaintLayerPlacement::Fixed,
+            PaintLayerPolicy::Cacheable,
+            PaintLayerReason::ScrollContent,
+            7,
+            vec![rect(10.0), rect(21.0)],
+        );
+        assert!(render_nodes_differ(&scene(-5.0, &content), &scene(-5.0, &changed)));
+    }
 
     #[test]
     fn summary_and_video_targets_follow_ordered_layer_content() {

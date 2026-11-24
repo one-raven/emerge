@@ -79,6 +79,29 @@ use super::{
 };
 
 const RUNTIME_DRAG_DEADZONE: f32 = 10.0;
+
+// One Raven patch: the drag threshold (touch slop) of the event runtime on
+// this thread (`ScrollPhysics::touch_slop`); overlay listeners are built on
+// the event actor's thread.
+thread_local! {
+    static DRAG_SLOP: std::cell::Cell<f32> = const { std::cell::Cell::new(RUNTIME_DRAG_DEADZONE) };
+}
+
+pub(crate) fn set_drag_slop(slop: f32) {
+    DRAG_SLOP.with(|cell| cell.set(slop));
+}
+
+// One Raven patch: with `Overscroll::Bounce`, a scroll container takes drags
+// toward an edge it already rests on (to rubber-band them). Registries are
+// built on the tree actor's thread, which sets this; returns whether it
+// changed.
+thread_local! {
+    static DRAG_OVERSCROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_drag_overscroll(enabled: bool) -> bool {
+    DRAG_OVERSCROLL.with(|cell| cell.replace(enabled) != enabled)
+}
 const GESTURE_AXIS_DOMINANCE_RATIO: f32 = 1.25;
 const GESTURE_AXIS_MIN_LEAD: f32 = 6.0;
 #[cfg(any(test, feature = "bench-diagnostics"))]
@@ -1485,7 +1508,7 @@ fn runtime_drag_candidate_threshold_listener(
         matcher: ListenerMatcher::CursorPosDistanceFromPointExceeded {
             origin_x,
             origin_y,
-            threshold: RUNTIME_DRAG_DEADZONE,
+            threshold: DRAG_SLOP.with(std::cell::Cell::get),
         },
         compute: ListenerCompute::PromoteDragTrackerFromCursorPos {
             element_id: *element_id,
@@ -8438,8 +8461,15 @@ fn emit_scroll_listeners_for_element(
         return;
     };
 
-    out.emit_all(
+    // One Raven patch: with drag overscroll on, every direction of a
+    // scrollable axis (see `DRAG_OVERSCROLL`).
+    let directions = if DRAG_OVERSCROLL.with(std::cell::Cell::get) {
+        scroll_wheel::scrollable_axis_directions_for_element(element)
+    } else {
         scroll_wheel::scroll_directions_for_element(element)
+    };
+    out.emit_all(
+        directions
             .into_iter()
             .map(|direction| Listener {
                 element_id: Some(element.id),
@@ -8881,10 +8911,58 @@ mod scroll_wheel {
         .flatten()
         .collect()
     }
+
+    /// One Raven patch: both directions of each axis with something to
+    /// scroll, edges included.
+    pub(super) fn scrollable_axis_directions_for_element(element: &Element) -> Vec<ScrollDirection> {
+        let attrs = &element.layout.effective;
+        let x = attrs.scrollbar_x.unwrap_or(false) && element.layout.scroll_x_max > 0.0;
+        let y = attrs.scrollbar_y.unwrap_or(false) && element.layout.scroll_y_max > 0.0;
+        [
+            x.then_some(ScrollDirection::XNeg),
+            x.then_some(ScrollDirection::XPos),
+            y.then_some(ScrollDirection::YNeg),
+            y.then_some(ScrollDirection::YPos),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    // One Raven patch: drag overscroll keeps both directions at an edge.
+    #[test]
+    fn drag_overscroll_registers_the_blocked_direction_at_an_edge() {
+        use super::{ScrollDirection, scroll_wheel};
+        let mut element = Element::with_attrs(
+            NodeId(7),
+            ElementKind::El,
+            vec![],
+            Attrs {
+                scrollbar_y: Some(true),
+                ..Attrs::default()
+            },
+        );
+        element.layout.effective.scrollbar_y = Some(true);
+        element.layout.scroll_y = 0.0;
+        element.layout.scroll_y_max = 300.0;
+        assert_eq!(
+            scroll_wheel::scroll_directions_for_element(&element),
+            vec![ScrollDirection::YNeg]
+        );
+        assert_eq!(
+            scroll_wheel::scrollable_axis_directions_for_element(&element),
+            vec![ScrollDirection::YNeg, ScrollDirection::YPos]
+        );
+        element.layout.scroll_y_max = 0.0;
+        assert!(scroll_wheel::scrollable_axis_directions_for_element(&element).is_empty());
+        assert!(super::set_drag_overscroll(true));
+        assert!(!super::set_drag_overscroll(true));
+        assert!(super::set_drag_overscroll(false));
+    }
+
     #[test]
     fn native_listener_mount_index_is_sparse_shared_and_released() {
         use crate::tree::layout::{Constraint, layout_and_refresh_default};

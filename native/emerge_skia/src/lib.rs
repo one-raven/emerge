@@ -274,6 +274,20 @@ struct StatsPipelineSnapshotNif {
     render_queue_overwrites: u64,
     drm_scenes_selected_for_draw: u64,
     drm_scenes_presented: u64,
+    present_intervals: PresentIntervalsNif,
+}
+
+// One Raven patch: spacing of presented scenes (see `PresentIntervalSummary`).
+#[derive(Clone, Copy, Debug, rustler::NifMap)]
+struct PresentIntervalsNif {
+    count: u64,
+    idle: u64,
+    /// Presented scenes per second while scenes kept coming (idle gaps excluded).
+    fps: f64,
+    p50_ms: f64,
+    p90_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
 }
 
 #[derive(Clone, Debug, rustler::NifMap)]
@@ -495,6 +509,23 @@ impl StatsSnapshotNif {
                     render_queue_overwrites: snapshot.pipeline.render_queue_overwrites,
                     drm_scenes_selected_for_draw: snapshot.pipeline.drm_scenes_selected_for_draw,
                     drm_scenes_presented: snapshot.pipeline.drm_scenes_presented,
+                    present_intervals: {
+                        let p = snapshot.pipeline.present_intervals;
+                        let ms = |us: u32| f64::from(us) / 1000.0;
+                        PresentIntervalsNif {
+                            count: p.count,
+                            idle: p.idle,
+                            fps: if p.total_us == 0 {
+                                0.0
+                            } else {
+                                p.count as f64 * 1.0e6 / p.total_us as f64
+                            },
+                            p50_ms: ms(p.p50_us),
+                            p90_ms: ms(p.p90_us),
+                            p99_ms: ms(p.p99_us),
+                            max_ms: ms(p.max_us),
+                        }
+                    },
                 },
                 video: StatsVideoSnapshotNif {
                     submitted: snapshot.video_pipeline.submitted,
@@ -3771,6 +3802,95 @@ fn set_input_mask(renderer: ResourceArc<RendererResource>, mask: u32) -> Atom {
         renderer.log_input,
     );
     atoms::ok()
+}
+
+/// One Raven patch: scroll physics (`Emerge.Config.Scroll`).
+#[derive(Clone, Debug, rustler::NifMap)]
+struct ScrollConfigNif {
+    compositor: bool,
+    friction: f64,
+    min_velocity: f64,
+    max_velocity: f64,
+    velocity_window_ms: Option<f64>,
+    touch_slop: f64,
+    bounce: bool,
+}
+
+/// One Raven patch: apply scroll physics to the event actor (it forwards
+/// the compositor setting to the tree and the renderer).
+#[rustler::nif]
+fn set_scroll_config(
+    renderer: ResourceArc<RendererResource>,
+    config: ScrollConfigNif,
+) -> Result<Atom, String> {
+    let physics = events::ScrollPhysics {
+        friction: config.friction as f32,
+        min_velocity: config.min_velocity as f32,
+        max_velocity: config.max_velocity as f32,
+        velocity_window: config
+            .velocity_window_ms
+            .filter(|ms| ms.is_finite() && *ms > 0.0)
+            .map(|ms| Duration::from_secs_f64(ms / 1000.0)),
+        touch_slop: config.touch_slop as f32,
+        overscroll: if config.bounce {
+            events::Overscroll::Bounce
+        } else {
+            events::Overscroll::None
+        },
+        compositor: config.compositor,
+    };
+    physics.validate()?;
+    send_event(
+        &renderer.event_tx,
+        EventMsg::SetScrollPhysics(physics),
+        renderer.log_input,
+    );
+    Ok(atoms::ok())
+}
+
+/// One Raven patch: replay a touch gesture into the event actor, as the
+/// backend's touchscreen would deliver it. Each sample is
+/// `{at_us, contact_id, phase, x, y}`: `at_us` is the offset from the call,
+/// `phase` 0 down, 1 move, 2 up, 3 cancel, coordinates in logical pixels. A
+/// native thread paces the samples, so a measured gesture isn't perturbed by
+/// BEAM scheduling. For automation and benchmarks; ordinary input never uses it.
+#[rustler::nif]
+fn inject_touch(
+    renderer: ResourceArc<RendererResource>,
+    samples: Vec<(u64, u64, u8, f64, f64)>,
+) -> NifResult<Atom> {
+    let samples = samples
+        .into_iter()
+        .map(|(at_us, id, phase, x, y)| {
+            let phase = match phase {
+                0 => crate::input::TouchPhase::Down,
+                1 => crate::input::TouchPhase::Move,
+                2 => crate::input::TouchPhase::Up,
+                3 => crate::input::TouchPhase::Cancel,
+                _ => return Err(rustler::Error::BadArg),
+            };
+            Ok((Duration::from_micros(at_us), id, phase, x as f32, y as f32))
+        })
+        .collect::<NifResult<Vec<_>>>()?;
+    let event_tx = renderer.event_tx.clone();
+    let log_input = renderer.log_input;
+    thread::Builder::new()
+        .name("emerge-inject-touch".into())
+        .spawn(move || {
+            let started = Instant::now();
+            for (at, id, phase, x, y) in samples {
+                if let Some(wait) = at.checked_sub(started.elapsed()) {
+                    thread::sleep(wait);
+                }
+                send_event(
+                    &event_tx,
+                    EventMsg::InputEvent(crate::input::InputEvent::Touch { id, phase, x, y }),
+                    log_input,
+                );
+            }
+        })
+        .map_err(|_| rustler::Error::Atom("thread_spawn_failed"))?;
+    Ok(atoms::ok())
 }
 
 /// Submit a complete supported live-control snapshot. Owner completions carry

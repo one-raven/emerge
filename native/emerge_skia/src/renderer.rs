@@ -7,7 +7,11 @@
 //! - Font cache for text rendering
 
 pub(crate) mod scene_images;
+// One Raven patch: scroll content drawn from tiles.
+mod scroll_tiles;
 mod vector_raster;
+pub use scroll_tiles::ScrollTileCounts;
+pub(crate) use scroll_tiles::set_scroll_tiles_enabled;
 use crate::fast_hash::FastHasher;
 use crate::render_color::RenderColor;
 pub use scene_images::{ImageSnapshot, ImageSnapshotRetention};
@@ -3198,6 +3202,8 @@ pub struct RendererCacheManager {
     base_snapshot_max_bytes: u64,
     base_snapshot_counts: BaseSnapshotCounts,
     last_frame_work: FrameWork,
+    /// One Raven patch: compositor scroll tiles (see renderer/scroll_tiles.rs).
+    scroll_tiles: scroll_tiles::ScrollTiles,
 }
 
 #[cfg(test)]
@@ -3302,6 +3308,7 @@ impl RendererCacheManager {
                 .min(config.paint_layer.max_bytes),
             base_snapshot_counts: BaseSnapshotCounts::default(),
             last_frame_work: FrameWork::default(),
+            scroll_tiles: scroll_tiles::ScrollTiles::new(),
             payloads: PaintLayerPayloadCache::with_config(
                 renderer_paint_layer_payload_cache_config(config),
             ),
@@ -3317,6 +3324,7 @@ impl RendererCacheManager {
         self.animation_snapshots.retain(|_, snapshot| {
             frame_index.saturating_sub(snapshot.last_used) <= ANIMATION_SNAPSHOT_MAX_UNSEEN_FRAMES
         });
+        self.scroll_tiles.begin_frame(frame_index);
         let mut stats = RendererCacheFrameStats::default();
         for bytes in self.payloads.begin_frame(self.frame_index) {
             stats.paint_layer.record_stale_eviction(bytes);
@@ -3371,6 +3379,7 @@ impl RendererCacheManager {
     }
 
     pub fn clear(&mut self) {
+        self.scroll_tiles.clear();
         self.generation = self.generation.wrapping_add(1);
         self.visible_admissions.clear();
         self.stored_run_families.clear();
@@ -4950,6 +4959,24 @@ impl SceneRenderer {
     }
 
     #[doc(hidden)]
+    /// One Raven patch: draw scroll content from tiles (on by default).
+    pub fn set_scroll_tiles(&mut self, enabled: bool) {
+        if !enabled {
+            self.renderer_cache.scroll_tiles.clear();
+        }
+        self.renderer_cache.scroll_tiles.enabled = enabled;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_scroll_tiles_on_cpu(&mut self, on_cpu: bool) {
+        self.renderer_cache.scroll_tiles.on_cpu = on_cpu;
+    }
+
+    /// One Raven patch: scroll tile activity since the renderer was made.
+    pub fn scroll_tile_counts(&self) -> ScrollTileCounts {
+        self.renderer_cache.scroll_tiles.counts
+    }
+
     pub fn enable_paint_layer_cache_for_benchmark(&mut self) {
         self.renderer_cache.set_enabled(true);
     }
@@ -7309,6 +7336,68 @@ impl<'video> RenderTraversalMode<'video> for CacheTrackingRenderMode<'_, '_> {
         eligibility: MovingLayerEligibility,
         instrumentation: &mut I,
     ) {
+        // One Raven patch: scroll content from tiles (renderer/scroll_tiles.rs).
+        if layer.id.role == PaintLayerReason::ScrollContent
+            && self.cache_tracking.renderer_cache.scroll_tiles.enabled
+        {
+            let cache = &mut *self.cache_tracking.renderer_cache;
+            let frame_index = cache.frame_index;
+            match cache.scroll_tiles.draw(
+                canvas,
+                layer,
+                options,
+                self.cache_tracking.gpu_context.as_deref_mut(),
+                frame_index,
+            ) {
+                scroll_tiles::TileDraw::Fallback => {}
+                scroll_tiles::TileDraw::Drawn { direct, overlays } => {
+                    let matrix = canvas.local_to_device();
+                    let mut region = skia_safe::Region::new();
+                    for rect in &direct {
+                        region.op_rect(*rect, skia_safe::region::RegionOp::Union);
+                    }
+                    if !direct.is_empty() {
+                        canvas.save();
+                        canvas.reset_matrix();
+                        canvas.clip_region(&region, None);
+                        canvas.set_matrix(&matrix);
+                        SceneRenderer::render_paint_layer_content_in_mode(
+                            canvas,
+                            layer,
+                            &layer.content.nodes,
+                            self,
+                            options,
+                            eligibility,
+                            instrumentation,
+                        );
+                        canvas.restore();
+                    }
+                    if let Some(overlays) = overlays {
+                        canvas.save();
+                        if !direct.is_empty() {
+                            canvas.reset_matrix();
+                            canvas.clip_region(&region, skia_safe::ClipOp::Difference);
+                            canvas.set_matrix(&matrix);
+                        }
+                        let mut mode = scroll_tiles::OverlayMode {
+                            inner: self,
+                            overlays: &overlays,
+                        };
+                        SceneRenderer::render_paint_layer_content_in_mode(
+                            canvas,
+                            layer,
+                            &layer.content.nodes,
+                            &mut mode,
+                            options,
+                            eligibility,
+                            instrumentation,
+                        );
+                        canvas.restore();
+                    }
+                    return;
+                }
+            }
+        }
         #[cfg(any(feature = "opengl", feature = "vulkan", feature = "macos"))]
         if crate::render_scene::renderer_animation_snapshot_eligible(layer)
             && let Some(gr_context) = self.cache_tracking.gpu_context.as_mut()
@@ -9239,7 +9328,9 @@ fn draw_border_with_fast_path(
             let fill_paint = solid_border_paint(color);
             if solid_border_fast_paths {
                 draw_solid_border_rrect(canvas, outer_rrect, inner_rrect, &fill_paint);
-            } else {
+            } else if !inner_rrect.is_some_and(|inner_rrect| {
+                draw_uniform_border_stroke_on_gpu(canvas, outer_rrect, inner_rrect, &fill_paint)
+            }) {
                 let band_path = border_band_path(outer_rrect, inner_rrect);
                 canvas.draw_path(&band_path, &fill_paint);
             }
@@ -9299,10 +9390,78 @@ fn draw_solid_border_rrect(
     paint: &Paint,
 ) {
     if let Some(inner_rrect) = inner_rrect {
+        // One Raven patch: see `draw_uniform_border_stroke_on_gpu`.
+        if draw_uniform_border_stroke_on_gpu(canvas, outer_rrect, inner_rrect, paint) {
+            return;
+        }
         canvas.draw_drrect(outer_rrect, inner_rrect, paint);
     } else {
         canvas.draw_rrect(outer_rrect, paint);
     }
+}
+
+/// One Raven patch: a uniform border with equal circular corners drawn as a
+/// stroked rounded rect, which the GPU draws analytically. As a band path
+/// (every border inside a clip) or a difference of two rounded rects, Ganesh
+/// fell back to its software path renderer: a CPU mask rasterized and
+/// uploaded per border per frame (~20% of a scroll frame's render on the
+/// hub). GPU only: the CPU stroker's arcs drift from the exact band.
+fn draw_uniform_border_stroke_on_gpu(
+    canvas: &skia_safe::Canvas,
+    outer_rrect: RRect,
+    inner_rrect: RRect,
+    paint: &Paint,
+) -> bool {
+    if canvas.recording_context().is_none() {
+        return false;
+    }
+    let Some((stroke_rrect, width)) = uniform_border_stroke(outer_rrect, inner_rrect) else {
+        return false;
+    };
+    let mut stroke = paint.clone();
+    stroke.set_style(PaintStyle::Stroke);
+    stroke.set_stroke_width(width);
+    canvas.draw_rrect(stroke_rrect, &stroke);
+    true
+}
+
+/// One Raven patch: the stroke (centre rounded rect, width) that paints the
+/// band between `outer` and `inner`, when the band is equally wide on every
+/// side and its corners are circular and equal, with an inner radius of at
+/// least zero (square corners, or corners at least as round as the band).
+/// Bands of 1 px or less keep the band: Skia draws so thin a stroke as a
+/// modulated hairline, whose coverage differs.
+fn uniform_border_stroke(outer: RRect, inner: RRect) -> Option<(RRect, f32)> {
+    use skia_safe::rrect::Corner;
+    let (o, i) = (outer.rect(), inner.rect());
+    let width = i.left - o.left;
+    let near = |a: f32, b: f32| (a - b).abs() <= 1.0e-3;
+    if !(width > 1.0)
+        || !near(i.top - o.top, width)
+        || !near(o.right - i.right, width)
+        || !near(o.bottom - i.bottom, width)
+    {
+        return None;
+    }
+    let radius = outer.radii(Corner::UpperLeft).x;
+    let circular_and_equal = [
+        Corner::UpperLeft,
+        Corner::UpperRight,
+        Corner::LowerRight,
+        Corner::LowerLeft,
+    ]
+    .into_iter()
+    .all(|corner| {
+        let r = outer.radii(corner);
+        near(r.x, radius) && near(r.y, radius)
+    });
+    if !circular_and_equal || (radius > 0.0 && radius < width) {
+        return None;
+    }
+    let half = width * 0.5;
+    let centre = o.with_inset((half, half));
+    let centre_radius = (radius - half).max(0.0);
+    Some((RRect::new_rect_xy(centre, centre_radius, centre_radius), width))
 }
 
 fn draw_single_edge_solid_border_rect(
@@ -9571,6 +9730,60 @@ fn border_edge_clip_quads(rect: RectSpec, insets: EdgeInsets) -> [(f32, [(f32, f
 mod tests {
     use super::*;
     use crate::render_scene::{PaintLayerPlacement, PaintLayerReason};
+
+    // One Raven patch: the stroked fast path paints what the band did.
+    #[test]
+    fn uniform_rounded_borders_stroke_the_same_band() {
+        let paint_band = |outer: RRect, inner: RRect, stroke: bool| {
+            let mut surface = skia_safe::surfaces::raster_n32_premul((64, 64)).expect("surface");
+            surface.canvas().clear(skia_safe::Color::WHITE);
+            let mut paint = Paint::default();
+            paint.set_anti_alias(true);
+            paint.set_color(skia_safe::Color::BLACK);
+            if stroke {
+                let (centre, width) = uniform_border_stroke(outer, inner).expect("stroke");
+                paint.set_style(PaintStyle::Stroke);
+                paint.set_stroke_width(width);
+                surface.canvas().draw_rrect(centre, &paint);
+            } else {
+                surface.canvas().draw_drrect(outer, inner, &paint);
+            }
+            let info = ImageInfo::new_n32_premul((64, 64), None);
+            let mut pixels = vec![0u8; 64 * 64 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 64 * 4, (0, 0)));
+            pixels
+        };
+        // The CPU stroker matches the band at these sizes (the GPU draws
+        // both exactly).
+        for (width, radius) in [(2.0, 12.0), (3.0, 3.0), (2.0, 0.0), (1.5, 6.5)] {
+            let outer = corner_rrect(Rect::from_xywh(4.5, 6.0, 50.0, 40.0), [radius; 4]);
+            let inner_rect = Rect::from_xywh(4.5 + width, 6.0 + width, 50.0 - 2.0 * width, 40.0 - 2.0 * width);
+            let inner = corner_rrect(inner_rect, [(radius - width).max(0.0); 4]);
+            assert!(uniform_border_stroke(outer, inner).is_some(), "{width} {radius}");
+            let band = paint_band(outer, inner, false);
+            let stroked = paint_band(outer, inner, true);
+            let worst = band
+                .iter()
+                .zip(&stroked)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(worst <= 2, "width {width} radius {radius}: {worst}");
+        }
+        // Thin, uneven or mixed-corner borders keep the band (a stroke of
+        // 1 px or less is drawn as a modulated hairline).
+        let outer = corner_rrect(Rect::from_xywh(0.0, 0.0, 40.0, 40.0), [8.0; 4]);
+        let inner = corner_rrect(Rect::from_xywh(1.0, 1.0, 38.0, 38.0), [7.0; 4]);
+        assert!(uniform_border_stroke(outer, inner).is_none());
+        let outer = corner_rrect(Rect::from_xywh(0.0, 0.0, 40.0, 40.0), [8.0, 8.0, 0.0, 8.0]);
+        let inner = corner_rrect(Rect::from_xywh(2.0, 2.0, 36.0, 36.0), [6.0, 6.0, 0.0, 6.0]);
+        assert!(uniform_border_stroke(outer, inner).is_none());
+        let outer = corner_rrect(Rect::from_xywh(0.0, 0.0, 40.0, 40.0), [8.0; 4]);
+        let inner = corner_rrect(Rect::from_xywh(2.0, 3.0, 36.0, 35.0), [6.0; 4]);
+        assert!(uniform_border_stroke(outer, inner).is_none());
+        let inner = corner_rrect(Rect::from_xywh(10.0, 10.0, 20.0, 20.0), [0.0; 4]);
+        assert!(uniform_border_stroke(outer, inner).is_none());
+    }
 
     #[test]
     fn asset_raster_lru_enforces_entry_and_byte_limits() {

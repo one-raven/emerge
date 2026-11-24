@@ -92,6 +92,15 @@ pub enum TreeMsg {
         height: f32,
         scale: f32,
     },
+    /// One Raven patch: how far a scroll container is pulled past its edge
+    /// (rubber band), in pixels per axis; drawn only, never hit-tested.
+    SetScrollOverscroll {
+        element_id: NodeId,
+        overscroll: [f32; 2],
+    },
+    /// One Raven patch: compositor scrolling and rubber-band drags on or off
+    /// (`ScrollPhysics`).
+    SetScrollMode { compositor: bool, bounce: bool },
     SetScrollPosition {
         element_id: NodeId,
         position: [f64; 2],
@@ -184,6 +193,7 @@ impl TreeMsg {
     pub(crate) fn target_id(&self) -> Option<NodeId> {
         match self {
             Self::SetScrollPosition { element_id, .. }
+            | Self::SetScrollOverscroll { element_id, .. }
             | Self::ScrollRequest { element_id, .. }
             | Self::ScrollbarThumbDragX { element_id, .. }
             | Self::ScrollbarThumbDragY { element_id, .. }
@@ -196,6 +206,7 @@ impl TreeMsg {
             | Self::SetTextInputRuntime { element_id, .. }
             | Self::SetSliderValue { element_id, .. } => Some(*element_id),
             Self::RequestFrame { .. }
+            | Self::SetScrollMode { .. }
             | Self::UploadTree { .. }
             | Self::PatchTree { .. }
             | Self::Resize { .. }
@@ -208,6 +219,23 @@ impl TreeMsg {
             | Self::AssetStateChanged
             | Self::FontMetricsChanged { .. }
             | Self::Stop => None,
+        }
+    }
+
+    /// One Raven patch: a message that only moves scroll content. The event
+    /// runtime does not wait for a registry after one (see
+    /// `ListenerLaneState::scroll_geometry_pending`).
+    pub(crate) fn is_scroll_motion(&self) -> bool {
+        match self {
+            Self::SetScrollPosition { .. }
+            | Self::SetScrollOverscroll { .. }
+            | Self::ScrollRequest { .. }
+            | Self::ScrollbarThumbDragX { .. }
+            | Self::ScrollbarThumbDragY { .. } => true,
+            Self::Batch(messages) | Self::EventBatch { messages, .. } => {
+                !messages.is_empty() && messages.iter().all(Self::is_scroll_motion)
+            }
+            _ => false,
         }
     }
 
@@ -232,6 +260,8 @@ impl TreeMsg {
             // immediately by the event runtime, so text dragging must not wait
             // for a registry round trip on every pointer move.
             Self::SetTextInputRuntime { .. } => false,
+            // One Raven patch: drawn only.
+            Self::SetScrollOverscroll { .. } | Self::SetScrollMode { .. } => false,
             Self::RequestFrame { .. }
             | Self::AnimationPulse { .. }
             | Self::SampleAnimation { .. }
@@ -272,6 +302,8 @@ pub enum EventMsg {
     },
     SetInputMask(u32),
     SetInputTarget(Option<LocalPid>),
+    /// One Raven patch: tunable scroll physics (`Emerge.Config.Scroll`).
+    SetScrollPhysics(crate::events::ScrollPhysics),
     Stop,
 }
 

@@ -397,6 +397,14 @@ defmodule EmergeSkia.Native do
   @spec set_input_mask(reference(), non_neg_integer()) :: :ok
   def set_input_mask(_renderer, _mask), do: :erlang.nif_error(:nif_not_loaded)
 
+  # One Raven patch: scroll physics (see `Emerge.Config.Scroll`).
+  @doc false
+  def set_scroll_config(_renderer, _config), do: :erlang.nif_error(:nif_not_loaded)
+
+  # One Raven patch: replay a touch gesture natively (see `EmergeSkia.inject_touch/2`).
+  @doc false
+  def inject_touch(_renderer, _samples), do: :erlang.nif_error(:nif_not_loaded)
+
   @doc """
   Set the target process to receive input events.
 

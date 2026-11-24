@@ -731,6 +731,8 @@ pub struct NodeRuntime {
     pub mouse_down_active: bool,
     pub focused_active: bool,
     pub scrollbar_hover_axis: Option<ScrollbarHoverAxis>,
+    /// One Raven patch: rubber-band overscroll (f32 bits per axis), drawn only.
+    pub scroll_overscroll: [u32; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -746,6 +748,36 @@ pub struct NodeRefreshState {
     /// One Raven patch: the paint-layer rewrites this element's last scroll
     /// or nearby canonicalization made (see `rewrite_layer` in tree/render.rs).
     pub layer_rewrites: RefCell<Vec<LayerRewrite>>,
+    /// One Raven patch: set when anything in this subtree changed for render,
+    /// other than this element's own scroll offset; a scroll container's
+    /// content (`scroll_content_cache`) is reusable only while it is clear.
+    pub scroll_content_dirty: std::cell::Cell<bool>,
+    /// One Raven patch: a scroll container's built content layer, reused
+    /// while only the scroll offset moves (see `ScrollContentCache`).
+    pub scroll_content_cache: RefCell<Option<ScrollContentCache>>,
+    /// One Raven patch: last marked dirty by a scroll offset moving below it.
+    /// Its next build is not cached: a scroll's next step drops it unused,
+    /// and storing it copied the subtree (for the root, the whole scene) on
+    /// every step.
+    pub scroll_moving: std::cell::Cell<bool>,
+    /// One Raven patch: the renderer-driven animation (revision, start) this
+    /// element's last build published. While it is still the element's
+    /// animation, a frame's transform/alpha sample needs no rebuild: the
+    /// render thread samples it on the retained scene.
+    pub built_renderer_animation: std::cell::Cell<Option<(u64, std::time::Instant)>>,
+}
+
+/// One Raven patch: a scroll container's content, built for a culling
+/// window wider than its viewport, in content coordinates, so moving the
+/// scroll offset within the window only moves the layer (see tree/render.rs).
+#[derive(Clone, Debug)]
+pub struct ScrollContentCache {
+    pub key: u64,
+    pub window: crate::tree::geometry::Rect,
+    pub content: Vec<RenderNode>,
+    pub escapes: Vec<RenderNode>,
+    pub text_input_focused: bool,
+    pub text_input_cursor_area: Option<(f32, f32, f32, f32)>,
 }
 
 /// One Raven patch: a paint layer as canonicalization rewrote it. The input
@@ -808,12 +840,17 @@ impl Default for NodeRefreshState {
             registry_subtree_affects: false,
             paint_generation: 1,
             layer_rewrites: RefCell::new(Vec::new()),
+            scroll_content_dirty: std::cell::Cell::new(true),
+            scroll_content_cache: RefCell::new(None),
+            scroll_moving: std::cell::Cell::new(false),
+            built_renderer_animation: std::cell::Cell::new(None),
         }
     }
 }
 
 impl NodeRefreshState {
     fn mark_render_changed(&mut self) {
+        self.scroll_content_dirty.set(true);
         if !self.has_render_damage() {
             self.paint_generation = self.paint_generation.saturating_add(1).max(1);
         }
@@ -1040,6 +1077,7 @@ impl Element {
                 scrollbar_hover_axis: attrs.scrollbar_hover_axis,
                 #[cfg(not(test))]
                 scrollbar_hover_axis: None,
+                scroll_overscroll: [0; 2],
             },
             layout: NodeLayoutState {
                 renderer_animation: None,
@@ -1133,6 +1171,10 @@ impl Element {
                 registry_subtree_affects: self.refresh.registry_subtree_affects,
                 paint_generation: self.refresh.paint_generation,
                 layer_rewrites: RefCell::new(self.refresh.layer_rewrites.borrow().clone()),
+                scroll_content_dirty: std::cell::Cell::new(true),
+                scroll_content_cache: RefCell::new(None),
+                scroll_moving: std::cell::Cell::new(false),
+                built_renderer_animation: std::cell::Cell::new(None),
             },
             lifecycle: self.lifecycle.clone(),
             #[cfg(test)]
@@ -1466,6 +1508,18 @@ pub struct ElementTree {
     detached_layout_cache: Vec<DetachedLayoutSubtreeCache>,
     scroll_refresh_dirty: bool,
     scroll_cache_context_active: bool,
+    /// One Raven patch: scroll containers whose offset moved since the event
+    /// registry was last built. Their registry is marked dirty only when a
+    /// registry is next built (`flush_deferred_scroll_registry`), so a drag
+    /// or fling no longer rebuilds the whole registry every frame.
+    deferred_scroll_registry: Vec<NodeId>,
+    /// One Raven patch: build scroll content for a culling window wider than
+    /// the viewport and move it as a layer (see `ScrollContentCache`). On by
+    /// default; `Emerge.Config.Scroll.compositor` turns it off.
+    pub(crate) compositor_scroll: bool,
+    /// One Raven patch: set while marking a scroll move, which leaves the
+    /// container's `scroll_content_cache` usable.
+    marking_scroll_move: bool,
     registry_affects_dirty: bool,
     registry_affects_stamp: Option<(u64, u64)>,
     #[cfg(any(test, feature = "bench-diagnostics"))]
@@ -1517,6 +1571,9 @@ impl Default for ElementTree {
             detached_layout_cache: Vec::new(),
             scroll_refresh_dirty: false,
             scroll_cache_context_active: false,
+            deferred_scroll_registry: Vec::new(),
+            compositor_scroll: true,
+            marking_scroll_move: false,
             registry_affects_dirty: true,
             registry_affects_stamp: None,
             #[cfg(any(test, feature = "bench-diagnostics"))]
@@ -2806,12 +2863,14 @@ impl ElementTree {
     fn mark_transform_animation_render_dirty_ix(&mut self, ix: NodeIx) {
         if let Some(element) = self.get_ix_mut(ix) {
             element.refresh.render_fragment_cache.borrow_mut().take();
+            element.refresh.scroll_content_dirty.set(true);
         }
 
         let mut current_ix = parent_ix_from_link(self.parent_link_of(ix));
         while let Some(current) = current_ix {
             if let Some(element) = self.get_ix_mut(current) {
                 element.refresh.render_fragment_cache.borrow_mut().take();
+                element.refresh.scroll_content_dirty.set(true);
                 if !element.refresh.render_dirty {
                     element.refresh.render_descendant_dirty = true;
                 }
@@ -2824,14 +2883,20 @@ impl ElementTree {
     fn mark_refresh_dirty_ix(&mut self, ix: NodeIx, render: bool, registry: bool) {
         let mut current_ix = Some(ix);
         let mut origin = true;
+        let scroll_move = self.marking_scroll_move;
 
         while let Some(ix) = current_ix {
             #[cfg(test)]
             REFRESH_DIRTY_MARKS.with(|count| count.set(count.get() + 1));
             if let Some(element) = self.get_ix_mut(ix) {
                 if render {
+                    let content_dirty = element.refresh.scroll_content_dirty.get();
                     element.refresh.mark_render_changed();
+                    if origin && scroll_move {
+                        element.refresh.scroll_content_dirty.set(content_dirty);
+                    }
                     element.refresh.render_fragment_cache.borrow_mut().take();
+                    element.refresh.scroll_moving.set(scroll_move);
                     if origin {
                         element.refresh.render_dirty = true;
                         element.refresh.render_descendant_dirty = false;
@@ -4260,7 +4325,15 @@ impl ElementTree {
         invalidation
     }
 
+    /// One Raven patch: a scroll offset changes no image source and no
+    /// handler, so it keeps those derived caches (`apply_native_frame_attrs`);
+    /// a mutable access dirtied them and every scroll frame walked the whole
+    /// tree for image sources again.
     pub fn set_scroll_position(&mut self, id: &NodeId, position: [f64; 2]) -> TreeInvalidation {
+        self.apply_native_frame_attrs(|tree| tree.set_scroll_position_inner(id, position))
+    }
+
+    fn set_scroll_position_inner(&mut self, id: &NodeId, position: [f64; 2]) -> TreeInvalidation {
         if !position
             .iter()
             .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
@@ -4279,8 +4352,60 @@ impl ElementTree {
         node.layout.scroll_y = (position[1] * node.layout.scroll_y_max as f64) as f32;
         self.scroll_refresh_dirty = true;
         self.scroll_cache_context_active = true;
-        self.mark_render_and_registry_refresh_dirty(id);
+        self.mark_scroll_moved(id);
         TreeInvalidation::Paint
+    }
+
+    /// One Raven patch: how far a scroll container is pulled past its edge.
+    /// Drawn only (see `CompositorScroll`); the registry ignores it.
+    pub fn set_scroll_overscroll(&mut self, id: &NodeId, overscroll: [f32; 2]) -> TreeInvalidation {
+        self.apply_native_frame_attrs(|tree| {
+            let bits = overscroll.map(|v| if v.is_finite() { v } else { 0.0 }.to_bits());
+            let Some(node) = tree.get_mut(id) else {
+                return TreeInvalidation::None;
+            };
+            if node.runtime.scroll_overscroll == bits {
+                return TreeInvalidation::None;
+            }
+            node.runtime.scroll_overscroll = bits;
+            if let Some(ix) = tree.ix_of(id) {
+                tree.marking_scroll_move = true;
+                tree.mark_refresh_dirty_ix(ix, true, false);
+                tree.marking_scroll_move = false;
+            }
+            TreeInvalidation::Paint
+        })
+    }
+
+    /// One Raven patch: a scroll offset moved. Render is marked now, keeping
+    /// the container's content cache; the registry is marked when one is next
+    /// built (see `deferred_scroll_registry`).
+    fn mark_scroll_moved(&mut self, id: &NodeId) {
+        if let Some(ix) = self.ix_of(id) {
+            self.marking_scroll_move = true;
+            self.mark_refresh_dirty_ix(ix, true, false);
+            self.marking_scroll_move = false;
+        }
+        if !self.deferred_scroll_registry.contains(id) {
+            self.deferred_scroll_registry.push(*id);
+        }
+    }
+
+    /// One Raven patch: whether a scroll moved since the registry was built.
+    pub(crate) fn has_deferred_scroll_registry(&self) -> bool {
+        !self.deferred_scroll_registry.is_empty()
+    }
+
+    /// One Raven patch: mark the registry of every scroll container that
+    /// moved since the last registry build, before building one.
+    pub(crate) fn flush_deferred_scroll_registry(&mut self) {
+        self.apply_native_frame_attrs(|tree| {
+            for id in std::mem::take(&mut tree.deferred_scroll_registry) {
+                if let Some(ix) = tree.ix_of(&id) {
+                    tree.mark_refresh_dirty_ix(ix, false, true);
+                }
+            }
+        });
     }
 
     pub fn set_slider_value(&mut self, id: &NodeId, value: f64) -> TreeInvalidation {
@@ -4333,6 +4458,16 @@ impl ElementTree {
     }
 
     fn apply_scroll_axis(&mut self, id: &NodeId, delta: f32, axis: ScrollAxis) -> TreeInvalidation {
+        // One Raven patch: see `set_scroll_position`.
+        self.apply_native_frame_attrs(|tree| tree.apply_scroll_axis_inner(id, delta, axis))
+    }
+
+    fn apply_scroll_axis_inner(
+        &mut self,
+        id: &NodeId,
+        delta: f32,
+        axis: ScrollAxis,
+    ) -> TreeInvalidation {
         let Some(element) = self.get_mut(id) else {
             return TreeInvalidation::None;
         };
@@ -4367,7 +4502,7 @@ impl ElementTree {
         } else {
             self.scroll_cache_context_active = self.any_active_scroll_offset();
         }
-        self.mark_render_and_registry_refresh_dirty(id);
+        self.mark_scroll_moved(id);
         TreeInvalidation::Paint
     }
 

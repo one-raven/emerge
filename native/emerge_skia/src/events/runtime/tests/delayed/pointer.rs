@@ -384,8 +384,11 @@ fn scroll_capture_and_thumb_capture_do_not_survive_remount_but_same_mount_releas
             if !thumb {
                 host.handle_input(InputEvent::CursorPos { x, y: -10.0 });
             }
+            // One Raven patch: a captured drag scrolls without waiting for a
+            // registry; the moved geometry is only owed.
             assert!(
-                host.driver.awaiting_registry.is_some(),
+                host.driver.awaiting_registry.is_none()
+                    && host.driver.runtime.listener_lane.scroll_geometry_pending,
                 "thumb={thumb} remount={remount} node={node:?} overlay={:?}",
                 host.driver.runtime.runtime_overlay
             );

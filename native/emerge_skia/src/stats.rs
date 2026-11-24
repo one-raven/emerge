@@ -334,6 +334,92 @@ pub struct RendererPipelineStatsSnapshot {
     pub gpu_render_elapsed_disjoint_discarded_samples: u64,
     pub gpu_render_elapsed_pool_saturated_sample_skips: u64,
     pub gpu_render_elapsed_stale_epoch_samples: u64,
+    /// One Raven patch: intervals between presented scenes in this window.
+    pub present_intervals: PresentIntervalSummary,
+}
+
+/// One Raven patch: how evenly scenes reached the screen. Intervals of
+/// `PRESENT_INTERVAL_IDLE_US` or more are idle gaps (no scene was pending),
+/// counted in `idle` and left out of the percentiles. Microseconds, to the
+/// histogram's 250 µs resolution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PresentIntervalSummary {
+    pub count: u64,
+    pub idle: u64,
+    pub total_us: u64,
+    pub p50_us: u32,
+    pub p90_us: u32,
+    pub p99_us: u32,
+    pub max_us: u32,
+}
+
+const PRESENT_INTERVAL_BUCKET_US: u32 = 250;
+const PRESENT_INTERVAL_IDLE_US: u32 = 100_000;
+const PRESENT_INTERVAL_BUCKETS: usize =
+    (PRESENT_INTERVAL_IDLE_US / PRESENT_INTERVAL_BUCKET_US) as usize;
+
+struct PresentIntervalHistogram {
+    last_at: Option<Instant>,
+    buckets: Box<[u32; PRESENT_INTERVAL_BUCKETS]>,
+    count: u64,
+    idle: u64,
+    total_us: u64,
+    max_us: u32,
+}
+
+impl Default for PresentIntervalHistogram {
+    fn default() -> Self {
+        Self {
+            last_at: None,
+            buckets: Box::new([0; PRESENT_INTERVAL_BUCKETS]),
+            count: 0,
+            idle: 0,
+            total_us: 0,
+            max_us: 0,
+        }
+    }
+}
+
+impl PresentIntervalHistogram {
+    fn record(&mut self, at: Instant) {
+        if let Some(last) = self.last_at.replace(at) {
+            let us = at.saturating_duration_since(last).as_micros().min(u32::MAX as u128) as u32;
+            if us >= PRESENT_INTERVAL_IDLE_US {
+                self.idle += 1;
+                return;
+            }
+            self.buckets[(us / PRESENT_INTERVAL_BUCKET_US) as usize] += 1;
+            self.count += 1;
+            self.total_us += u64::from(us);
+            self.max_us = self.max_us.max(us);
+        }
+    }
+
+    fn summary(&self) -> PresentIntervalSummary {
+        let percentile = |p: f64| -> u32 {
+            if self.count == 0 {
+                return 0;
+            }
+            let rank = ((self.count as f64) * p).ceil().max(1.0) as u64;
+            let mut seen = 0u64;
+            for (index, n) in self.buckets.iter().enumerate() {
+                seen += u64::from(*n);
+                if seen >= rank {
+                    return ((index as u32 + 1) * PRESENT_INTERVAL_BUCKET_US).min(self.max_us);
+                }
+            }
+            self.max_us
+        };
+        PresentIntervalSummary {
+            count: self.count,
+            idle: self.idle,
+            total_us: self.total_us,
+            p50_us: percentile(0.5),
+            p90_us: percentile(0.9),
+            p99_us: percentile(0.99),
+            max_us: self.max_us,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -808,6 +894,7 @@ struct RendererPipelineStatsWindow {
     gpu_render_elapsed_disjoint_discarded_samples: u64,
     gpu_render_elapsed_pool_saturated_sample_skips: u64,
     gpu_render_elapsed_stale_epoch_samples: u64,
+    present_intervals: PresentIntervalHistogram,
 }
 
 impl RendererPipelineStatsWindow {
@@ -822,6 +909,7 @@ impl RendererPipelineStatsWindow {
             gpu_render_elapsed_pool_saturated_sample_skips: self
                 .gpu_render_elapsed_pool_saturated_sample_skips,
             gpu_render_elapsed_stale_epoch_samples: self.gpu_render_elapsed_stale_epoch_samples,
+            present_intervals: self.present_intervals.summary(),
         }
     }
 }
@@ -1703,6 +1791,7 @@ impl RendererStatsCollector {
     pub fn record_drm_scene_presented(&self) {
         self.update_pipeline(|pipeline| {
             pipeline.drm_scenes_presented = pipeline.drm_scenes_presented.saturating_add(1);
+            pipeline.present_intervals.record(Instant::now());
         });
     }
 

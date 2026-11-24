@@ -85,10 +85,31 @@ impl DirectEventRuntime {
     // Coalesce callbacks per container, after both axes of a dispatch are applied.
     pub(super) fn resolve_scroll_commands(&mut self, messages: Vec<TreeMsg>) -> Vec<TreeMsg> {
         let mut changed = HashMap::new();
+        // One Raven patch: a drag may pull a container past its edges.
+        let dragging = (self.physics.overscroll == super::Overscroll::Bounce)
+            .then(|| self.drag_motion.as_ref().map(|motion| motion.element_id))
+            .flatten();
+        let mut overscrolled = Vec::new();
         let other: Vec<_> = messages
             .into_iter()
             .filter_map(|message| {
                 let (id, delta) = match message {
+                    TreeMsg::ScrollRequest { element_id, dx, dy }
+                        if dragging.is_some_and(|dragged| dragged == element_id) =>
+                    {
+                        if let Some(session) = self.scroll_sessions.get_mut(&element_id) {
+                            let before = session.position;
+                            if session.drag_by([dx as f64, dy as f64])
+                                && !overscrolled.contains(&element_id)
+                            {
+                                overscrolled.push(element_id);
+                            }
+                            if session.position != before {
+                                changed.entry(element_id).or_insert(before);
+                            }
+                        }
+                        return None;
+                    }
                     TreeMsg::ScrollRequest { element_id, dx, dy } => {
                         (element_id, [dx as f64, dy as f64])
                     }
@@ -140,6 +161,16 @@ impl DirectEventRuntime {
                 })
             })
             .collect();
-        other.into_iter().chain(updates).collect()
+        let overscrolls: Vec<_> = overscrolled
+            .into_iter()
+            .filter_map(|id| {
+                let session = self.scroll_sessions.get(&id)?;
+                Some(TreeMsg::SetScrollOverscroll {
+                    element_id: id,
+                    overscroll: session.overscroll.map(|v| v as f32),
+                })
+            })
+            .collect();
+        other.into_iter().chain(updates).chain(overscrolls).collect()
     }
 }

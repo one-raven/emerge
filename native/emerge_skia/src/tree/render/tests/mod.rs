@@ -7,6 +7,7 @@ mod animated_shadow_scroll_clip;
 mod cache;
 mod canonical;
 mod color;
+mod compositor_scroll;
 mod common;
 mod incremental;
 mod multiline;
