@@ -765,6 +765,10 @@ pub struct NodeRefreshState {
     /// animation, a frame's transform/alpha sample needs no rebuild: the
     /// render thread samples it on the retained scene.
     pub built_renderer_animation: std::cell::Cell<Option<(u64, std::time::Instant)>>,
+    /// One Raven patch: the renderer-driven animation a refresh was last
+    /// dirtied to build. Still unbuilt after that, the element is not drawn
+    /// (outside the scroll window, say), so rebuilding again changes nothing.
+    pub offered_renderer_animation: std::cell::Cell<Option<(u64, std::time::Instant)>>,
 }
 
 /// One Raven patch: a scroll container's content, built for a culling
@@ -844,6 +848,7 @@ impl Default for NodeRefreshState {
             scroll_content_cache: RefCell::new(None),
             scroll_moving: std::cell::Cell::new(false),
             built_renderer_animation: std::cell::Cell::new(None),
+            offered_renderer_animation: std::cell::Cell::new(None),
         }
     }
 }
@@ -1175,6 +1180,7 @@ impl Element {
                 scroll_content_cache: RefCell::new(None),
                 scroll_moving: std::cell::Cell::new(false),
                 built_renderer_animation: std::cell::Cell::new(None),
+            offered_renderer_animation: std::cell::Cell::new(None),
             },
             lifecycle: self.lifecycle.clone(),
             #[cfg(test)]

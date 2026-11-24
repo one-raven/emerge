@@ -2197,6 +2197,17 @@ mod tests {
     // thread samples; the content layer is reused as it is.
     #[test]
     fn scrolling_past_a_renderer_driven_animation_reuses_the_content_layer() {
+        scroll_steps_reuse_content_around_a_loop(1, 10);
+    }
+
+    // One Raven patch: a loop below the scroll window is never built; it must
+    // not count as unsettled and rebuild the content on every scroll step.
+    #[test]
+    fn a_loop_outside_the_scroll_window_does_not_rebuild_the_content() {
+        scroll_steps_reuse_content_around_a_loop(28, 30);
+    }
+
+    fn scroll_steps_reuse_content_around_a_loop(animated: usize, row_count: u8) {
         let root = NodeId::from_term_bytes(vec![1]);
         let column = NodeId::from_term_bytes(vec![2]);
         let mut tree = ElementTree::new();
@@ -2220,7 +2231,7 @@ mod tests {
                 ..Attrs::default()
             },
         ));
-        let rows: Vec<NodeId> = (10..20u8).map(|i| NodeId::from_term_bytes(vec![i])).collect();
+        let rows: Vec<NodeId> = (10..10 + row_count).map(|i| NodeId::from_term_bytes(vec![i])).collect();
         for (index, id) in rows.iter().enumerate() {
             let spin = |deg| Attrs {
                 rotate: Some(deg),
@@ -2238,7 +2249,7 @@ mod tests {
                         g: 40 + index as u8,
                         b: 40,
                     })),
-                    animate: (index == 1).then(|| AnimationSpec {
+                    animate: (index == animated).then(|| AnimationSpec {
                         keyframes: vec![spin(0.0), spin(360.0)],
                         duration_ms: 1000.0,
                         curve: AnimationCurve::Linear,
@@ -2248,6 +2259,7 @@ mod tests {
                 },
             ));
         }
+        let looping = rows[animated];
         tree.set_children(&column, rows).unwrap();
         tree.set_children(&root, vec![column]).unwrap();
         tree.set_root_id(root);
@@ -2284,6 +2296,8 @@ mod tests {
             })
         }
 
+        // The same pixel steps however long the content: 30, 60 and 45 px.
+        let step = 300.0 / (f64::from(row_count) * 40.0 - 100.0);
         let mut engine = TreeUpdateEngine::new(tree, 100, 100);
         engine.set_renderer_driven_animations(true);
         let options = || TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr);
@@ -2313,9 +2327,9 @@ mod tests {
                 .process_messages(vec![TreeMsg::RebuildRegistry], options())
                 .unwrap(),
         );
-        let first = scroll_to(&mut engine, 0.1);
+        let first = scroll_to(&mut engine, 0.1 * step);
         std::thread::sleep(Duration::from_millis(20));
-        let second = scroll_to(&mut engine, 0.2);
+        let second = scroll_to(&mut engine, 0.2 * step);
         let first = scroll_layer(&first.scene.nodes).expect("scroll layer");
         let second = scroll_layer(&second.scene.nodes).expect("scroll layer");
         assert!(first.content.nodes.iter().any(|_| true));
@@ -2328,7 +2342,7 @@ mod tests {
                 .process_messages(
                     vec![TreeMsg::SetScrollPosition {
                         element_id: root,
-                        position: [0.0, 0.15],
+                        position: [0.0, 0.15 * step],
                     }],
                     options(),
                 )
@@ -2337,6 +2351,40 @@ mod tests {
         assert_eq!(crate::tree::animation::take_element_samples(), 0);
         let third = scroll_layer(&third.scene.nodes).expect("scroll layer");
         assert!(Arc::ptr_eq(&first.content, &third.content));
+
+        // Scrolled into view, the loop is drawn with its renderer animation.
+        fn plays_loop(nodes: &[RenderNode], id: u64) -> bool {
+            use crate::render_scene::{PaintLayerReason, RenderPaintLayerContentNode as C};
+            fn layer(layer: &crate::render_scene::RenderPaintLayer, id: u64) -> bool {
+                (layer.id.role == PaintLayerReason::Animation
+                    && layer.id.node_id == id
+                    && layer.renderer_animation.is_some())
+                    || content(&layer.content.nodes, id)
+            }
+            fn content(nodes: &[C], id: u64) -> bool {
+                nodes.iter().any(|node| match node {
+                    C::Own(run) => plays_loop(&run.nodes, id),
+                    C::Child(child) => layer(child, id),
+                    C::ShadowPass { children }
+                    | C::Clip { children, .. }
+                    | C::RelaxedClip { children, .. }
+                    | C::Transform { children, .. }
+                    | C::Alpha { children, .. } => content(children, id),
+                })
+            }
+            nodes.iter().any(|node| match node {
+                RenderNode::PaintLayer(child) => layer(child, id),
+                RenderNode::ShadowPass { children }
+                | RenderNode::Clip { children, .. }
+                | RenderNode::RelaxedClip { children, .. }
+                | RenderNode::Transform { children, .. }
+                | RenderNode::Alpha { children, .. } => plays_loop(children, id),
+                RenderNode::Primitive(_) => false,
+            })
+        }
+        let at_row = (animated as f64 * 40.0 / (f64::from(row_count) * 40.0 - 100.0)).min(1.0);
+        let in_view = scroll_to(&mut engine, at_row);
+        assert!(plays_loop(&in_view.scene.nodes, looping.to_wire_u64()));
     }
 
     #[test]

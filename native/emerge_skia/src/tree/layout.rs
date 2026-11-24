@@ -970,14 +970,32 @@ fn prepare_frame_attrs_measured<M: TextMeasurer>(
 /// One Raven patch: a renderer-driven animation whose layer the render
 /// thread already plays. Re-sampling it in the tree changes nothing drawn
 /// (patch 4), so a frame that refreshes for anything else (a scroll step) skips
-/// it, as an idle frame does.
+/// it, as an idle frame does. So does one a refresh was already dirtied to
+/// build (`offered_renderer_animation`) that still went unbuilt: nothing draws
+/// it (it lies below the scroll window, say), and it is built with its
+/// animation when it comes into view. Counted unsettled, it was re-prepared
+/// on every scroll step and dirtied its ancestors, the whole scroll content.
 fn settled_renderer_driven(tree: &ElementTree, id: &NodeId) -> bool {
     tree.get(id).is_some_and(|element| {
         element.layout.renderer_animation.as_ref().is_some_and(|animation| {
-            element.refresh.built_renderer_animation.get()
-                == Some((animation.revision, animation.started_at))
+            let current = Some((animation.revision, animation.started_at));
+            element.refresh.built_renderer_animation.get() == current
+                || element.refresh.offered_renderer_animation.get() == current
         })
     })
+}
+
+/// One Raven patch: note that a refresh is being dirtied to build `id`'s
+/// renderer-driven animation (see `settled_renderer_driven`).
+fn offer_renderer_driven(tree: &ElementTree, id: &NodeId) {
+    if let Some(element) = tree.get(id) {
+        if let Some(animation) = element.layout.renderer_animation.as_ref() {
+            element
+                .refresh
+                .offered_renderer_animation
+                .set(Some((animation.revision, animation.started_at)));
+        }
+    }
 }
 
 pub(crate) fn prepare_frame_attrs_for_update(
@@ -1139,17 +1157,13 @@ fn mark_animation_refresh_effects_dirty(
             // retained scene; rebuilding it with this frame's sample changes
             // nothing it draws, but dirtied every ancestor (a whole scroll
             // content layer) on every frame anything else refreshed.
-            if tree.get(&effect.id).is_some_and(|element| {
-                element.layout.renderer_animation.as_ref().is_some_and(|animation| {
-                    element.refresh.built_renderer_animation.get()
-                        == Some((animation.revision, animation.started_at))
-                })
-            }) {
+            if settled_renderer_driven(tree, &effect.id) {
                 if registry_refresh {
                     tree.mark_registry_refresh_dirty(&effect.id);
                 }
                 continue;
             }
+            offer_renderer_driven(tree, &effect.id);
             tree.mark_transform_animation_refresh_dirty(&effect.id, registry_refresh);
             continue;
         }

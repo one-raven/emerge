@@ -329,9 +329,18 @@ mod tests {
             .validate()
             .is_err()
         );
+        // One Raven patch: touch (0x100) is a known category.
         assert!(
             LiveConfig {
-                input_mask: 256,
+                input_mask: crate::input::INPUT_MASK_TOUCH,
+                ..config()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            LiveConfig {
+                input_mask: crate::input::INPUT_MASK_ALL + 1,
                 ..config()
             }
             .validate()
