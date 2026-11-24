@@ -3196,6 +3196,8 @@ struct BaseSnapshot {
     color_type: ColorType,
     /// What the snapshot's pixels drew from beyond its nodes, when it was made.
     resource_generation: u64,
+    /// The scene epoch this base was last found equal in.
+    verified_epoch: u64,
     content: Vec<RenderPaintLayerContentNode>,
     /// None until the same base is seen on two consecutive frames.
     image: Option<Image>,
@@ -5273,19 +5275,25 @@ impl SceneRenderer {
             return BaseSnapshotPlan::Off;
         }
         let base = &root.content.nodes[..split];
-        #[cfg(test)]
-        BASE_SNAPSHOT_COMPARES.with(|count| count.set(count.get() + 1));
+        let same_scene = state.scene_epoch != 0
+            && cache.base_snapshot_planned_epoch.replace(state.scene_epoch) == Some(state.scene_epoch);
         let info = surface.image_info();
+        // Within one scene only renderer-driven animations change nodes, and
+        // a base holding one is never kept; so a base verified for this scene
+        // needs no second look.
         let unchanged = cache.base_snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot.root_id == root.id
+            (same_scene && snapshot.verified_epoch == state.scene_epoch)
+                || snapshot.root_id == root.id
                 && snapshot.root_bounds == root.bounds
                 && snapshot.clear_color == state.clear_color
                 && snapshot.dimensions == info.dimensions()
                 && snapshot.color_type == info.color_type()
-                && base_snapshot_content_eq(&snapshot.content, base)
+                && {
+                    #[cfg(test)]
+                    BASE_SNAPSHOT_COMPARES.with(|count| count.set(count.get() + 1));
+                    base_snapshot_content_eq(&snapshot.content, base)
+                }
         });
-        let same_scene = state.scene_epoch != 0
-            && cache.base_snapshot_planned_epoch.replace(state.scene_epoch) == Some(state.scene_epoch);
         if !unchanged {
             // The same scene with a different base: its renderer-driven
             // animations are advancing it in place, so it will differ on
@@ -5302,6 +5310,7 @@ impl SceneRenderer {
                 dimensions: info.dimensions(),
                 color_type: info.color_type(),
                 resource_generation: 0,
+                verified_epoch: state.scene_epoch,
                 content: base.to_vec(),
                 image: None,
             });
@@ -5310,6 +5319,7 @@ impl SceneRenderer {
         let Some(snapshot) = cache.base_snapshot.as_mut() else {
             return BaseSnapshotPlan::Off;
         };
+        snapshot.verified_epoch = state.scene_epoch;
         // Same nodes; the pixels may still depend on an image revision or
         // the font generation, or on something that can't be kept at all.
         let Some(resource_generation) = base_snapshot_resource_generation(base) else {
@@ -16092,8 +16102,9 @@ mod base_snapshot_tests {
         for _ in 0..3 {
             draw(&state);
         }
-        // Two frames to learn the base is unkeepable (store, then check).
-        assert_eq!(compares() - before, 2);
+        // Stored on the first frame, found unkeepable on the second without
+        // a node comparison (same scene), skipped after that.
+        assert_eq!(compares() - before, 0);
 
         let mut next = RenderState::new(frame_scene(), Color::TRANSPARENT, 2, false);
         next.set_scene(frame_scene());
@@ -16102,11 +16113,11 @@ mod base_snapshot_tests {
         assert_eq!(compares() - before, 1, "a new scene is compared again");
     }
 
-    // One Raven patch: a base that changes between frames of one scene (its
-    // animations advance in place) is given up on until the next scene.
+    // One Raven patch: frames that only advance overlay animations of one
+    // scene reuse the snapshot without comparing the base again.
     #[test]
-    fn a_base_animated_in_place_is_given_up_until_the_next_scene() {
-        let mut renderer = SceneRenderer::with_cache_config(RendererCacheConfig {
+    fn a_verified_base_is_not_compared_again_within_its_scene() {
+        let mut cached = SceneRenderer::with_cache_config(RendererCacheConfig {
             enabled: true,
             ..RendererCacheConfig::default()
         });
@@ -16118,23 +16129,29 @@ mod base_snapshot_tests {
         );
         let mut surface = skia_safe::surfaces::raster(&info, None, None).unwrap();
         let compares = || BASE_SNAPSHOT_COMPARES.with(|count| count.get());
-        let mut state = RenderState::new(
-            scene(vec![rect(0.0, 0x112233FF), overlay(1.0)]),
-            Color::TRANSPARENT,
-            1,
-            false,
-        );
+        let page = || scene(vec![rect(0.0, 0x112233FF), rect(40.0, 0x445566FF), overlay(1.0)]);
+        let state = RenderState::new(page(), Color::TRANSPARENT, 1, false);
         let before = compares();
-        for color in [0x112233FFu32, 0x223344FF, 0x334455FF, 0x445566FF] {
-            // Stand-in for an animation advancing the base without a new scene.
-            if let RenderNode::PaintLayer(root) = &mut state.scene.nodes[0] {
-                root.content =
-                    layer(1, PaintLayerReason::Root, vec![rect(0.0, color), overlay(1.0)]).content;
-            }
+        for _ in 0..4 {
             let mut frame = RenderFrame::new(&mut surface, None);
-            renderer.render(&mut frame, &state);
+            cached.render(&mut frame, &state);
         }
-        assert_eq!(compares() - before, 2, "compared until the in-place change was seen");
+        assert_eq!(compares() - before, 0);
+        let counts = cached.base_snapshot_counts();
+        assert_eq!(counts.rasterizations, 1);
+        assert_eq!(counts.draws, 3);
+
+        let mut expected = vec![0u8; 100 * 100 * 4];
+        let (direct, _) =
+            tests::render_scene_graph_to_pixels_and_timings_with_renderer(&mut SceneRenderer::new(), 100, 100, page());
+        surface.read_pixels(&info, expected.as_mut_slice(), 400, (0, 0));
+        assert!(expected == direct, "the snapshot draws what a direct render does");
+
+        let mut next = RenderState::new(page(), Color::TRANSPARENT, 2, false);
+        next.set_scene(page());
+        let mut frame = RenderFrame::new(&mut surface, None);
+        cached.render(&mut frame, &next);
+        assert_eq!(compares() - before, 1, "a new scene's base is compared");
     }
 
     #[test]
