@@ -108,6 +108,8 @@ pub struct AnimationRuntime {
     last_root: Option<(NodeId, u64)>,
     #[cfg(test)]
     sync_node_visits: usize,
+    #[cfg(test)]
+    sync_regular_visits: usize,
 }
 
 impl Clone for AnimationRuntime {
@@ -129,6 +131,8 @@ impl Clone for AnimationRuntime {
             last_root: self.last_root,
             #[cfg(test)]
             sync_node_visits: self.sync_node_visits,
+            #[cfg(test)]
+            sync_regular_visits: self.sync_regular_visits,
         }
     }
 }
@@ -545,11 +549,43 @@ impl AnimationRuntime {
                 continue;
             }
 
-            if tree.was_mounted_after(&id, self.last_seen_revision)
+            // One Raven patch: this scan visits every node whenever the tree
+            // revision moved (every patch), and a node with no animation of
+            // its own paid up to five id lookups here and in
+            // `sync_regular_node` to remove entries that are almost never
+            // there. Same steps, skipping lookups into empty maps.
+            let mount = element.lifecycle.mounted_at_revision;
+            let newly_mounted = mount > self.last_seen_revision;
+            if element.spec.declared.animate.is_none()
+                && element.spec.declared.animate_enter.is_none()
+            {
+                let has_animate = !self.animate_entries.is_empty();
+                let has_enter = !self.enter_entries.is_empty();
+                if newly_mounted
+                    && has_enter
+                    && self
+                        .enter_entries
+                        .get(&id)
+                        .is_none_or(|entry| entry.mount != mount)
+                    && (!has_animate
+                        || self
+                            .animate_entries
+                            .get(&id)
+                            .is_none_or(|entry| entry.mount != mount))
+                {
+                    self.enter_entries.remove(&id);
+                }
+                if has_animate {
+                    self.animate_entries.remove(&id);
+                }
+                continue;
+            }
+
+            if newly_mounted
                 && self
                     .enter_entries
                     .get(&id)
-                    .is_none_or(|entry| entry.mount != element.lifecycle.mounted_at_revision)
+                    .is_none_or(|entry| entry.mount != mount)
                 && self
                     .animate_entries
                     .get(&id)
@@ -576,6 +612,10 @@ impl AnimationRuntime {
                 }
             }
 
+            #[cfg(test)]
+            {
+                self.sync_regular_visits += 1;
+            }
             self.sync_regular_node(tree, id, started_at)?;
         }
 
@@ -1011,17 +1051,36 @@ pub(crate) fn sample_animation_overlays(
         };
     }
 
-    tree.iter_node_pairs().fold(
-        AnimationFrameSamples::default(),
-        |mut frame_samples, (id, element)| {
-            if let Some(sample) = sample_animation_for_element(element, runtime, sample_time) {
-                frame_samples.result.record_sample(id, &sample);
-                frame_samples.samples.insert(id, sample);
+    // One Raven patch: with a runtime, an element samples only from its own
+    // entries in it, so visit just those elements (in tree order, as the
+    // full walk records effects). Every animation frame walked all nodes,
+    // with eight runtime lookups each and the accumulator moved per node:
+    // two thirds of an animation frame on the 29k-node Stress screen.
+    let mut frame_samples = AnimationFrameSamples::default();
+    let mut record = |id: NodeId, element: &super::element::Element| {
+        if let Some(sample) = sample_animation_for_element(element, runtime, sample_time) {
+            frame_samples.result.record_sample(id, &sample);
+            frame_samples.samples.insert(id, sample);
+        }
+    };
+    if let Some(runtime) = runtime {
+        let mut ixs: Vec<_> = runtime
+            .active_node_ids()
+            .iter()
+            .filter_map(|id| tree.ix_of(id))
+            .collect();
+        ixs.sort_unstable();
+        for ix in ixs {
+            if let Some(element) = tree.get_ix(ix) {
+                record(element.id, element);
             }
-
-            frame_samples
-        },
-    )
+        }
+    } else {
+        for (id, element) in tree.iter_node_pairs() {
+            record(id, element);
+        }
+    }
+    frame_samples
 }
 
 pub(crate) fn sample_animation_overlays_for_ids(
@@ -1054,11 +1113,23 @@ pub(crate) fn sample_animation_overlays_for_ids(
         })
 }
 
+#[cfg(test)]
+thread_local! {
+    static ELEMENT_SAMPLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_element_samples() -> usize {
+    ELEMENT_SAMPLES.with(|count| count.replace(0))
+}
+
 fn sample_animation_for_element(
     element: &super::element::Element,
     runtime: Option<&AnimationRuntime>,
     sample_time: Option<Instant>,
 ) -> Option<AnimationSample> {
+    #[cfg(test)]
+    ELEMENT_SAMPLES.with(|count| count.set(count.get() + 1));
     let Some(runtime) = runtime else {
         return element
             .spec
@@ -2915,6 +2986,46 @@ mod tests {
         tree.bump_revision();
         runtime.sync_with_tree(&tree, end);
         assert_eq!(runtime.sync_node_visits, 2002);
+    }
+
+    // One Raven patch: a rescan after a patch, and every frame's sampling,
+    // touch the animated node, not the 1,000 static ones.
+    #[test]
+    fn a_rescan_and_frame_sampling_skip_nodes_without_animations() {
+        let (mut tree, id) = tree_with_element(
+            Attrs {
+                animate: Some(alpha_spec(0.5, 1.0, 200.0)),
+                ..Attrs::default()
+            },
+            1,
+            1,
+        );
+        for n in 100..1100 {
+            tree.insert(Element::with_attrs(
+                NodeId::from_wire_u64(n),
+                ElementKind::El,
+                Vec::new(),
+                Attrs::default(),
+            ));
+        }
+        let start = Instant::now();
+        let mut runtime = AnimationRuntime::default();
+        runtime.sync_with_tree(&tree, start);
+        tree.bump_revision();
+        runtime.sync_with_tree(&tree, start + std::time::Duration::from_millis(10));
+        assert_eq!(runtime.sync_node_visits, 2002);
+        assert_eq!(runtime.sync_regular_visits, 2);
+        assert!(runtime.animate_entry(&id).is_some());
+
+        let _ = take_element_samples();
+        let samples = sample_animation_overlays(
+            &tree,
+            Some(&runtime),
+            Some(start + std::time::Duration::from_millis(50)),
+        );
+        assert_eq!(take_element_samples(), 1);
+        assert_eq!(samples.samples.keys().collect::<Vec<_>>(), vec![&id]);
+        assert!(samples.result.active);
     }
 
     #[test]

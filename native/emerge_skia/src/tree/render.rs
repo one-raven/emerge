@@ -46,8 +46,10 @@ use crate::render_scene::{
 use crate::renderer::{make_font_with_style, measure_text_visual_metrics_with_font};
 #[cfg(any(test, feature = "bench-diagnostics"))]
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
+use std::rc::Rc;
 use std::sync::Arc;
 
 #[cfg(any(test, feature = "bench-diagnostics"))]
@@ -311,6 +313,9 @@ struct RenderTraversal<'a> {
     disable_viewport_culling: bool,
     inside_cacheable_semantic_layer: bool,
     is_root: bool,
+    /// One Raven patch: set while building the content of a scroll container
+    /// (see `ScrollCanon`); the element's local nodes come back canonical.
+    scroll_canon: Option<Rc<ScrollCanon>>,
 }
 
 impl<'a> RenderTraversal<'a> {
@@ -326,6 +331,7 @@ impl<'a> RenderTraversal<'a> {
             disable_viewport_culling,
             inside_cacheable_semantic_layer,
             is_root: false,
+            scroll_canon: self.scroll_canon.clone(),
         }
     }
 
@@ -340,6 +346,7 @@ impl<'a> RenderTraversal<'a> {
             disable_viewport_culling: self.disable_viewport_culling,
             inside_cacheable_semantic_layer: self.inside_cacheable_semantic_layer,
             is_root: false,
+            scroll_canon: self.scroll_canon.clone(),
         }
     }
 
@@ -355,6 +362,16 @@ impl<'a> RenderTraversal<'a> {
         self.inside_cacheable_semantic_layer = true;
         self.is_root = false;
         self
+    }
+
+    fn with_scroll_canon(mut self, scroll_canon: Option<Rc<ScrollCanon>>) -> Self {
+        self.scroll_canon = scroll_canon;
+        self
+    }
+
+    /// Raw nodes, for a branch whose output is canonicalized as a whole.
+    fn raw(self) -> Self {
+        self.with_scroll_canon(None)
     }
 }
 
@@ -495,6 +512,7 @@ fn build_refresh_output_with_semantic_layers(
         disable_viewport_culling: false,
         inside_cacheable_semantic_layer: false,
         is_root: true,
+        scroll_canon: None,
     };
     let subtree = match registry_collector.as_mut() {
         Some(collector) => build_element_subtree(
@@ -640,7 +658,32 @@ fn build_element_subtree<R: RegistryTraversalSink>(
     let host_content_render_ctx = local_transform_render_ctx
         .as_ref()
         .unwrap_or(traversal.render_ctx);
-    let host_content = build_host_content_subtree(
+    // One Raven patch: inside a scroll container's content, an element whose
+    // own wrappers commute with canonicalization (no transform, layer or
+    // media clip) builds its nodes canonical, from its children's canonical
+    // nodes. Any other element builds raw and canonicalizes its own output.
+    // A scroll container starts its own canonical context for its content.
+    let outer_canon = traversal.scroll_canon.clone();
+    let distributive = outer_canon.is_some()
+        && !scroll_content
+        && !declared_animation
+        && transform.is_identity()
+        && !matches!(element.spec.kind, ElementKind::Image | ElementKind::Video);
+    let scroll_canon = scroll_content.then(|| {
+        Rc::new(ScrollCanon::take(
+            element,
+            child_render_ctx.inherited_clip_shapes.clone(),
+        ))
+    });
+    let canonicalize_after_build = canonicalize_scroll_content_after_build();
+    let content_canon = if scroll_content {
+        scroll_canon.clone().filter(|_| !canonicalize_after_build)
+    } else if distributive {
+        outer_canon.clone()
+    } else {
+        None
+    };
+    let mut host_content = build_host_content_subtree(
         tree,
         HostContentBuild {
             element,
@@ -650,13 +693,26 @@ fn build_element_subtree<R: RegistryTraversalSink>(
             scene_state: scene_state.clone(),
         },
         &mut outputs.reborrow(),
-        traversal.for_host_content(
-            host_content_render_ctx,
-            traversal.disable_viewport_culling,
-            semantic_descendants,
-        ),
+        traversal
+            .for_host_content(
+                host_content_render_ctx,
+                traversal.disable_viewport_culling,
+                semantic_descendants,
+            )
+            .with_scroll_canon(content_canon),
         host_registry,
     );
+    if let Some(canon) = scroll_canon {
+        if canonicalize_after_build {
+            host_content.local = canon.nodes(std::mem::take(&mut host_content.local));
+        }
+        canon.store(element);
+    }
+    let own_canon = outer_canon.as_ref().filter(|_| distributive);
+    let canonical = |nodes: Vec<RenderNode>| match own_canon {
+        Some(canon) => canon.nodes(nodes),
+        None => nodes,
+    };
 
     let outer_shadow_nodes = collect_box_shadow_nodes(render_frame, attrs, radius, false);
     let background_nodes = build_background_nodes(render_frame, attrs);
@@ -680,26 +736,29 @@ fn build_element_subtree<R: RegistryTraversalSink>(
             &traversal.render_ctx.shadow_clip_shapes(),
         ))
     } else {
-        wrap_outer_shadow_nodes(outer_shadow_nodes, transform, traversal.render_ctx)
+        canonical(wrap_outer_shadow_nodes(
+            outer_shadow_nodes,
+            transform,
+            traversal.render_ctx,
+        ))
     };
     let mut normal_nodes = Vec::new();
-    normal_nodes.extend(background_nodes);
-    normal_nodes.extend(inset_shadow_nodes);
+    normal_nodes.extend(canonical(background_nodes));
+    normal_nodes.extend(canonical(inset_shadow_nodes));
 
     if scroll_content {
         normal_nodes.extend(wrap_semantic_scroll_content_layer(
             host_content.local,
             element,
             render_frame,
-            &child_render_ctx,
             current_host_clip.clip,
         ));
         normal_nodes.extend(wrap_with_host_clip(scrollbar_nodes, current_host_clip.clip));
     } else {
         normal_nodes.extend(host_content.local);
-        normal_nodes.extend(scrollbar_nodes);
+        normal_nodes.extend(canonical(scrollbar_nodes));
     }
-    normal_nodes.extend(border_nodes);
+    normal_nodes.extend(canonical(border_nodes));
 
     // An image or video without its own box is clipped to its parent's
     // shape. One Raven patch: that clip is applied inside the element's
@@ -717,7 +776,9 @@ fn build_element_subtree<R: RegistryTraversalSink>(
     } else {
         wrap_with_transform
     };
-    let normal_nodes = if let Some(clip) = image_self_clip {
+    let normal_nodes = if let Some(canon) = own_canon {
+        canon.wrap_with_clips(normal_nodes, inherited_host_clips)
+    } else if let Some(clip) = image_self_clip {
         wrap_transform(wrap_with_relaxed_clips(normal_nodes, &[clip]), transform)
     } else if matches!(element.spec.kind, ElementKind::Image | ElementKind::Video) {
         wrap_with_relaxed_clips(wrap_transform(normal_nodes, transform), inherited_host_clips)
@@ -756,6 +817,9 @@ fn build_element_subtree<R: RegistryTraversalSink>(
         }
     } else {
         local = wrap_with_alpha(local, alpha);
+    }
+    if let Some(canon) = outer_canon.as_ref().filter(|_| !distributive) {
+        local = canon.nodes(local);
     }
 
     // The local transform context dropped the outer clip_nearby clips.
@@ -819,6 +883,13 @@ fn element_render_fragment_cache_key(
     hash_font_context(&mut hasher, inherited);
     hasher.write_u8(traversal.disable_viewport_culling as u8);
     hasher.write_u8(traversal.inside_cacheable_semantic_layer as u8);
+    // One Raven patch: canonical scroll content nodes differ from raw ones.
+    if let Some(canon) = &traversal.scroll_canon {
+        hasher.write_u8(1);
+        hasher.write_usize(canon.clips.len());
+        hash_f32_bits(&mut hasher, canon.dx);
+        hash_f32_bits(&mut hasher, canon.dy);
+    }
     key.kind = RenderFragmentCacheKind::Element;
     key.context = hasher.finish();
     Some(key)
@@ -853,23 +924,15 @@ fn hash_font_context(hasher: &mut DefaultHasher, font: &FontContext) {
     text_align.map(|align| align as u8).hash(hasher);
 }
 
+// `canonical_nodes`: the content, built canonical (see `ScrollCanon`).
 fn wrap_semantic_scroll_content_layer(
-    nodes: Vec<RenderNode>,
+    canonical_nodes: Vec<RenderNode>,
     element: &Element,
     render_frame: Frame,
-    child_render_ctx: &RenderBuildContext,
     host_clip: ClipShape,
 ) -> Vec<RenderNode> {
     let scroll_x = element.layout.scroll_x;
     let scroll_y = element.layout.scroll_y;
-    let mut rewriter = LayerRewriter::take(element);
-    let canonical_nodes = offset_render_nodes(
-        remove_composition_clips(nodes, child_render_ctx.full_clip_shapes(), &mut rewriter),
-        scroll_x,
-        scroll_y,
-        &mut rewriter,
-    );
-    rewriter.store(element);
     let nominal_bounds = Rect::from_frame(render_frame);
     let content_bounds = paint_layer_bounds_from_visual_bounds(
         paint_layer_own_content_visual_bounds(&canonical_nodes),
@@ -918,6 +981,8 @@ fn remove_composition_clip_node(
     rewriter: &mut LayerRewriter,
     out: &mut Vec<RenderNode>,
 ) {
+    #[cfg(test)]
+    CANONICALIZED_NODES.with(|count| count.set(count.get() + 1));
     match node {
         RenderNode::Clip { clips, children } => rebuild_composition_clip_node(
             clips,
@@ -949,15 +1014,108 @@ fn remove_composition_clip_node(
             children: remove_composition_clips(children, composition_clips, rewriter),
         }),
         RenderNode::PaintLayer(layer) => {
-            let op = LayerRewriteOp::StripClips(composition_clips.to_vec());
-            out.push(RenderNode::PaintLayer(rewriter.rewrite(&layer, op, |rewriter| {
-                let children =
-                    remove_composition_clips(layer.content_nodes(), composition_clips, rewriter);
-                layer.with_children(children)
-            })));
+            out.push(RenderNode::PaintLayer(strip_layer_clips(
+                &layer,
+                composition_clips,
+                rewriter,
+            )));
         }
         RenderNode::Primitive(_) => out.push(node),
     }
+}
+
+// One Raven patch: a scroll container's content is cached as a layer in
+// canonical form: the clips it inherits (`clips`, its own included) stripped
+// and its scroll offset added back, so scrolling only moves the layer.
+// Upstream built the content raw and canonicalized all of it on every
+// rebuild, so one changed row in a 1,400-node screen under the panel's
+// scroll body copied and rewrote every visible node (about half of a
+// visible one-switch patch). Canonicalizing is a per-node map, so it is
+// built in place: an element whose own wrappers commute with it (clips and
+// alpha only) wraps its children's canonical nodes and canonicalizes just
+// what it adds, and a clean child hands back its cached canonical nodes.
+// Anything else (a transform, a layer, a nearby branch) is built raw and
+// canonicalized as a whole, as before.
+struct ScrollCanon {
+    clips: Arc<[ClipShape]>,
+    dx: f32,
+    dy: f32,
+    rewriter: RefCell<LayerRewriter>,
+}
+
+impl ScrollCanon {
+    fn take(element: &Element, clips: Arc<[ClipShape]>) -> Self {
+        Self {
+            clips,
+            dx: element.layout.scroll_x,
+            dy: element.layout.scroll_y,
+            rewriter: RefCell::new(LayerRewriter::take(element)),
+        }
+    }
+
+    fn store(&self, element: &Element) {
+        let rewriter = std::mem::replace(
+            &mut *self.rewriter.borrow_mut(),
+            LayerRewriter {
+                previous: Vec::new(),
+                current: Vec::new(),
+            },
+        );
+        rewriter.store(element);
+    }
+
+    /// Canonicalize raw nodes.
+    fn nodes(&self, nodes: Vec<RenderNode>) -> Vec<RenderNode> {
+        if nodes.is_empty() {
+            return nodes;
+        }
+        let mut rewriter = self.rewriter.borrow_mut();
+        let stripped = remove_composition_clips(nodes, &self.clips, &mut rewriter);
+        offset_render_nodes(stripped, self.dx, self.dy, &mut rewriter)
+    }
+
+    /// `wrap_with_clips` over canonical nodes, canonical: the clips stripped
+    /// and offset as `nodes` would do to the clip nodes the wrap makes.
+    fn wrap_with_clips(&self, nodes: Vec<RenderNode>, clips: &[ClipShape]) -> Vec<RenderNode> {
+        let kept: Vec<ClipShape> = clips
+            .iter()
+            .filter(|clip| !self.clips.contains(clip))
+            .map(|clip| clip.offset(-self.dx, -self.dy))
+            .collect();
+        // With no clip left every group the wrap makes is spliced back in
+        // order; otherwise each node keeps its escape grouping (a spliced
+        // node never escapes a remaining clip it inherited).
+        wrap_with_clips(nodes, &kept)
+    }
+}
+
+// Test reference: build scroll content raw and canonicalize it at the
+// container, as upstream does.
+#[cfg(test)]
+thread_local! {
+    static CANONICALIZE_AFTER_BUILD: Cell<bool> = const { Cell::new(false) };
+    static CANONICALIZED_NODES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn canonicalize_scroll_content_after_build() -> bool {
+    CANONICALIZE_AFTER_BUILD.with(Cell::get)
+}
+
+#[cfg(not(test))]
+fn canonicalize_scroll_content_after_build() -> bool {
+    false
+}
+
+#[cfg(test)]
+pub(crate) fn set_canonicalize_scroll_content_after_build(enabled: bool) {
+    CANONICALIZE_AFTER_BUILD.with(|flag| flag.set(enabled));
+}
+
+/// Render nodes a clip strip has visited since the last call.
+#[cfg(test)]
+pub(crate) fn take_canonicalized_nodes() -> usize {
+    CANONICALIZED_NODES.with(|count| count.replace(0))
 }
 
 // One Raven patch: a scroll container's content is canonicalized on every
@@ -1038,6 +1196,116 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_layer_rewrites_computed() -> usize {
     LAYER_REWRITES_COMPUTED.with(|count| count.replace(0))
+}
+
+fn strip_layer_clips(
+    layer: &RenderPaintLayer,
+    composition_clips: &[ClipShape],
+    rewriter: &mut LayerRewriter,
+) -> RenderPaintLayer {
+    let op = LayerRewriteOp::StripClips(composition_clips.to_vec());
+    rewriter.rewrite(layer, op, |rewriter| {
+        if layer.id.role == PaintLayerReason::ScrollContent
+            && strip_keeps_content(&layer.content.nodes, composition_clips)
+        {
+            return layer_with_stripped_child_layers(layer, composition_clips, rewriter);
+        }
+        let children = remove_composition_clips(layer.content_nodes(), composition_clips, rewriter);
+        layer.with_children(children)
+    })
+}
+
+// One Raven patch: a nested scroll container's layer has had its inherited
+// clips stripped already, so an outer strip (a nearby boundary over the page)
+// usually finds nothing to remove in it, yet copied its whole content out and
+// rebuilt it whenever the content changed: a second full pass over the list.
+// When no clip node in it would change, the result is the same layer with its
+// child layers stripped (their own rewrites), so build exactly that. Only for
+// scroll content: it is built in composition form, which the rebuild would
+// reproduce, and its metrics' visual bounds already cover its own nodes.
+fn strip_keeps_content(content: &[RenderPaintLayerContentNode], clips: &[ClipShape]) -> bool {
+    content.iter().all(|node| match node {
+        RenderPaintLayerContentNode::Own(run) => run
+            .nodes
+            .iter()
+            .all(|node| matches!(node, RenderNode::Primitive(_))),
+        RenderPaintLayerContentNode::Child(_) | RenderPaintLayerContentNode::ShadowPass { .. } => {
+            true
+        }
+        RenderPaintLayerContentNode::Clip {
+            clips: own,
+            children,
+        }
+        | RenderPaintLayerContentNode::RelaxedClip {
+            clips: own,
+            children,
+        } => {
+            !children.is_empty()
+                && !own.iter().any(|clip| clips.contains(clip))
+                && strip_keeps_content(children, clips)
+        }
+        RenderPaintLayerContentNode::Transform { children, .. }
+        | RenderPaintLayerContentNode::Alpha { children, .. } => {
+            strip_keeps_content(children, clips)
+        }
+    })
+}
+
+fn layer_with_stripped_child_layers(
+    layer: &RenderPaintLayer,
+    clips: &[ClipShape],
+    rewriter: &mut LayerRewriter,
+) -> RenderPaintLayer {
+    fn map(
+        content: &[RenderPaintLayerContentNode],
+        clips: &[ClipShape],
+        rewriter: &mut LayerRewriter,
+    ) -> Vec<RenderPaintLayerContentNode> {
+        content
+            .iter()
+            .map(|node| match node {
+                RenderPaintLayerContentNode::Child(child) => {
+                    RenderPaintLayerContentNode::Child(strip_layer_clips(child, clips, rewriter))
+                }
+                // The strip leaves shadow passes and runs alone.
+                RenderPaintLayerContentNode::Own(_)
+                | RenderPaintLayerContentNode::ShadowPass { .. } => node.clone(),
+                RenderPaintLayerContentNode::Clip {
+                    clips: own,
+                    children,
+                } => RenderPaintLayerContentNode::Clip {
+                    clips: own.clone(),
+                    children: map(children, clips, rewriter),
+                },
+                RenderPaintLayerContentNode::RelaxedClip {
+                    clips: own,
+                    children,
+                } => RenderPaintLayerContentNode::RelaxedClip {
+                    clips: own.clone(),
+                    children: map(children, clips, rewriter),
+                },
+                RenderPaintLayerContentNode::Transform {
+                    transform,
+                    children,
+                } => RenderPaintLayerContentNode::Transform {
+                    transform: *transform,
+                    children: map(children, clips, rewriter),
+                },
+                RenderPaintLayerContentNode::Alpha { alpha, children } => {
+                    RenderPaintLayerContentNode::Alpha {
+                        alpha: *alpha,
+                        children: map(children, clips, rewriter),
+                    }
+                }
+            })
+            .collect()
+    }
+    RenderPaintLayer {
+        content: Arc::new(RenderPaintLayerContent {
+            nodes: map(&layer.content.nodes, clips, rewriter),
+        }),
+        ..layer.clone()
+    }
 }
 
 fn rebuild_composition_clip_node(
@@ -1347,6 +1615,14 @@ fn build_host_content_subtree<H: HostRegistryTraversalSink>(
         attrs.clip_nearby.unwrap_or(false),
     );
 
+    // One Raven patch: in canonical scroll content (see `ScrollCanon`), child
+    // elements build canonical; every other piece of local content is built
+    // raw and canonicalized here. Escapes stay raw.
+    let canon = traversal.scroll_canon.clone();
+    let canonical = |nodes: Vec<RenderNode>| match &canon {
+        Some(canon) => canon.nodes(nodes),
+        None => nodes,
+    };
     let mut subtree = RenderSubtree::default();
     let slider_slots = (element.spec.kind == ElementKind::Slider)
         .then(|| tree.child_ixs(element_ix))
@@ -1357,16 +1633,17 @@ fn build_host_content_subtree<H: HostRegistryTraversalSink>(
     if element.spec.kind == ElementKind::Paragraph {
         for mount in tree.local_nearby_mounts_ix(element_ix) {
             let branch_registry = registry.local_nearby_traversal(scene_state.as_ref());
-            let branch_subtree = build_nearby_mount_subtree(
+            let mut branch_subtree = build_nearby_mount_subtree(
                 tree,
                 mount.ix,
                 mount.slot,
                 element_context,
                 &mut outputs.reborrow(),
-                traversal.for_branch(&child_render_ctx),
+                traversal.for_branch(&child_render_ctx).raw(),
                 scene_state.clone(),
                 branch_registry,
             );
+            branch_subtree.local = canonical(std::mem::take(&mut branch_subtree.local));
             subtree.extend_local(branch_subtree);
         }
     } else {
@@ -1374,16 +1651,17 @@ fn build_host_content_subtree<H: HostRegistryTraversalSink>(
         element.for_each_retained_local_branch(tree, |branch| match branch {
             RetainedLocalBranchRef::Nearby(mount) => {
                 let branch_registry = registry.local_nearby_traversal(scene_state.as_ref());
-                let branch_subtree = build_nearby_mount_subtree(
+                let mut branch_subtree = build_nearby_mount_subtree(
                     tree,
                     mount.ix,
                     mount.slot,
                     element_context,
                     &mut outputs.reborrow(),
-                    traversal.for_branch(&child_render_ctx),
+                    traversal.for_branch(&child_render_ctx).raw(),
                     scene_state.clone(),
                     branch_registry,
                 );
+                branch_subtree.local = canonical(std::mem::take(&mut branch_subtree.local));
                 subtree.extend_local(branch_subtree);
             }
             RetainedLocalBranchRef::Child(child) => {
@@ -1413,7 +1691,7 @@ fn build_host_content_subtree<H: HostRegistryTraversalSink>(
                 let child_traversal =
                     traversal.for_child(child_scene_ctx.clone(), &child_render_ctx);
                 let child_traversal = if slider_value_slot {
-                    child_traversal.within_cacheable_semantic_layer()
+                    child_traversal.within_cacheable_semantic_layer().raw()
                 } else {
                     child_traversal
                 };
@@ -1429,7 +1707,7 @@ fn build_host_content_subtree<H: HostRegistryTraversalSink>(
                     slider_value_subtree.extend_local(branch_subtree);
                     if slider_thumb_slot {
                         subtree.merge_outputs(&slider_value_subtree);
-                        subtree.local.extend(wrap_with_paint_layer(
+                        subtree.local.extend(canonical(wrap_with_paint_layer(
                             std::mem::take(&mut slider_value_subtree.local),
                             element.id.to_wire_u64(),
                             PaintLayerPlacement::Fixed,
@@ -1437,7 +1715,7 @@ fn build_host_content_subtree<H: HostRegistryTraversalSink>(
                             PaintLayerReason::SliderValue,
                             render_frame,
                             None,
-                        ));
+                        )));
                         subtree.escapes.append(&mut slider_value_subtree.escapes);
                         slider_value_emitted = true;
                     }
@@ -1450,7 +1728,7 @@ fn build_host_content_subtree<H: HostRegistryTraversalSink>(
 
     if slider_slots.is_some() && !slider_value_emitted {
         subtree.merge_outputs(&slider_value_subtree);
-        subtree.local.extend(wrap_with_paint_layer(
+        subtree.local.extend(canonical(wrap_with_paint_layer(
             std::mem::take(&mut slider_value_subtree.local),
             element.id.to_wire_u64(),
             PaintLayerPlacement::Fixed,
@@ -1458,7 +1736,7 @@ fn build_host_content_subtree<H: HostRegistryTraversalSink>(
             PaintLayerReason::SliderValue,
             render_frame,
             None,
-        ));
+        )));
         subtree.escapes.append(&mut slider_value_subtree.escapes);
     }
 
@@ -1483,24 +1761,25 @@ fn build_host_content_subtree<H: HostRegistryTraversalSink>(
         subtree.text_input_cursor_area = own_text_input_cursor_area;
     }
 
-    subtree.local.extend(wrap_own_content_nodes(
+    subtree.local.extend(canonical(wrap_own_content_nodes(
         own_content_nodes,
         attrs,
         element.spec.kind,
         current_host_clip.clip,
-    ));
+    )));
 
     if element.spec.kind == ElementKind::Paragraph {
-        let paragraph_subtree = build_paragraph_subtree(
+        let mut paragraph_subtree = build_paragraph_subtree(
             tree,
             element,
             element_context,
             &mut outputs.reborrow(),
-            traversal.for_branch(&child_render_ctx),
+            traversal.for_branch(&child_render_ctx).raw(),
             scene_state.clone(),
             current_host_clip.clip,
             &mut registry,
         );
+        paragraph_subtree.local = canonical(std::mem::take(&mut paragraph_subtree.local));
         subtree.extend_local(paragraph_subtree);
     }
 
@@ -1513,7 +1792,7 @@ fn build_host_content_subtree<H: HostRegistryTraversalSink>(
             mount.slot,
             element_context,
             &mut outputs.reborrow(),
-            traversal.for_branch(&escape_render_ctx),
+            traversal.for_branch(&escape_render_ctx).raw(),
             scene_state.clone(),
             ReuseCleanRegistryTraversal,
         ));

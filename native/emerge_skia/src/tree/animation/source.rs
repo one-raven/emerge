@@ -59,6 +59,24 @@ impl PresentationSource {
         })
         .collect()
     }
+    /// The first entry of `attachment_path`.
+    fn attachment_entry(
+        tree: &ElementTree,
+        id: &NodeId,
+    ) -> Option<(NodeId, u64, ElementKind, Option<NearbySlot>)> {
+        let ix = tree.ix_of(id)?;
+        let node = tree.get_ix(ix)?;
+        let slot = match tree.parent_link_of(ix) {
+            Some(ParentLink::Nearby { slot, .. }) if Some(node.id) != tree.root_id() => Some(slot),
+            _ => None,
+        };
+        Some((
+            node.id,
+            node.lifecycle.mounted_at_revision,
+            node.spec.kind,
+            slot,
+        ))
+    }
     pub(crate) fn attachment_changed(&self, tree: &ElementTree, id: &NodeId, axis: Axis) -> bool {
         tree.get(id)
             .is_some_and(|node| node.lifecycle.mounted_at_revision == self.mounted_at)
@@ -78,6 +96,14 @@ impl PresentationSource {
             && Arc::ptr_eq(&self.path, &self.transport_origin.path)
     }
     pub fn capture(tree: &ElementTree, id: &NodeId) -> Option<Self> {
+        Self::capture_with_path(tree, id, || Arc::new(Self::attachment_path(tree, id)))
+    }
+
+    fn capture_with_path(
+        tree: &ElementTree,
+        id: &NodeId,
+        path: impl FnOnce() -> Arc<AttachmentPath>,
+    ) -> Option<Self> {
         let node = tree.get(id)?;
         // A mount that has never had layout has no presentation to interrupt.
         node.layout.frame?;
@@ -86,7 +112,7 @@ impl PresentationSource {
             return None;
         }
         let dimensions = [Axis::Width, Axis::Height].map(|axis| capture_axis(tree, id, axis));
-        let path = Arc::new(Self::attachment_path(tree, id));
+        let path = path();
         if path.last().map(|(id, mount, ..)| (*id, *mount)) != published.root {
             return None;
         }
@@ -128,6 +154,16 @@ impl ElementTree {
     /// mount is a different source. The current declaration is the latest target;
     /// keeping a second target copy in this journal would be redundant history.
     pub(crate) fn capture_animation_source(&mut self, id: &NodeId) {
+        self.capture_animation_source_with(id, |tree| {
+            Arc::new(PresentationSource::attachment_path(tree, id))
+        });
+    }
+
+    fn capture_animation_source_with(
+        &mut self,
+        id: &NodeId,
+        path: impl FnOnce(&ElementTree) -> Arc<AttachmentPath>,
+    ) {
         if self
             .pending_patch_effects
             .sources
@@ -139,27 +175,52 @@ impl ElementTree {
         {
             return;
         }
-        if let Some(source) = PresentationSource::capture(self, id) {
+        if let Some(source) = PresentationSource::capture_with_path(self, id, || path(self)) {
             self.invalidate_unapplied_frame();
             self.pending_patch_effects.sources.insert(*id, source);
         }
     }
 
+    // One Raven patch: a re-sort moves whole rows, and every node of each
+    // moved subtree is captured. Each capture walked up to the tree root for
+    // its attachment path, and the source map grew (rehashing its large
+    // entries) as it filled: half of the capture time. A node's path is its
+    // own entry followed by its parent's, so derive it top-down (the same
+    // path, checked against the walk in tests), and size the map once.
     pub(crate) fn capture_animation_subtree(&mut self, root: &NodeId) {
-        let mut pending = vec![*root];
-        let ids: Vec<_> = std::iter::from_fn(|| {
-            let id = pending.pop()?;
-            pending.extend(self.child_ids(&id));
+        let mut nodes: Vec<(NodeId, Option<usize>)> = Vec::new();
+        let mut pending = vec![(*root, None)];
+        while let Some((id, parent)) = pending.pop() {
+            let index = nodes.len();
+            pending.extend(
+                self.child_ids(&id)
+                    .into_iter()
+                    .map(|child| (child, Some(index))),
+            );
             pending.extend(
                 self.nearby_mounts_for(&id)
                     .into_iter()
-                    .map(|mount| mount.id),
+                    .map(|mount| (mount.id, Some(index))),
             );
-            Some(id)
-        })
-        .collect();
-        for id in ids {
-            self.capture_animation_source(&id);
+            nodes.push((id, parent));
+        }
+        self.pending_patch_effects.sources.reserve(nodes.len());
+        let mut paths: Vec<Arc<AttachmentPath>> = Vec::with_capacity(nodes.len());
+        for (id, parent) in nodes {
+            let entry = PresentationSource::attachment_entry(self, &id);
+            let path = match (parent, entry) {
+                (Some(parent), Some(entry)) if self.root_id() != Some(id) => {
+                    let parent_path = &paths[parent];
+                    let mut path = Vec::with_capacity(parent_path.len() + 1);
+                    path.push(entry);
+                    path.extend(parent_path.iter().copied());
+                    Arc::new(path)
+                }
+                _ => Arc::new(PresentationSource::attachment_path(self, &id)),
+            };
+            debug_assert_eq!(*path, PresentationSource::attachment_path(self, &id));
+            paths.push(Arc::clone(&path));
+            self.capture_animation_source_with(&id, |_| path);
         }
     }
 

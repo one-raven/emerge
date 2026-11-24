@@ -411,7 +411,12 @@ pub fn configure(config: AssetConfig) {
 }
 
 pub fn ensure_tree_sources(tree: &ElementTree) {
-    let sources = collect_tree_sources(tree);
+    ensure_sources(&collect_tree_sources(tree));
+}
+
+/// Reconcile asset state with the tree's distinct `sources` (see
+/// `ElementTree::ensure_frame_sources`).
+pub(crate) fn ensure_sources(sources: &[ImageSource]) {
     let active_sources = sources.iter().cloned().collect::<HashSet<_>>();
     let context = current_context();
     if let Ok(mut state) = context.state.lock() {
@@ -1038,9 +1043,22 @@ pub(crate) fn collect_tree_sources(tree: &ElementTree) -> Vec<ImageSource> {
         .into_iter()
         .collect()
 }
+#[cfg(test)]
+thread_local! {
+    static TREE_SOURCE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whole-tree image reference walks since the last call.
+#[cfg(test)]
+pub(crate) fn take_tree_source_walks() -> usize {
+    TREE_SOURCE_WALKS.with(|count| count.replace(0))
+}
+
 fn tree_source_refs(
     tree: &ElementTree,
 ) -> impl Iterator<Item = (ImageSource, Option<crate::tree::element::NodeId>)> + '_ {
+    #[cfg(test)]
+    TREE_SOURCE_WALKS.with(|count| count.set(count.get() + 1));
     tree.iter_nodes().flat_map(|element| {
         let attrs = &element.spec.declared;
         attrs

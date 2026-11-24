@@ -703,7 +703,13 @@ impl TreeUpdateEngine {
                 );
             }
             if animation_sync.completed.invalidation.is_dirty() {
-                mark_animation_effects_dirty_for_update(&mut self.tree, &animation_sync.completed);
+                // One Raven patch: marking layout/refresh dirt changes no
+                // handler or image reference, so keep the caches of those
+                // (each a whole-tree walk to rebuild), as frame preparation
+                // does when it marks the same effects.
+                self.tree.apply_native_frame_attrs(|tree| {
+                    mark_animation_effects_dirty_for_update(tree, &animation_sync.completed)
+                });
                 plan.invalidation.add(animation_sync.completed.invalidation);
             }
             if let Some(started_at) = animation_sync_started_at {
@@ -721,7 +727,7 @@ impl TreeUpdateEngine {
             || (!frame_attr_dirty_ids_complete && plan.invalidation.can_refresh_only());
 
         if should_prepare_frame {
-            assets::ensure_tree_sources(&self.tree);
+            self.tree.ensure_frame_sources();
             self.tree.set_layout_cache_stats_enabled(
                 options
                     .stats
@@ -868,7 +874,7 @@ impl TreeUpdateEngine {
             }
             RefreshDecision::RefreshOnly => {
                 if plan.preparation.is_none() {
-                    assets::ensure_tree_sources(&self.tree);
+                    self.tree.ensure_frame_sources();
                 }
                 let refresh_started_at = patch_frame_active.then(Instant::now);
                 let update = if let Some(preparation) = plan.preparation {
@@ -924,7 +930,7 @@ impl TreeUpdateEngine {
             }
             RefreshDecision::Recompute => {
                 if plan.preparation.is_none() {
-                    assets::ensure_tree_sources(&self.tree);
+                    self.tree.ensure_frame_sources();
                 }
 
                 let constraint = crate::tree::layout::Constraint::new(self.width, self.height);
@@ -1836,7 +1842,7 @@ mod tests {
         out
     }
 
-    fn sidepane_enter_tree_at_start() -> ElementTree {
+    pub(super) fn sidepane_enter_tree_at_start() -> ElementTree {
         let host_id = NodeId::from_term_bytes(vec![10]);
         let sidepane_id = NodeId::from_term_bytes(vec![11]);
 
@@ -3085,7 +3091,7 @@ mod tests {
     }
 
     // One Raven patch: a 40-row column and a SetAttrs that resizes one row.
-    fn sized_column_tree(rows: u8) -> ElementTree {
+    pub(super) fn sized_column_tree(rows: u8) -> ElementTree {
         let root_id = NodeId::from_term_bytes(vec![0]);
         let mut tree = ElementTree::new();
         tree.insert(Element::with_attrs(
@@ -3108,7 +3114,7 @@ mod tests {
         tree
     }
 
-    fn encoded_resize_patch(id: NodeId, width: f64, height: f64) -> Vec<u8> {
+    pub(super) fn encoded_resize_patch(id: NodeId, width: f64, height: f64) -> Vec<u8> {
         let attrs_raw = encoded_size_attrs_raw(width, height);
         let mut out = vec![1];
         out.extend_from_slice(&id.to_wire_u64().to_be_bytes());
@@ -3200,5 +3206,78 @@ mod tests {
             engine.tree().get(&resized).unwrap().layout.frame.unwrap().width,
             20.0
         );
+    }
+}
+
+// One Raven patch: the tree's image references are walked once per patch, and
+// animation frames keep the handler and image caches.
+#[cfg(test)]
+mod frame_cache_tests {
+    use super::tests::{encoded_resize_patch, sidepane_enter_tree_at_start, sized_column_tree};
+    use super::*;
+
+    fn options() -> TreeUpdateOptions<'static> {
+        TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr)
+    }
+
+    #[test]
+    fn a_patch_walks_the_trees_image_references_once() {
+        let mut engine = TreeUpdateEngine::new(sized_column_tree(40), 300, 600);
+        engine
+            .process_messages(
+                vec![TreeMsg::Resize {
+                    width: 300.0,
+                    height: 600.0,
+                    scale: 1.0,
+                }],
+                options(),
+            )
+            .unwrap();
+        let _ = crate::assets::take_tree_source_walks();
+        engine
+            .process_messages(
+                vec![TreeMsg::PatchTree {
+                    bytes: encoded_resize_patch(NodeId::from_term_bytes(vec![7]), 20.0, 20.0),
+                    submitted_at: None,
+                }],
+                options(),
+            )
+            .unwrap();
+        assert_eq!(crate::assets::take_tree_source_walks(), 1);
+    }
+
+    #[test]
+    fn a_finishing_animation_keeps_the_handler_and_image_caches() {
+        let mut engine = TreeUpdateEngine::new(sidepane_enter_tree_at_start(), 360, 240);
+        engine
+            .process_messages(
+                vec![TreeMsg::Resize {
+                    width: 360.0,
+                    height: 240.0,
+                    scale: 1.0,
+                }],
+                options(),
+            )
+            .unwrap();
+        let first = Instant::now() + Duration::from_secs(1);
+        let pulse = |at: Instant| TreeMsg::AnimationPulse {
+            presented_at: at,
+            predicted_next_present_at: at + Duration::from_millis(32),
+            trace: None,
+        };
+        engine
+            .process_messages(vec![pulse(first)], options())
+            .unwrap();
+        assert!(!engine.animation_runtime_is_empty());
+        let _ = crate::assets::take_tree_source_walks();
+        let registry_walks = engine.tree().registry_affects_visit_count();
+
+        // The enter finishes in this frame and marks its effects dirty.
+        engine
+            .process_messages(vec![pulse(first + Duration::from_millis(200))], options())
+            .unwrap();
+        assert!(engine.animation_runtime_is_empty());
+        assert_eq!(crate::assets::take_tree_source_walks(), 0);
+        assert_eq!(engine.tree().registry_affects_visit_count(), registry_walks);
     }
 }

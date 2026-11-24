@@ -1407,9 +1407,7 @@ impl ElementTree {
         }
     }
 
-    /// Cache declared/interaction references across animation ticks. Asset facts
-    /// are captured afresh; no layout or paint work occurs under asset locks.
-    pub(crate) fn capture_frame_assets(&mut self) -> Arc<crate::assets::FrameAssets> {
+    fn frame_source_list(&mut self) -> &crate::assets::FrameSourceList {
         if self.frame_image_sources_dirty
             || self
                 .frame_image_sources
@@ -1422,11 +1420,25 @@ impl ElementTree {
             ));
         }
         self.frame_image_sources_dirty = false;
-        let sources = &self
+        &self
             .frame_image_sources
             .as_ref()
             .expect("initialized source list")
-            .1;
+            .1
+    }
+
+    /// One Raven patch: `assets::ensure_tree_sources` for the tree update,
+    /// from the source list the frame's asset capture keeps. Both walked the
+    /// whole tree for image references on every patch (8% of a one-switch
+    /// patch on the 1,400-node Stress screen); now one walk serves both.
+    pub(crate) fn ensure_frame_sources(&mut self) {
+        crate::assets::ensure_sources(&self.frame_source_list().all);
+    }
+
+    /// Cache declared/interaction references across animation ticks. Asset facts
+    /// are captured afresh; no layout or paint work occurs under asset locks.
+    pub(crate) fn capture_frame_assets(&mut self) -> Arc<crate::assets::FrameAssets> {
+        let sources = self.frame_source_list();
         sources
             .all
             .iter()
