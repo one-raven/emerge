@@ -262,7 +262,7 @@ fn screen() -> ElementTree {
 
 fn change(tree: &mut ElementTree, id: u64) {
     let id = NodeId::from_u64(id);
-    tree.get_mut(&id).expect("node").layout.effective = solid_fill_attrs((7, 7, 7));
+    tree.get_mut(&id).expect("node").layout.effective = solid_fill_attrs((7, 7, 7)).into();
     tree.mark_render_and_registry_refresh_dirty(&id);
 }
 

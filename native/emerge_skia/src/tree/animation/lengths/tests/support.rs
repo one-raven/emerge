@@ -56,7 +56,7 @@ pub(super) fn poses(tree: &ElementTree) -> Poses {
                     mount: node.lifecycle.mounted_at_revision,
                     frame: node.layout.frame,
                     render_frame: node.layout.render_frame,
-                    effective: node.layout.effective.clone(),
+                    effective: (*node.layout.effective).clone(),
                     footprints: [Axis::Width, Axis::Height]
                         .map(|axis| capture_axis(tree, &node.id, axis)),
                     sampled: [Axis::Width, Axis::Height].map(|axis| {
@@ -91,8 +91,8 @@ impl From<&source::PresentationSource> for Source {
         Self {
             mount: s.mounted_at,
             model: s.model,
-            declared: s.declared.clone(),
-            effective: s.effective.clone(),
+            declared: (*s.declared).clone(),
+            effective: (*s.effective).clone(),
             scale: s.scale,
             dimensions: s.dimensions,
             sampled: s.sampled,
@@ -281,7 +281,7 @@ impl Driver {
                     self.tree.capture_animation_source(id);
                     let node = self.tree.get_mut(id).unwrap();
                     let model_changed = layout_model_attrs_changed(&node.spec.declared, attrs);
-                    node.spec.declared = (**attrs).clone();
+                    node.spec.declared = (**attrs).clone().into();
                     if model_changed {
                         self.tree.layout_model_epoch += 1;
                     }
@@ -443,7 +443,7 @@ impl Driver {
         }
     }
     pub fn attrs(&self, id: NodeId) -> Attrs {
-        self.tree.get(&id).unwrap().spec.declared.clone()
+        self.tree.get(&id).unwrap().spec.declared.as_ref().clone()
     }
 }
 

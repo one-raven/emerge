@@ -188,6 +188,8 @@ pub(crate) fn spawn_tree_actor_with_initial_tree(
                 }
                 Err(err) => eprintln!("tree update failed: {err}"),
             }
+            // One Raven patch: drop removed elements after the frame is queued.
+            engine.release_retired();
         }
     })
 }

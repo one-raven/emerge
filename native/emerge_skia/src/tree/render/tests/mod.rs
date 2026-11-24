@@ -12,4 +12,5 @@ mod multiline;
 mod paint;
 mod paragraph;
 mod pipeline;
+mod scroll_nearby_clip;
 mod text;

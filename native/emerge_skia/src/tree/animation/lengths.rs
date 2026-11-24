@@ -789,7 +789,7 @@ impl LengthRuntime {
                                         NodeProjection {
                                             model: sources
                                                 .get(id)
-                                                .map(|source| Arc::new(source.declared.clone())),
+                                                .map(|source| Arc::new((*source.declared).clone())),
                                             ..node.clone()
                                         },
                                     )
@@ -802,7 +802,7 @@ impl LengthRuntime {
                                             (
                                                 *id,
                                                 NodeProjection {
-                                                    model: Some(Arc::new(source.declared.clone())),
+                                                    model: Some(Arc::new((*source.declared).clone())),
                                                     ..Default::default()
                                                 },
                                             )

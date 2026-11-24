@@ -292,7 +292,7 @@ fn declared_float_handoff_and_due_move_are_native_and_transactional() {
                 if due {
                     reparent(&mut d);
                 } else {
-                    let mut attrs = d.tree.get(&id(2)).unwrap().spec.declared.clone();
+                    let mut attrs = d.tree.get(&id(2)).unwrap().spec.declared.as_ref().clone();
                     attrs.align_x = Some(AlignX::Left);
                     let out = d.attempt(
                         600_000,
@@ -535,7 +535,7 @@ fn change_handoff_during_move_uses_first_published_native_source() {
     assert!(d.step(0, vec![]).result.is_ok());
     assert!(d.step(500_000, vec![]).result.is_ok());
     reparent(&mut d);
-    let mut attrs = d.tree.get(&id(2)).unwrap().spec.declared.clone();
+    let mut attrs = d.tree.get(&id(2)).unwrap().spec.declared.as_ref().clone();
     attrs.animate = None;
     attrs.width = Some(Length::Px(100.0));
     attrs.animate_change = Some(Arc::new(vec![ChangePolicy {
@@ -1426,7 +1426,7 @@ fn rebased_inline_decorations_survive_dimension_transport_alignment_and_ghost_cl
                     animate: Some(spec(Length::Px(180.0), Length::Fill, 1000.0, Axis::Width)),
                     animate_exit: Some(spec(Length::Fill, Length::Px(80.0), 250.0, Axis::Width)),
                     ..Default::default()
-                };
+                }.into();
                 tree.get_mut(&id(20)).unwrap().spec.declared.text_align = Some(align);
                 tree.insert(Element::with_attrs(
                     id(4),
@@ -1493,7 +1493,7 @@ fn rebased_inline_decorations_survive_dimension_transport_alignment_and_ghost_cl
                 let source = capture_axis(&d.tree, &id(2), Axis::Width).unwrap();
                 let key = d.tree.length_runtime.as_ref().unwrap().tracks[&(id(2), Axis::Width)].key;
                 reparent(&mut d);
-                let mut attrs = d.tree.get(&id(20)).unwrap().spec.declared.clone();
+                let mut attrs = d.tree.get(&id(20)).unwrap().spec.declared.as_ref().clone();
                 attrs.text_align = Some(TextAlign::Right);
                 let failure = d.attempt(
                     600_000,

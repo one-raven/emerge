@@ -381,7 +381,7 @@ impl EndpointResolver {
                 tree.get_mut(id)
                     .ok_or(ProjectionError::UnknownNode(*id))?
                     .spec
-                    .declared = (**attrs).clone();
+                    .declared = (**attrs).clone().into();
             }
         }
         for (id, seed) in workspace.temporary_seeds.drain().chain(

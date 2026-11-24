@@ -292,6 +292,79 @@ pub struct VirtualKeySpec {
     pub repeat_ms: u32,
 }
 
+/// One Raven patch: `Attrs` shared copy-on-write. An element keeps two
+/// (`spec.declared`, `layout.effective`), ~2.5 KB each inline, and layout,
+/// presentation capture and decoding cloned them per node (layout clones each
+/// node's attrs to hold them across tree mutation, a removed subtree's capture
+/// clones both, decoding cloned the declared attrs into the effective ones).
+/// A clone is now a reference count; writing through `DerefMut` copies only
+/// a shared value (`Arc::make_mut`), so every holder keeps value semantics.
+#[derive(Clone, Default)]
+pub struct SharedAttrs(std::sync::Arc<Attrs>);
+
+impl SharedAttrs {
+    /// Replace the value, reusing the allocation when it isn't shared.
+    pub fn set(&mut self, attrs: Attrs) {
+        match std::sync::Arc::get_mut(&mut self.0) {
+            Some(current) => *current = attrs,
+            None => self.0 = std::sync::Arc::new(attrs),
+        }
+    }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl AsRef<Attrs> for SharedAttrs {
+    fn as_ref(&self) -> &Attrs {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for SharedAttrs {
+    type Target = Attrs;
+    fn deref(&self) -> &Attrs {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SharedAttrs {
+    fn deref_mut(&mut self) -> &mut Attrs {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
+impl From<Attrs> for SharedAttrs {
+    fn from(attrs: Attrs) -> Self {
+        Self(std::sync::Arc::new(attrs))
+    }
+}
+
+impl std::fmt::Debug for SharedAttrs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq for SharedAttrs {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr_eq(other) || *self.0 == *other.0
+    }
+}
+
+impl PartialEq<Attrs> for SharedAttrs {
+    fn eq(&self, other: &Attrs) -> bool {
+        *self.0 == *other
+    }
+}
+
+impl PartialEq<SharedAttrs> for Attrs {
+    fn eq(&self, other: &SharedAttrs) -> bool {
+        *self == *other.0
+    }
+}
+
 /// All decoded attributes for an element.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Attrs {

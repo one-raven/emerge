@@ -2900,7 +2900,7 @@ fn noncanonical_self_and_cross_axis_repeats_interruptions_and_failures_preserve_
                                     };
                                     if vertical {
                                         for node in tree.iter_nodes_mut() {
-                                            let attrs = &mut node.spec.declared;
+                                            let attrs = &mut *node.spec.declared;
                                             std::mem::swap(&mut attrs.width, &mut attrs.height);
                                             if let Some(spec) = attrs.animate.as_mut() {
                                                 for attrs in &mut spec.keyframes {

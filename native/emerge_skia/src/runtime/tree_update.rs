@@ -158,6 +158,12 @@ impl TreeUpdateEngine {
         self.animation_retry.next
     }
 
+    /// One Raven patch: drop the elements the last batch removed (see
+    /// `RetiredElements`), after its frame is out.
+    pub fn release_retired(&mut self) {
+        self.tree.release_retired();
+    }
+
     pub fn animation_runtime_is_empty(&self) -> bool {
         self.animation_runtime.is_empty()
     }
@@ -176,6 +182,9 @@ impl TreeUpdateEngine {
         options: TreeUpdateOptions<'_>,
         tree_batch_started_at: Instant,
     ) -> Result<TreeUpdateEffect, String> {
+        // One Raven patch: the tree actor releases a batch's removed elements
+        // once it has published; any other caller releases them here.
+        self.tree.release_retired();
         self.animation_runtime.observe_presentations();
         let mut flat = Vec::new();
         messages
@@ -226,6 +235,9 @@ impl TreeUpdateEngine {
         let mut frame_attr_dirty_subtree_roots = Vec::new();
         let mut frame_attr_dirty_ids_complete =
             !self.tree.pending_patch_effects.invalidation.is_dirty();
+        // One Raven patch: false once a patch's hints are complete only for a
+        // frame that recomputes layout (see `PatchFrameAttrDirtyHints`).
+        let mut frame_attr_dirty_ids_refresh_complete = true;
         let mut patch_processing_started_ats = Vec::new();
         let mut patch_decode_durations = Vec::new();
         let mut patch_apply_durations = Vec::new();
@@ -362,6 +374,8 @@ impl TreeUpdateEngine {
                         Ok(patch_invalidation) => {
                             invalidation.add(patch_invalidation);
                             if patch_frame_attr_dirty.complete {
+                                frame_attr_dirty_ids_refresh_complete &=
+                                    patch_frame_attr_dirty.refresh_complete;
                                 extend_frame_attr_dirty_ids(
                                     &mut frame_attr_dirty_ids,
                                     patch_frame_attr_dirty.ids,
@@ -724,7 +738,8 @@ impl TreeUpdateEngine {
             || !self.animation_runtime.is_empty()
             || (!frame_attr_dirty_ids.is_empty() && plan.invalidation.can_refresh_only())
             || (!frame_attr_dirty_subtree_roots.is_empty() && plan.invalidation.can_refresh_only())
-            || (!frame_attr_dirty_ids_complete && plan.invalidation.can_refresh_only());
+            || ((!frame_attr_dirty_ids_complete || !frame_attr_dirty_ids_refresh_complete)
+                && plan.invalidation.can_refresh_only());
 
         if should_prepare_frame {
             self.tree.ensure_frame_sources();
@@ -735,6 +750,7 @@ impl TreeUpdateEngine {
             );
             let can_prepare_dirty_incrementally = plan.invalidation.can_refresh_only()
                 && frame_attr_dirty_ids_complete
+                && frame_attr_dirty_ids_refresh_complete
                 && !had_transient_animations;
             // One Raven patch: a patch whose hints are complete (SetAttrs ids,
             // inserted subtree roots) prepares only those nodes even when it
@@ -1156,12 +1172,32 @@ struct PatchFrameAttrDirtyHints {
     ids: Vec<NodeId>,
     subtree_roots: Vec<NodeId>,
     complete: bool,
+    /// One Raven patch: `complete` also for a frame that only refreshes. A
+    /// Remove, or a SetChildren that moves no node to a new parent, changes no
+    /// surviving node's prepared attrs (they follow from its own declaration,
+    /// its samples and its ancestors' layout scale), so it leaves the hints
+    /// complete for a layout frame; replacing a 1,440-row list (Remove,
+    /// InsertSubtree, SetChildren) no longer re-derives every element's attrs.
+    /// A frame that only refreshes keeps upstream's full preparation for them.
+    refresh_complete: bool,
 }
 
 fn patch_frame_attr_dirty_hints(tree: &ElementTree, patches: &[Patch]) -> PatchFrameAttrDirtyHints {
+    // Subtree roots this batch inserts, by parent.
+    let inserted_roots = || {
+        patches.iter().filter_map(|patch| match patch {
+            Patch::InsertSubtree {
+                parent_id: Some(parent),
+                subtree,
+                ..
+            } => subtree.root_id().map(|root| (*parent, root)),
+            _ => None,
+        })
+    };
     patches.iter().fold(
         PatchFrameAttrDirtyHints {
             complete: true,
+            refresh_complete: true,
             ..Default::default()
         },
         |mut hints, patch| {
@@ -1179,9 +1215,20 @@ fn patch_frame_attr_dirty_hints(tree: &ElementTree, patches: &[Patch]) -> PatchF
                     if tree
                         .get(id)
                         .is_some_and(|element| element.spec.declared.animate_exit.is_some()) => {}
-                Patch::SetChildren { .. }
-                | Patch::SetNearbyMounts { .. }
-                | Patch::Remove { .. } => {
+                Patch::Remove { .. } => hints.refresh_complete = false,
+                Patch::SetChildren { id, children }
+                    if tree.ix_of(id).is_some_and(|parent_ix| {
+                        children.iter().all(|child| {
+                            tree.ix_of(child).is_some_and(|child_ix| {
+                                tree.parent_link_of(child_ix)
+                                    == Some(crate::tree::element::ParentLink::Child { parent: parent_ix })
+                            }) || inserted_roots().any(|inserted| inserted == (*id, *child))
+                        })
+                    }) =>
+                {
+                    hints.refresh_complete = false;
+                }
+                Patch::SetChildren { .. } | Patch::SetNearbyMounts { .. } => {
                     hints.complete = false;
                 }
             }
@@ -1680,7 +1727,7 @@ mod tests {
         out
     }
 
-    fn encoded_size_attrs_raw(width: f64, height: f64) -> Vec<u8> {
+    pub(super) fn encoded_size_attrs_raw(width: f64, height: f64) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&2u16.to_be_bytes());
         encode_length_px_attr(&mut out, 1, width);
@@ -3279,5 +3326,310 @@ mod frame_cache_tests {
         assert!(engine.animation_runtime_is_empty());
         assert_eq!(crate::assets::take_tree_source_walks(), 0);
         assert_eq!(engine.tree().registry_affects_visit_count(), registry_walks);
+    }
+}
+
+// One Raven patch: replacing a big subtree (a re-sorted list, a swapped screen)
+// costs what the new subtree costs.
+#[cfg(test)]
+mod subtree_replace_tests {
+    use super::*;
+    use crate::tree::{
+        animation::change::{ChangePolicy, Field},
+        animation::{AnimationCurve, source::SUBTREE_CAPTURE_VISITS},
+        attrs::Attrs,
+        element::{Element, ElementKind},
+        patch::{Patch, apply_patches, decode_patches},
+        serialize::encode_tree,
+    };
+    use std::sync::Arc;
+
+    const ROOT: u64 = 1;
+    const OLD_LIST: u64 = 100;
+    const NEW_LIST: u64 = 5_000;
+    const STATIC: u64 = 9_000;
+
+    fn id(n: u64) -> NodeId {
+        NodeId::from_u64(n)
+    }
+
+    fn el(n: u64, kind: ElementKind, width: f64, height: f64) -> Element {
+        let raw = super::tests::encoded_size_attrs_raw(width, height);
+        let attrs = crate::tree::attrs::decode_attrs(&raw).unwrap();
+        Element::with_attrs(id(n), kind, raw, attrs)
+    }
+
+    /// A list column of `rows` rows, each holding a badge: 1 + 2 * rows nodes.
+    /// Row `i` is `first + 1 + 2i`, its badge `first + 2 + 2i`.
+    fn list(tree: &mut ElementTree, first: u64, rows: u64) {
+        tree.insert(el(first, ElementKind::Column, 300.0, 1000.0));
+        let row_ids: Vec<NodeId> = (0..rows).map(|i| id(first + 1 + 2 * i)).collect();
+        for i in 0..rows {
+            tree.insert(el(first + 1 + 2 * i, ElementKind::Row, 300.0, 20.0));
+            tree.insert(el(first + 2 + 2 * i, ElementKind::El, 10.0 + i as f64, 10.0));
+            tree.set_children(&id(first + 1 + 2 * i), vec![id(first + 2 + 2 * i)])
+                .unwrap();
+        }
+        tree.set_children(&id(first), row_ids).unwrap();
+    }
+
+    /// The root holds the list and a static 21-node section after it.
+    fn screen(list_first: u64, rows: u64) -> ElementTree {
+        let mut tree = ElementTree::new();
+        tree.insert(el(ROOT, ElementKind::Column, 300.0, 1500.0));
+        list(&mut tree, list_first, rows);
+        list(&mut tree, STATIC, 10);
+        tree.set_children(&id(ROOT), vec![id(list_first), id(STATIC)])
+            .unwrap();
+        tree.set_root_id(id(ROOT));
+        tree
+    }
+
+    /// Remove the old list, insert a new one, then the parent's children: the
+    /// shape of the Elixir diff for a re-sorted list or a swapped screen.
+    fn replace_patch(new_list: &ElementTree, new_first: u64) -> Vec<u8> {
+        let bytes = encode_tree(new_list);
+        let mut out = vec![4];
+        out.extend_from_slice(&id(OLD_LIST).to_wire_u64().to_be_bytes());
+        out.push(3);
+        out.extend_from_slice(&id(ROOT).to_wire_u64().to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&bytes);
+        out.push(2);
+        out.extend_from_slice(&id(ROOT).to_wire_u64().to_be_bytes());
+        out.extend_from_slice(&2u16.to_be_bytes());
+        out.extend_from_slice(&id(new_first).to_wire_u64().to_be_bytes());
+        out.extend_from_slice(&id(STATIC).to_wire_u64().to_be_bytes());
+        out
+    }
+
+    fn new_list(rows: u64) -> ElementTree {
+        let mut tree = ElementTree::new();
+        list(&mut tree, NEW_LIST, rows);
+        tree.set_root_id(id(NEW_LIST));
+        tree
+    }
+
+    fn options() -> TreeUpdateOptions<'static> {
+        TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr)
+    }
+
+    fn published(rows: u64) -> TreeUpdateEngine {
+        let mut engine = TreeUpdateEngine::new(screen(OLD_LIST, rows), 300, 2000);
+        let effect = engine
+            .process_messages(vec![TreeMsg::RebuildRegistry], options())
+            .unwrap();
+        assert!(matches!(effect, TreeUpdateEffect::Layout { .. }));
+        assert!(engine.tree().publication.0.is_some());
+        engine
+    }
+
+    fn frames(tree: &ElementTree) -> Vec<(u64, Option<crate::tree::element::Frame>)> {
+        let mut frames: Vec<_> = tree
+            .iter_node_pairs()
+            .map(|(id, node)| (id.0, node.layout.frame))
+            .collect();
+        frames.sort_by_key(|(id, _)| *id);
+        frames
+    }
+
+    #[test]
+    fn a_removed_subtree_keeps_only_the_sources_a_later_read_can_see() {
+        let mut engine = published(30);
+        // A removed row with a change animation, and a removed badge whose id
+        // comes back in the same batch: those two sources stay observable.
+        let animated = id(OLD_LIST + 1 + 2 * 4);
+        engine.tree.get_mut(&animated).unwrap().spec.declared.animate_change =
+            Some(Arc::new(vec![ChangePolicy {
+                field: Field::Width,
+                duration_ms: 100.0,
+                curve: AnimationCurve::Linear,
+            }]));
+        let returning = id(OLD_LIST + 2 + 2 * 7);
+        let mut inserted = new_list(3);
+        inserted.insert(el(returning.0, ElementKind::El, 12.0, 10.0));
+        inserted
+            .set_children(&id(NEW_LIST + 1), vec![id(NEW_LIST + 2), returning])
+            .unwrap();
+        SUBTREE_CAPTURE_VISITS.with(|count| count.set(0));
+
+        let patches = decode_patches(&replace_patch(&inserted, NEW_LIST)).unwrap();
+        apply_patches(&mut engine.tree, patches).unwrap();
+
+        let mut sources: Vec<u64> = engine
+            .tree
+            .pending_patch_effects
+            .sources
+            .keys()
+            .map(|id| id.0)
+            .collect();
+        sources.sort_unstable();
+        // The removed list's root, the parent the new list joins, and the two
+        // observable descendants; not the other 59 removed nodes.
+        assert_eq!(sources, vec![ROOT, OLD_LIST, animated.0, returning.0]);
+        assert_eq!(SUBTREE_CAPTURE_VISITS.with(|count| count.get()), 2);
+    }
+
+    #[test]
+    fn a_removed_subtree_without_a_root_source_is_captured_whole() {
+        // Before the first published frame nothing is captured at all; the
+        // fallback is the full walk, which captures nothing either.
+        let mut tree = screen(OLD_LIST, 5);
+        let patches = decode_patches(&replace_patch(&new_list(2), NEW_LIST)).unwrap();
+        apply_patches(&mut tree, patches).unwrap();
+        assert!(tree.pending_patch_effects.sources.is_empty());
+    }
+
+    #[test]
+    fn replacing_a_list_prepares_only_the_new_list_and_lays_out_as_a_cold_tree() {
+        let mut engine = published(40);
+        let _ = crate::tree::layout::take_frame_attr_prepare_count();
+        let shared_before =
+            crate::tree::layout::SHARED_EFFECTIVE_ATTRS.with(|count| count.get());
+        let effect = engine
+            .process_messages(
+                vec![TreeMsg::PatchTree {
+                    bytes: replace_patch(&new_list(25), NEW_LIST),
+                    submitted_at: None,
+                }],
+                options(),
+            )
+            .unwrap();
+        assert!(matches!(effect, TreeUpdateEffect::Layout { .. }));
+        // The 51 new nodes and the root (its source was captured); upstream
+        // re-derived every node, the static section's 21 included.
+        assert_eq!(crate::tree::layout::take_frame_attr_prepare_count(), 52);
+        assert_eq!(
+            crate::tree::layout::SHARED_EFFECTIVE_ATTRS.with(|count| count.get()) - shared_before,
+            52,
+            "at scale 1 every new node shares its declared attrs"
+        );
+
+        let mut cold = TreeUpdateEngine::new(
+            {
+                let mut tree = screen(NEW_LIST, 25);
+                tree.set_root_id(id(ROOT));
+                tree
+            },
+            300,
+            2000,
+        );
+        cold.process_messages(vec![TreeMsg::RebuildRegistry], options())
+            .unwrap();
+        assert_eq!(frames(engine.tree()), frames(cold.tree()));
+    }
+
+    #[test]
+    fn a_removed_subtree_is_dropped_after_the_frame() {
+        let mut engine = published(10);
+        engine
+            .process_messages(
+                vec![TreeMsg::PatchTree {
+                    bytes: replace_patch(&new_list(2), NEW_LIST),
+                    submitted_at: None,
+                }],
+                options(),
+            )
+            .unwrap();
+        assert_eq!(engine.tree.retired_len(), 21, "the old list waits for the publish");
+        engine.release_retired();
+        assert_eq!(engine.tree.retired_len(), 0);
+        // A caller that never releases gets them dropped by its next batch.
+        engine
+            .process_messages(
+                vec![TreeMsg::UploadTree {
+                    bytes: encode_tree(&screen(OLD_LIST, 1)),
+                    submitted_at: None,
+                }],
+                options(),
+            )
+            .unwrap();
+        assert_eq!(engine.tree.retired_len(), 27, "an upload retires the tree it replaces");
+        engine
+            .process_messages(vec![TreeMsg::RebuildRegistry], options())
+            .unwrap();
+        assert_eq!(engine.tree.retired_len(), 0);
+    }
+
+    #[test]
+    fn inserted_elements_move_into_the_tree_without_copying() {
+        let mut tree = screen(OLD_LIST, 2);
+        let mut patches = decode_patches(&replace_patch(&new_list(2), NEW_LIST)).unwrap();
+        let decoded = patches
+            .iter_mut()
+            .find_map(|patch| match patch {
+                Patch::InsertSubtree { subtree, .. } => {
+                    Some(subtree.get(&id(NEW_LIST + 2)).unwrap() as *const Element)
+                }
+                _ => None,
+            })
+            .unwrap();
+        apply_patches(&mut tree, patches).unwrap();
+        assert_eq!(
+            tree.get(&id(NEW_LIST + 2)).unwrap() as *const Element,
+            decoded,
+            "the decoded element's box moved, not the element"
+        );
+    }
+
+    #[test]
+    fn a_reparenting_set_children_still_prepares_the_whole_tree() {
+        let mut engine = published(4);
+        let _ = crate::tree::layout::take_frame_attr_prepare_count();
+        // Move the first row's badge under the root: its inherited scale can
+        // change, so the hints are incomplete.
+        let mut out = vec![2];
+        out.extend_from_slice(&id(ROOT).to_wire_u64().to_be_bytes());
+        out.extend_from_slice(&2u16.to_be_bytes());
+        out.extend_from_slice(&id(OLD_LIST).to_wire_u64().to_be_bytes());
+        out.extend_from_slice(&id(OLD_LIST + 2).to_wire_u64().to_be_bytes());
+        engine
+            .process_messages(
+                vec![TreeMsg::PatchTree {
+                    bytes: out,
+                    submitted_at: None,
+                }],
+                options(),
+            )
+            .unwrap();
+        assert_eq!(crate::tree::layout::take_frame_attr_prepare_count(), 31);
+    }
+
+    #[test]
+    fn shared_attrs_are_copied_on_write() {
+        use crate::tree::attrs::SharedAttrs;
+        let mut a = SharedAttrs::from(Attrs {
+            spacing: Some(1.0),
+            ..Attrs::default()
+        });
+        let b = a.clone();
+        assert!(a.ptr_eq(&b), "a clone is a reference");
+        a.spacing = Some(2.0);
+        assert_eq!((a.spacing, b.spacing), (Some(2.0), Some(1.0)));
+        assert!(!a.ptr_eq(&b));
+        let unique = &*a as *const Attrs;
+        a.set(Attrs::default());
+        assert_eq!(&*a as *const Attrs, unique, "an unshared value is replaced in place");
+        let element = el(7, ElementKind::El, 1.0, 1.0);
+        assert!(element.spec.declared.ptr_eq(&element.layout.effective));
+    }
+
+    #[test]
+    fn node_id_hashes_spread_counters_and_high_bit_ids() {
+        use std::hash::BuildHasher;
+        let build = std::hash::BuildHasherDefault::<crate::tree::element::NodeIdHasher>::default();
+        for ids in [
+            (1..=4096u64).collect::<Vec<_>>(),
+            (1..=4096u64).map(|n| n << 32).collect(),
+        ] {
+            let buckets: std::collections::HashSet<u64> = ids
+                .iter()
+                .map(|&n| build.hash_one(NodeId::from_u64(n)) & 4095)
+                .collect();
+            // Random placement fills ~2,590; a hash whose low bits ignore the
+            // id's high bits would fill one.
+            assert!(buckets.len() > 2000, "{} of 4096 buckets", buckets.len());
+        }
     }
 }

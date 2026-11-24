@@ -74,6 +74,18 @@ pub(crate) struct LoopAccounting {
     work: [Duration; WORK_KINDS],
     wait: [Duration; WAIT_KINDS],
     draws: u32,
+    animation: AnimationFrames,
+}
+
+/// One Raven patch: frames drawn (or skipped) for renderer-driven
+/// animations alone.
+#[derive(Clone, Copy, Debug, Default)]
+struct AnimationFrames {
+    partial: u32,
+    full: u32,
+    damage_pixels: u64,
+    skipped_unchanged: u32,
+    divisor: u32,
 }
 
 impl LoopAccounting {
@@ -84,7 +96,27 @@ impl LoopAccounting {
             work: [Duration::ZERO; WORK_KINDS],
             wait: [Duration::ZERO; WAIT_KINDS],
             draws: 0,
+            animation: AnimationFrames::default(),
         }
+    }
+
+    /// A frame drawn only to advance renderer-driven animations: a partial
+    /// redraw of `damage_pixels`, or a full one (None).
+    pub(crate) fn animation_frame(&mut self, damage_pixels: Option<u64>, divisor: u32) {
+        match damage_pixels {
+            Some(pixels) => {
+                self.animation.partial = self.animation.partial.saturating_add(1);
+                self.animation.damage_pixels = self.animation.damage_pixels.saturating_add(pixels);
+            }
+            None => self.animation.full = self.animation.full.saturating_add(1),
+        }
+        self.animation.divisor = divisor;
+    }
+
+    /// An animation frame not drawn: nothing it would draw had changed.
+    pub(crate) fn animation_frame_unchanged(&mut self, divisor: u32) {
+        self.animation.skipped_unchanged = self.animation.skipped_unchanged.saturating_add(1);
+        self.animation.divisor = divisor;
     }
 
     pub(crate) fn add_work(&mut self, work: LoopWork, duration: Duration) {
@@ -106,7 +138,9 @@ impl LoopAccounting {
             return None;
         }
         let report = self.format(elapsed);
+        let divisor = self.animation.divisor;
         *self = Self::new(self.window, now);
+        self.animation.divisor = divisor;
         Some(report)
     }
 
@@ -123,8 +157,24 @@ impl LoopAccounting {
         } else {
             ms(draw) / f64::from(self.draws)
         };
+        let animation = self.animation;
+        let animation = if animation.partial + animation.full + animation.skipped_unchanged == 0 {
+            String::new()
+        } else {
+            format!(
+                "; animation-only frames: partial={} (avg {} px) full={} unchanged_skipped={} rate=1/{}",
+                animation.partial,
+                animation
+                    .damage_pixels
+                    .checked_div(u64::from(animation.partial))
+                    .unwrap_or(0),
+                animation.full,
+                animation.skipped_unchanged,
+                animation.divisor.max(1),
+            )
+        };
         format!(
-            "presenter loop over {:.0} ms: draws={} ({:.1}/s, {:.1} ms each); busy {:.0} ms ({:.0}%): draw={:.0} scenes={:.0} skip_check={:.0} events={:.0} commit={:.0} other={:.0}; waiting {:.0} ms ({:.0}%): flip={:.0} buffer={:.0} retry={:.0} idle={:.0}",
+            "presenter loop over {:.0} ms: draws={} ({:.1}/s, {:.1} ms each); busy {:.0} ms ({:.0}%): draw={:.0} scenes={:.0} skip_check={:.0} events={:.0} commit={:.0} other={:.0}; waiting {:.0} ms ({:.0}%): flip={:.0} buffer={:.0} retry={:.0} idle={:.0}{}",
             ms(elapsed),
             self.draws,
             f64::from(self.draws) / elapsed.as_secs_f64(),
@@ -143,6 +193,7 @@ impl LoopAccounting {
             ms(self.wait[LoopWait::Buffer.index()]),
             ms(self.wait[LoopWait::Retry.index()]),
             ms(self.wait[LoopWait::Idle.index()]),
+            animation,
         )
     }
 }
@@ -220,6 +271,35 @@ mod tests {
         assert!(next.contains("draws=0 (0.0/s, 0.0 ms each)"), "{next}");
         assert!(next.contains("busy 2000 ms (100%)"), "{next}");
         assert!(next.contains("flip=0 buffer=0 retry=0 idle=0"), "{next}");
+    }
+
+    #[test]
+    fn animation_only_frames_are_reported_when_there_are_any() {
+        let start = Instant::now();
+        let mut accounting = LoopAccounting::new(Duration::from_secs(2), start);
+        accounting.animation_frame(Some(1_000), 2);
+        accounting.animation_frame(Some(3_000), 2);
+        accounting.animation_frame(None, 2);
+        accounting.animation_frame_unchanged(2);
+        let report = accounting
+            .take_report(start + Duration::from_secs(2))
+            .expect("window passed");
+        assert!(
+            report.ends_with(
+                "; animation-only frames: partial=2 (avg 2000 px) full=1 unchanged_skipped=1 rate=1/2"
+            ),
+            "{report}"
+        );
+        // The rate carries over; an empty window says nothing.
+        let next = accounting
+            .take_report(start + Duration::from_secs(4))
+            .expect("second window passed");
+        assert!(!next.contains("animation-only"), "{next}");
+        accounting.animation_frame_unchanged(2);
+        let third = accounting
+            .take_report(start + Duration::from_secs(6))
+            .expect("third window passed");
+        assert!(third.ends_with("unchanged_skipped=1 rate=1/2"), "{third}");
     }
 
     #[test]

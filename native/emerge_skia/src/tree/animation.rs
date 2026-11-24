@@ -2199,7 +2199,7 @@ mod tests {
         };
         let mut ghost =
             Element::with_attrs(ghost_id, ElementKind::El, Vec::new(), ghost_attrs.clone());
-        ghost.spec.declared = ghost_attrs;
+        ghost.spec.declared = ghost_attrs.into();
         ghost.lifecycle.residency = NodeResidency::Ghost;
         ghost.lifecycle.ghost_attachment = Some(GhostAttachment::Child {
             parent_id: root_id,

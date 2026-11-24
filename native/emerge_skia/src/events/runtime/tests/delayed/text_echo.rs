@@ -182,7 +182,7 @@ fn multiline_word_wrap_updates_height_and_caret_before_controller_echoes() {
     let mut tree = input_tree(ElementKind::Multiline, true);
     let node = tree.get_mut(&NodeId(9)).unwrap();
     node.spec.attrs_raw = raw_attrs("");
-    node.spec.declared = crate::tree::attrs::decode_attrs(&node.spec.attrs_raw).unwrap();
+    node.spec.declared = crate::tree::attrs::decode_attrs(&node.spec.attrs_raw).unwrap().into();
     node.layout.effective = node.spec.declared.clone();
     let (mut engine, mut host, _) = start(tree);
 
@@ -673,7 +673,7 @@ fn animation_geometry_updates_do_not_replay_processed_app_content() {
     let mut tree = input_tree(ElementKind::TextInput, true);
     let input = tree.get_mut(&NodeId(9)).unwrap();
     input.spec.attrs_raw = animated_attrs("");
-    input.spec.declared = crate::tree::attrs::decode_attrs(&input.spec.attrs_raw).unwrap();
+    input.spec.declared = crate::tree::attrs::decode_attrs(&input.spec.attrs_raw).unwrap().into();
     let (mut engine, mut host, changes) = start(tree);
     commit(&mut engine, &mut host, "a");
     host.install_rebuild(response(

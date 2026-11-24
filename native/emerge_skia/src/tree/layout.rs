@@ -1213,7 +1213,7 @@ fn prepare_attrs_flat(
             None => scale,
         };
         dimensions::prepare_scale(element, scale_factor);
-        element.layout.effective = scale_attrs(&frame_attrs, scale_factor);
+        set_effective_attrs(element, frame_attrs, scale_factor);
         element.layout.renderer_animation = samples
             .get(&element.id)
             .and_then(|sample| sample.renderer_driven.clone());
@@ -1322,7 +1322,7 @@ fn prepare_attrs_for_node_ix(
     count_frame_attr_prepare();
     let frame_attrs = frame_declared_attrs(element, samples);
     dimensions::prepare_scale(element, scale_factor);
-    element.layout.effective = scale_attrs(&frame_attrs, scale_factor);
+    set_effective_attrs(element, frame_attrs, scale_factor);
     element.layout.renderer_animation = samples
         .get(&element.id)
         .and_then(|sample| sample.renderer_driven.clone());
@@ -1341,7 +1341,7 @@ fn prepare_attrs_for_single_node(
         count_frame_attr_prepare();
         let frame_attrs = frame_declared_attrs(element, samples);
         dimensions::prepare_scale(element, scale_factor);
-        element.layout.effective = scale_attrs(&frame_attrs, scale_factor);
+        set_effective_attrs(element, frame_attrs, scale_factor);
         element.layout.renderer_animation = samples
             .get(&element.id)
             .and_then(|sample| sample.renderer_driven.clone());
@@ -1349,10 +1349,60 @@ fn prepare_attrs_for_single_node(
     }
 }
 
+/// One Raven patch: at scale 1 `scale_attrs` copies every field (lengths times
+/// 1.0 are the same numbers), except that it rebuilds animation keyframes and
+/// clears the test-only mirror fields. For such attrs the effective attrs are
+/// the declared ones, shared (see `SharedAttrs`): preparing an inserted 29k-node
+/// subtree built and allocated a scaled copy of every node's attrs.
+fn set_effective_attrs(
+    element: &mut Element,
+    frame_attrs: super::attrs::SharedAttrs,
+    scale_factor: f32,
+) {
+    if scale_factor == 1.0 && unscaled_attrs_are_effective(&frame_attrs) {
+        #[cfg(test)]
+        assert_eq!(scale_attrs(&frame_attrs, 1.0), *frame_attrs);
+        #[cfg(test)]
+        SHARED_EFFECTIVE_ATTRS.with(|count| count.set(count.get() + 1));
+        element.layout.effective = frame_attrs;
+    } else {
+        element
+            .layout
+            .effective
+            .set(scale_attrs(&frame_attrs, scale_factor));
+    }
+}
+
+fn unscaled_attrs_are_effective(attrs: &Attrs) -> bool {
+    let animated =
+        attrs.animate.is_some() || attrs.animate_enter.is_some() || attrs.animate_exit.is_some();
+    #[cfg(test)]
+    let mirrored = attrs.scroll_x_max.is_some()
+        || attrs.scroll_y_max.is_some()
+        || attrs.mouse_over_active.is_some()
+        || attrs.mouse_down_active.is_some()
+        || attrs.focused_active.is_some()
+        || attrs.text_input_focused.is_some()
+        || attrs.text_input_cursor.is_some()
+        || attrs.text_input_selection_anchor.is_some()
+        || attrs.text_input_preedit.is_some()
+        || attrs.text_input_preedit_cursor.is_some()
+        || attrs.paragraph_fragments.is_some();
+    #[cfg(not(test))]
+    let mirrored = false;
+    !animated && !mirrored
+}
+
+#[cfg(test)]
+thread_local! {
+    /// One Raven patch: preparations that shared the declared attrs.
+    pub(crate) static SHARED_EFFECTIVE_ATTRS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn frame_declared_attrs(
     element: &Element,
     samples: &HashMap<NodeId, super::animation::AnimationSample>,
-) -> Attrs {
+) -> super::attrs::SharedAttrs {
     let mut attrs = element.spec.declared.clone();
     if let Some(sample) = samples.get(&element.id) {
         apply_sample_attrs(&mut attrs, &sample.attrs);

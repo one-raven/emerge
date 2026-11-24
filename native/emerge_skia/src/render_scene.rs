@@ -403,8 +403,29 @@ pub struct LayerRendererAnimation {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RendererAnimationAdvance {
     pub found: bool,
-    /// Scene area whose pixels changed since the previous advance.
+    /// Scene area whose pixels changed since the previous advance; None with
+    /// `changed` when some change can't be bounded (redraw everything).
     pub damage: Option<Rect>,
+    /// Whether any animated layer moved. A sample that rounds to what is
+    /// already drawn (a hold in the keyframes, or motion far below a pixel)
+    /// is not applied, so a frame with nothing changed needn't be drawn.
+    pub changed: bool,
+    unbounded: bool,
+}
+
+impl RendererAnimationAdvance {
+    fn add_damage(&mut self, rect: Option<Rect>) {
+        self.changed = true;
+        match rect {
+            Some(rect) if !self.unbounded => {
+                self.damage = union_damage_rect(self.damage, rect);
+            }
+            _ => {
+                self.unbounded = true;
+                self.damage = None;
+            }
+        }
+    }
 }
 
 fn union_damage_rect(a: Option<Rect>, b: Rect) -> Option<Rect> {
@@ -493,7 +514,16 @@ fn layer_has_renderer_animation(layer: &RenderPaintLayer) -> bool {
     layer.renderer_animation.is_some() || content_has_renderer_animation(&layer.content.nodes)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Content nodes searched for renderer-driven animations (tests count
+    /// how much of a scene each advance visits).
+    pub(crate) static ANIMATION_SEARCH_NODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn content_has_renderer_animation(nodes: &[RenderPaintLayerContentNode]) -> bool {
+    #[cfg(test)]
+    ANIMATION_SEARCH_NODES.with(|count| count.set(count.get() + nodes.len() as u64));
     nodes.iter().any(|node| match node {
         RenderPaintLayerContentNode::Own(_) => false,
         RenderPaintLayerContentNode::Child(layer) => layer_has_renderer_animation(layer),
@@ -518,47 +548,431 @@ fn advance_layer(
         return;
     }
     found.found = true;
-    let patch = layer.renderer_animation.as_ref().map(|animation| {
-        let (transform, alpha) = animation.sample(at);
-        (
-            animation.current_transform,
-            animation.current_alpha,
-            transform,
-            alpha,
-        )
-    });
+    advance_own(layer, at, found);
     let content = Arc::make_mut(&mut layer.content);
-    if let Some((old_transform, old_alpha, transform, alpha)) = patch {
-        patch_content(
-            &mut content.nodes,
-            old_transform,
-            transform,
-            old_alpha,
-            alpha,
-        );
-        if let Some(animation) = layer.renderer_animation.as_mut() {
-            let animation = Arc::make_mut(animation);
-            // Old and new screen area of this layer: its bounds were measured
-            // under bounds_transform; map them to each transform.
-            if let Some(inverse) = animation.bounds_transform.inverse() {
-                let before = old_transform.then(inverse).map_rect_aabb(layer.bounds);
-                let after = transform.then(inverse).map_rect_aabb(layer.bounds);
-                let pad = |r: Rect| Rect {
-                    x: r.x - 4.0,
-                    y: r.y - 4.0,
-                    width: r.width + 8.0,
-                    height: r.height + 8.0,
-                };
-                found.damage = union_damage_rect(found.damage, pad(before));
-                found.damage = union_damage_rect(found.damage, pad(after));
-            } else {
-                found.damage = None;
-            }
-            animation.current_transform = transform;
-            animation.current_alpha = alpha;
-        }
-    }
     advance_content_children(&mut content.nodes, at, found);
+}
+
+/// One Raven patch: how far below a device pixel (and an 8-bit alpha step) a
+/// new sample may differ from the drawn one and still count as unchanged.
+/// Skipped samples aren't applied, so differences can't accumulate.
+const UNCHANGED_CORNER_PX: f32 = 1.0 / 64.0;
+
+fn layer_corners(layer: &RenderPaintLayer, screen: Affine2) -> [crate::tree::transform::Point; 4] {
+    use crate::tree::transform::Point;
+    let r = layer.bounds;
+    [
+        (r.x, r.y),
+        (r.x + r.width, r.y),
+        (r.x, r.y + r.height),
+        (r.x + r.width, r.y + r.height),
+    ]
+    .map(|(x, y)| screen.map_point(Point { x, y }))
+}
+
+fn max_corner_distance(a: &[crate::tree::transform::Point; 4], b: &[crate::tree::transform::Point; 4]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt())
+        .fold(0.0, f32::max)
+}
+
+fn alpha_byte(alpha: f32) -> u8 {
+    (alpha.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Samples this layer's own animation at `at` and patches its own
+/// Transform/Alpha nodes (not those of child layers), adding the old and new
+/// screen area to the damage. Leaves the layer as it is when the sample
+/// rounds to what is drawn.
+fn advance_own(layer: &mut RenderPaintLayer, at: std::time::Instant, found: &mut RendererAnimationAdvance) {
+    let Some(animation) = layer.renderer_animation.as_ref() else {
+        return;
+    };
+    let (transform, alpha) = animation.sample(at);
+    let (old_transform, old_alpha) = (animation.current_transform, animation.current_alpha);
+    // Old and new screen area of this layer: its bounds were measured under
+    // bounds_transform; map them to each transform.
+    let inverse = animation.bounds_transform.inverse();
+    let unchanged = inverse.is_some_and(|inverse| {
+        alpha_byte(alpha) == alpha_byte(old_alpha)
+            && max_corner_distance(
+                &layer_corners(layer, old_transform.then(inverse)),
+                &layer_corners(layer, transform.then(inverse)),
+            ) < UNCHANGED_CORNER_PX
+    });
+    if unchanged {
+        return;
+    }
+    let damage = inverse.map(|inverse| {
+        let before = old_transform.then(inverse).map_rect_aabb(layer.bounds);
+        let after = transform.then(inverse).map_rect_aabb(layer.bounds);
+        let pad = |r: Rect| Rect {
+            x: r.x - 4.0,
+            y: r.y - 4.0,
+            width: r.width + 8.0,
+            height: r.height + 8.0,
+        };
+        union_damage_rect(Some(pad(before)), pad(after)).expect("union of two rects")
+    });
+    found.add_damage(damage);
+    let content = Arc::make_mut(&mut layer.content);
+    patch_content(&mut content.nodes, old_transform, transform, old_alpha, alpha);
+    if let Some(animation) = layer.renderer_animation.as_mut() {
+        let animation = Arc::make_mut(animation);
+        animation.current_transform = transform;
+        animation.current_alpha = alpha;
+    }
+}
+
+/// One Raven patch: where the renderer-driven layers of one scene are, so
+/// each frame visits only them (and their ancestors) instead of searching
+/// the whole scene. A path is the index taken at each level of nesting:
+/// into a node list, then into a layer's content, and so on, ending at an
+/// animated layer. Paths are in tree order (a parent before its children).
+#[derive(Debug, Default)]
+pub struct RendererAnimationIndex {
+    paths: Option<Vec<Vec<u32>>>,
+    /// The node list the paths were taken in (a scene replaced without
+    /// `invalidate` is caught here).
+    scene_nodes: usize,
+    motions: std::collections::HashMap<PaintLayerId, MotionEntry>,
+}
+
+#[derive(Debug)]
+struct MotionEntry {
+    spec: Arc<crate::tree::animation::AnimationSpec>,
+    revision: u64,
+    frame: crate::tree::element::Frame,
+    base: crate::tree::attrs::Attrs,
+    bounds: Rect,
+    bounds_transform: Affine2,
+    motion: AnimationMotion,
+}
+
+/// One Raven patch: the fastest a renderer-driven layer changes, over one
+/// period of its loop: corner movement in device pixels per second, and
+/// alpha per second.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AnimationMotion {
+    pub px_per_second: f32,
+    pub alpha_per_second: f32,
+}
+
+impl RendererAnimationIndex {
+    /// Forget the paths (a new scene). Measured motions are kept by layer.
+    pub fn invalidate(&mut self) {
+        self.paths = None;
+    }
+
+    fn paths(&mut self, scene: &RenderScene) -> &[Vec<u32>] {
+        let scene_nodes = scene.nodes.as_ptr() as usize;
+        if self.paths.is_none() || self.scene_nodes != scene_nodes {
+            let mut paths = Vec::new();
+            collect_animation_paths_in_nodes(&scene.nodes, &mut Vec::new(), &mut paths);
+            self.paths = Some(paths);
+            self.scene_nodes = scene_nodes;
+        }
+        self.paths.as_deref().unwrap_or_default()
+    }
+
+    /// Same as `RenderScene::advance_renderer_animations`, visiting only the
+    /// animated layers.
+    pub fn advance(
+        &mut self,
+        scene: &mut RenderScene,
+        at: std::time::Instant,
+    ) -> RendererAnimationAdvance {
+        let valid = |paths: &[Vec<u32>], scene: &RenderScene| {
+            paths.iter().all(|path| {
+                layer_at_path(&scene.nodes, path)
+                    .is_some_and(|layer| layer.renderer_animation.is_some())
+            })
+        };
+        if !valid(self.paths(scene), scene) {
+            // The scene changed shape under the index without `invalidate`.
+            self.paths = None;
+        }
+        let paths = self.paths(scene).to_vec();
+        let mut advance = RendererAnimationAdvance {
+            found: !paths.is_empty(),
+            ..RendererAnimationAdvance::default()
+        };
+        for path in &paths {
+            advance_at_path(&mut scene.nodes, path, at, &mut advance);
+        }
+        advance
+    }
+
+    /// The motion of every renderer-driven layer in the scene, measured once
+    /// per animation and layout.
+    pub fn motions(&mut self, scene: &RenderScene) -> Vec<AnimationMotion> {
+        let paths = self.paths(scene).to_vec();
+        let mut seen = HashSet::new();
+        let motions = paths
+            .iter()
+            .filter_map(|path| layer_at_path(&scene.nodes, path))
+            .filter_map(|layer| {
+                let animation = layer.renderer_animation.as_deref()?;
+                seen.insert(layer.id);
+                let fresh = self.motions.get(&layer.id).is_some_and(|entry| {
+                    Arc::ptr_eq(&entry.spec, &animation.spec)
+                        && entry.revision == animation.revision
+                        && entry.frame == animation.frame
+                        && entry.bounds == layer.bounds
+                        && entry.bounds_transform == animation.bounds_transform
+                        && entry.base == animation.base
+                });
+                if !fresh {
+                    self.motions.insert(
+                        layer.id,
+                        MotionEntry {
+                            spec: animation.spec.clone(),
+                            revision: animation.revision,
+                            frame: animation.frame,
+                            base: animation.base.clone(),
+                            bounds: layer.bounds,
+                            bounds_transform: animation.bounds_transform,
+                            motion: measure_animation_motion(layer, animation),
+                        },
+                    );
+                }
+                self.motions.get(&layer.id).map(|entry| entry.motion)
+            })
+            .collect();
+        self.motions.retain(|id, _| seen.contains(id));
+        motions
+    }
+}
+
+/// One Raven patch: samples one period of the loop (`MOTION_SAMPLES` times,
+/// so a long loop costs no more to measure than a short one: this runs on the
+/// render thread whenever the tree rebuilds the layer) and takes the largest
+/// step between neighbouring samples, with a margin for the peak of an eased
+/// curve falling between two samples. Corners are
+/// enough: under an affine map a point's movement is affine in the point, so
+/// its maximum over the layer's box is at a corner. The wrap from the last
+/// keyframe back to the first is not motion and is left out.
+pub(crate) fn measure_animation_motion(
+    layer: &RenderPaintLayer,
+    animation: &LayerRendererAnimation,
+) -> AnimationMotion {
+    let period = animation.spec.duration_ms.max(0.0) / 1000.0;
+    let Some(inverse) = animation.bounds_transform.inverse() else {
+        return AnimationMotion {
+            px_per_second: f32::INFINITY,
+            alpha_per_second: f32::INFINITY,
+        };
+    };
+    if !(period > 0.0) || !period.is_finite() {
+        return AnimationMotion::default();
+    }
+    let steps = MOTION_SAMPLES;
+    let dt = period / steps as f64;
+    let at = |k: usize| {
+        // The last sample stays just inside the period.
+        let t = if k == steps { period - 1e-6 } else { k as f64 * dt };
+        animation.started_at + std::time::Duration::from_secs_f64(t.max(0.0))
+    };
+    let mut motion = AnimationMotion::default();
+    let (transform, mut alpha) = animation.sample(at(0));
+    let mut corners = layer_corners(layer, transform.then(inverse));
+    for k in 1..=steps {
+        let (transform, next_alpha) = animation.sample(at(k));
+        let next_corners = layer_corners(layer, transform.then(inverse));
+        let seconds = if k == steps { dt - 1e-6 } else { dt } as f32;
+        if seconds > 0.0 {
+            motion.px_per_second = motion
+                .px_per_second
+                .max(max_corner_distance(&corners, &next_corners) / seconds);
+            motion.alpha_per_second = motion
+                .alpha_per_second
+                .max((next_alpha - alpha).abs() / seconds);
+        }
+        corners = next_corners;
+        alpha = next_alpha;
+    }
+    AnimationMotion {
+        px_per_second: motion.px_per_second * MOTION_MARGIN,
+        alpha_per_second: motion.alpha_per_second * MOTION_MARGIN,
+    }
+}
+
+const MOTION_SAMPLES: usize = 96;
+const MOTION_MARGIN: f32 = 1.1;
+
+fn collect_animation_paths_in_nodes(
+    nodes: &[RenderNode],
+    path: &mut Vec<u32>,
+    paths: &mut Vec<Vec<u32>>,
+) {
+    for (index, node) in nodes.iter().enumerate() {
+        path.push(index as u32);
+        match node {
+            RenderNode::ShadowPass { children }
+            | RenderNode::Clip { children, .. }
+            | RenderNode::RelaxedClip { children, .. }
+            | RenderNode::Transform { children, .. }
+            | RenderNode::Alpha { children, .. } => {
+                collect_animation_paths_in_nodes(children, path, paths)
+            }
+            RenderNode::PaintLayer(layer) => collect_animation_paths_in_layer(layer, path, paths),
+            RenderNode::Primitive(_) => {}
+        }
+        path.pop();
+    }
+}
+
+fn collect_animation_paths_in_layer(
+    layer: &RenderPaintLayer,
+    path: &mut Vec<u32>,
+    paths: &mut Vec<Vec<u32>>,
+) {
+    if layer.renderer_animation.is_some() {
+        paths.push(path.clone());
+    }
+    collect_animation_paths_in_content(&layer.content.nodes, path, paths);
+}
+
+fn collect_animation_paths_in_content(
+    nodes: &[RenderPaintLayerContentNode],
+    path: &mut Vec<u32>,
+    paths: &mut Vec<Vec<u32>>,
+) {
+    for (index, node) in nodes.iter().enumerate() {
+        path.push(index as u32);
+        match node {
+            RenderPaintLayerContentNode::Own(_) => {}
+            RenderPaintLayerContentNode::Child(layer) => {
+                collect_animation_paths_in_layer(layer, path, paths)
+            }
+            RenderPaintLayerContentNode::ShadowPass { children }
+            | RenderPaintLayerContentNode::Clip { children, .. }
+            | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+            | RenderPaintLayerContentNode::Transform { children, .. }
+            | RenderPaintLayerContentNode::Alpha { children, .. } => {
+                collect_animation_paths_in_content(children, path, paths)
+            }
+        }
+        path.pop();
+    }
+}
+
+fn layer_at_path<'a>(nodes: &'a [RenderNode], path: &[u32]) -> Option<&'a RenderPaintLayer> {
+    let (&index, rest) = path.split_first()?;
+    match nodes.get(index as usize)? {
+        RenderNode::ShadowPass { children }
+        | RenderNode::Clip { children, .. }
+        | RenderNode::RelaxedClip { children, .. }
+        | RenderNode::Transform { children, .. }
+        | RenderNode::Alpha { children, .. } => layer_at_path(children, rest),
+        RenderNode::PaintLayer(layer) => layer_at_content_path(layer, rest),
+        RenderNode::Primitive(_) => None,
+    }
+}
+
+fn layer_at_content_path<'a>(layer: &'a RenderPaintLayer, path: &[u32]) -> Option<&'a RenderPaintLayer> {
+    let Some((&index, rest)) = path.split_first() else {
+        return Some(layer);
+    };
+    match layer.content.nodes.get(index as usize)? {
+        RenderPaintLayerContentNode::Child(child) => layer_at_content_path(child, rest),
+        node => layer_at_content_children_path(node, rest),
+    }
+}
+
+fn layer_at_content_children_path<'a>(
+    node: &'a RenderPaintLayerContentNode,
+    path: &[u32],
+) -> Option<&'a RenderPaintLayer> {
+    match node {
+        RenderPaintLayerContentNode::ShadowPass { children }
+        | RenderPaintLayerContentNode::Clip { children, .. }
+        | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+        | RenderPaintLayerContentNode::Transform { children, .. }
+        | RenderPaintLayerContentNode::Alpha { children, .. } => {
+            let (&index, rest) = path.split_first()?;
+            match children.get(index as usize)? {
+                RenderPaintLayerContentNode::Child(child) => layer_at_content_path(child, rest),
+                node => layer_at_content_children_path(node, rest),
+            }
+        }
+        RenderPaintLayerContentNode::Own(_) | RenderPaintLayerContentNode::Child(_) => None,
+    }
+}
+
+/// Advances the animated layer at `path`; false when the path doesn't lead
+/// to one. Layers on the way are copied on write, as in a full advance.
+fn advance_at_path(
+    nodes: &mut [RenderNode],
+    path: &[u32],
+    at: std::time::Instant,
+    advance: &mut RendererAnimationAdvance,
+) -> bool {
+    let Some((&index, rest)) = path.split_first() else {
+        return false;
+    };
+    match nodes.get_mut(index as usize) {
+        Some(
+            RenderNode::ShadowPass { children }
+            | RenderNode::Clip { children, .. }
+            | RenderNode::RelaxedClip { children, .. }
+            | RenderNode::Transform { children, .. }
+            | RenderNode::Alpha { children, .. },
+        ) => advance_at_path(children, rest, at, advance),
+        Some(RenderNode::PaintLayer(layer)) => advance_at_layer_path(layer, rest, at, advance),
+        _ => false,
+    }
+}
+
+fn advance_at_layer_path(
+    layer: &mut RenderPaintLayer,
+    path: &[u32],
+    at: std::time::Instant,
+    advance: &mut RendererAnimationAdvance,
+) -> bool {
+    let Some((&index, rest)) = path.split_first() else {
+        if layer.renderer_animation.is_none() {
+            return false;
+        }
+        advance_own(layer, at, advance);
+        return true;
+    };
+    if layer
+        .content
+        .nodes
+        .get(index as usize)
+        .is_none_or(|node| matches!(node, RenderPaintLayerContentNode::Own(_)))
+    {
+        return false;
+    }
+    let content = Arc::make_mut(&mut layer.content);
+    advance_at_content_path(&mut content.nodes[index as usize], rest, at, advance)
+}
+
+fn advance_at_content_path(
+    node: &mut RenderPaintLayerContentNode,
+    path: &[u32],
+    at: std::time::Instant,
+    advance: &mut RendererAnimationAdvance,
+) -> bool {
+    match node {
+        RenderPaintLayerContentNode::Child(child) => advance_at_layer_path(child, path, at, advance),
+        RenderPaintLayerContentNode::ShadowPass { children }
+        | RenderPaintLayerContentNode::Clip { children, .. }
+        | RenderPaintLayerContentNode::RelaxedClip { children, .. }
+        | RenderPaintLayerContentNode::Transform { children, .. }
+        | RenderPaintLayerContentNode::Alpha { children, .. } => {
+            let Some((&index, rest)) = path.split_first() else {
+                return false;
+            };
+            match children.get_mut(index as usize) {
+                Some(node) => advance_at_content_path(node, rest, at, advance),
+                None => false,
+            }
+        }
+        RenderPaintLayerContentNode::Own(_) => false,
+    }
 }
 
 // Replaces this layer's own Transform/Alpha nodes (not those of child layers,
@@ -2282,5 +2696,267 @@ mod renderer_animation_tests {
 
         nested.renderer_animation = None;
         assert!(!renderer_animation_snapshot_eligible(&nested));
+    }
+
+    fn static_layer(id: u64) -> RenderNode {
+        RenderNode::PaintLayer(RenderPaintLayer::from_children(
+            id,
+            BOUNDS,
+            PaintLayerPlacement::Fixed,
+            PaintLayerPolicy::Cacheable,
+            PaintLayerReason::ScrollContent,
+            1,
+            vec![rect_node(), rect_node()],
+        ))
+    }
+
+    /// A page of `statics` static layers with `animated` nested inside a
+    /// clip and a static parent layer, as a dashboard card would hold it.
+    fn page(statics: u64, animated: RenderPaintLayer) -> RenderScene {
+        let mut children: Vec<RenderNode> = (0..statics).map(|id| static_layer(100 + id)).collect();
+        let card = RenderPaintLayer::from_children(
+            50,
+            BOUNDS,
+            PaintLayerPlacement::Fixed,
+            PaintLayerPolicy::Cacheable,
+            PaintLayerReason::ScrollContent,
+            1,
+            vec![],
+        )
+        .with_children(vec![
+            rect_node(),
+            RenderNode::Clip {
+                clips: vec![ClipShape {
+                    rect: BOUNDS,
+                    radii: None,
+                }],
+                children: vec![RenderNode::PaintLayer(animated)],
+            },
+        ]);
+        children.insert(statics as usize / 2, RenderNode::PaintLayer(card));
+        let root = RenderPaintLayer::from_children(
+            1,
+            BOUNDS,
+            PaintLayerPlacement::Fixed,
+            PaintLayerPolicy::DirectOnly,
+            PaintLayerReason::Root,
+            1,
+            vec![],
+        )
+        .with_children(children);
+        RenderScene {
+            nodes: vec![RenderNode::PaintLayer(root)],
+            ..RenderScene::default()
+        }
+    }
+
+    fn search_nodes(advance: impl FnOnce()) -> u64 {
+        ANIMATION_SEARCH_NODES.with(|count| count.set(0));
+        advance();
+        ANIMATION_SEARCH_NODES.with(|count| count.get())
+    }
+
+    #[test]
+    fn the_index_advances_exactly_what_a_full_search_does_without_searching() {
+        let started_at = Instant::now();
+        let animated = animated_layer(started_at, Some(child_layer(1)));
+        let mut searched = page(200, animated.clone());
+        let mut indexed = page(200, animated);
+        let mut index = RendererAnimationIndex::default();
+        for ms in [16, 33, 250, 251, 900] {
+            let at = started_at + Duration::from_millis(ms);
+            let mut full = RendererAnimationAdvance::default();
+            let full_nodes = search_nodes(|| full = searched.advance_renderer_animations(at));
+            let mut fast = RendererAnimationAdvance::default();
+            let fast_nodes = search_nodes(|| fast = index.advance(&mut indexed, at));
+            assert_eq!(indexed, searched, "at {ms} ms");
+            assert_eq!(
+                (fast.found, fast.changed, fast.damage),
+                (full.found, full.changed, full.damage),
+                "at {ms} ms"
+            );
+            // The full search walks the whole page every frame; the index
+            // goes straight to the animated layer.
+            assert!(full_nodes > 200, "{full_nodes}");
+            assert_eq!(fast_nodes, 0, "at {ms} ms");
+        }
+    }
+
+    #[test]
+    fn the_index_follows_a_scene_replaced_behind_its_back() {
+        let started_at = Instant::now();
+        let mut index = RendererAnimationIndex::default();
+        let mut scene = page(3, animated_layer(started_at, None));
+        assert!(index.advance(&mut scene, started_at + Duration::from_millis(100)).changed);
+        // A new scene without `invalidate`: no animation any more.
+        let mut still = page(3, child_layer(1));
+        let advance = index.advance(&mut still, started_at + Duration::from_millis(200));
+        assert!(!advance.found && !advance.changed);
+        // And one where it moved elsewhere.
+        let mut moved = page(9, animated_layer(started_at, None));
+        let advance = index.advance(&mut moved, started_at + Duration::from_millis(300));
+        assert!(advance.found && advance.changed);
+    }
+
+    #[test]
+    fn a_sample_that_rounds_to_the_drawn_one_is_not_applied() {
+        let started_at = Instant::now();
+        let mut layer = animated_layer(started_at, None);
+        // A loop that holds still: two equal keyframes.
+        let animation = Arc::make_mut(layer.renderer_animation.as_mut().unwrap());
+        let held = Attrs {
+            rotate: Some(0.0),
+            ..Attrs::default()
+        };
+        animation.spec = Arc::new(AnimationSpec {
+            keyframes: vec![held.clone(), held],
+            duration_ms: 1000.0,
+            curve: AnimationCurve::Linear,
+            repeat: AnimationRepeat::Loop,
+        });
+        let mut scene = RenderScene {
+            nodes: vec![RenderNode::PaintLayer(layer)],
+            ..RenderScene::default()
+        };
+        let before = scene.clone();
+        let advance = scene.advance_renderer_animations(started_at + Duration::from_millis(300));
+        assert!(advance.found);
+        assert!(!advance.changed);
+        assert!(advance.damage.is_none());
+        assert_eq!(scene, before);
+
+        // Far below a pixel per frame: 0.36 degrees over 100 s turns the
+        // box's far corner ~0.28 px, ~3e-6 px per ms.
+        let mut slow = animated_layer(started_at, None);
+        let animation = Arc::make_mut(slow.renderer_animation.as_mut().unwrap());
+        animation.spec = Arc::new(AnimationSpec {
+            keyframes: vec![
+                Attrs {
+                    rotate: Some(0.0),
+                    ..Attrs::default()
+                },
+                Attrs {
+                    rotate: Some(0.36),
+                    ..Attrs::default()
+                },
+            ],
+            duration_ms: 100_000.0,
+            curve: AnimationCurve::Linear,
+            repeat: AnimationRepeat::Loop,
+        });
+        let mut scene = RenderScene {
+            nodes: vec![RenderNode::PaintLayer(slow)],
+            ..RenderScene::default()
+        };
+        assert!(!scene
+            .advance_renderer_animations(started_at + Duration::from_millis(16))
+            .changed);
+        // Skipped samples aren't applied, so motion still shows up once it
+        // adds up: after 10 s the corner has moved ~0.03 px.
+        let advance = scene.advance_renderer_animations(started_at + Duration::from_secs(10));
+        assert!(advance.changed);
+        assert!(advance.damage.is_some());
+    }
+
+    #[test]
+    fn damage_that_cannot_be_bounded_is_not_lost_to_a_later_layer() {
+        let started_at = Instant::now();
+        let mut degenerate = animated_layer(started_at, None);
+        let animation = Arc::make_mut(degenerate.renderer_animation.as_mut().unwrap());
+        // Bounds measured under a singular transform: no screen mapping.
+        animation.bounds_transform = Affine2 {
+            xx: 0.0,
+            yx: 0.0,
+            xy: 0.0,
+            yy: 0.0,
+            tx: 0.0,
+            ty: 0.0,
+        };
+        let mut second = animated_layer(started_at, None);
+        second.id = PaintLayerId::new(8, PaintLayerReason::Animation);
+        let mut scene = RenderScene {
+            nodes: vec![
+                RenderNode::PaintLayer(degenerate),
+                RenderNode::PaintLayer(second),
+            ],
+            ..RenderScene::default()
+        };
+        let advance = scene.advance_renderer_animations(started_at + Duration::from_millis(250));
+        assert!(advance.changed);
+        assert!(advance.damage.is_none(), "{:?}", advance.damage);
+    }
+
+    fn with_spec(keyframes: Vec<Attrs>, duration_ms: f64, curve: AnimationCurve) -> RenderPaintLayer {
+        let mut layer = animated_layer(Instant::now(), None);
+        Arc::make_mut(layer.renderer_animation.as_mut().unwrap()).spec = Arc::new(AnimationSpec {
+            keyframes,
+            duration_ms,
+            curve,
+            repeat: AnimationRepeat::Loop,
+        });
+        layer
+    }
+
+    fn motion(layer: &RenderPaintLayer) -> AnimationMotion {
+        measure_animation_motion(layer, layer.renderer_animation.as_deref().unwrap())
+    }
+
+    #[test]
+    fn motion_is_the_fastest_corner_and_alpha_change_in_a_period() {
+        // Measurements carry a 10% margin (MOTION_MARGIN).
+        // One turn a second: the corners (44.7 px from the centre of the
+        // 80x40 box) move 2 pi r = 281 px/s.
+        let spin = motion(&animated_layer(Instant::now(), None));
+        assert!((spin.px_per_second - 281.0 * 1.1).abs() < 281.0 * 0.03, "{spin:?}");
+        assert_eq!(spin.alpha_per_second, 0.0);
+
+        // A slide of 20 px over 4 s, eased: peak speed above the 5 px/s average.
+        let at = |x: f32| Attrs {
+            move_x: Some(x as f64),
+            ..Attrs::default()
+        };
+        let slide = motion(&with_spec(vec![at(0.0), at(20.0)], 4000.0, AnimationCurve::EaseInOut));
+        assert!(slide.px_per_second > 6.0 && slide.px_per_second < 16.5, "{slide:?}");
+        let linear = motion(&with_spec(vec![at(0.0), at(20.0)], 4000.0, AnimationCurve::Linear));
+        assert!((linear.px_per_second - 5.5).abs() < 0.1, "{linear:?}");
+
+        // A fade 0.2 -> 1 over 2 s; the wrap back to 0.2 isn't motion.
+        let fade = |a: f64| Attrs {
+            alpha: Some(a),
+            ..Attrs::default()
+        };
+        let pulse = motion(&with_spec(vec![fade(0.2), fade(1.0)], 2000.0, AnimationCurve::Linear));
+        assert!((pulse.alpha_per_second - 0.44).abs() < 0.01, "{pulse:?}");
+        assert_eq!(pulse.px_per_second, 0.0);
+
+        // Holding still.
+        let held = motion(&with_spec(vec![fade(0.5), fade(0.5)], 1000.0, AnimationCurve::Linear));
+        assert_eq!(held, AnimationMotion::default());
+    }
+
+    #[test]
+    fn motions_are_measured_once_per_animation_and_layout() {
+        let started_at = Instant::now();
+        let animated = animated_layer(started_at, None);
+        let mut index = RendererAnimationIndex::default();
+        assert_eq!(index.motions(&page(3, animated.clone())).len(), 1);
+        // Mark the stored measurement: a re-measure would overwrite it.
+        let marker = AnimationMotion {
+            px_per_second: -1.0,
+            alpha_per_second: -1.0,
+        };
+        index.motions.values_mut().next().unwrap().motion = marker;
+        // The same animation in a new scene keeps its measurement.
+        index.invalidate();
+        assert_eq!(index.motions(&page(5, animated.clone())), vec![marker]);
+        // A new layout (the box moved) is measured again.
+        let mut moved = animated.clone();
+        moved.bounds.x += 10.0;
+        index.invalidate();
+        assert_ne!(index.motions(&page(5, moved)), vec![marker]);
+        // A scene without it drops the entry.
+        index.invalidate();
+        assert!(index.motions(&page(5, child_layer(1))).is_empty());
+        assert!(index.motions.is_empty());
     }
 }

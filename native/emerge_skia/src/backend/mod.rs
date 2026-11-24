@@ -2,6 +2,9 @@
 //!
 //! Each backend provides a way to create a window/surface and run an event loop.
 
+// One Raven patch: pure logic, so it is tested on every host.
+#[cfg(any(all(feature = "drm", feature = "opengl", target_os = "linux"), test))]
+pub(crate) mod animation_rate;
 // Pure owner-side backlight primitives are tested without enabling DRM or
 // touching hardware. Presenters remain fail-closed until power/barrier wiring.
 #[cfg(all(target_os = "linux", any(feature = "drm", test)))]

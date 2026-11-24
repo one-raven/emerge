@@ -130,11 +130,23 @@ pub fn decode_tree(data: &[u8]) -> Result<ElementTree, DecodeError> {
         return Ok(ElementTree::new());
     }
 
-    // Parse all nodes
-    let mut raw_nodes = Vec::with_capacity(node_count);
+    // One Raven patch: build each element in its box (see `ElementTree::nodes`)
+    // as it is parsed, in an arena sized once, instead of collecting ~7.9 KB
+    // elements and their 2.5 KB attrs in vectors and moving them again.
+    let mut tree = ElementTree::new();
+    tree.nodes.reserve(node_count);
+    tree.id_to_ix.reserve(node_count);
+    let mut root_id = None;
+    // Insert all nodes first so child/nearby references can resolve in a second pass.
+    let mut topology_updates = Vec::with_capacity(node_count);
     for _ in 0..node_count {
-        let node = decode_node(&mut cursor)?;
-        raw_nodes.push(node);
+        let raw = decode_node(&mut cursor)?;
+        let id = raw.id;
+        // First node is the root
+        root_id.get_or_insert(id);
+        let element = Box::new(Element::with_attrs(id, raw.kind, raw.attrs_raw, raw.attrs));
+        topology_updates.push((id, raw.child_ids, raw.nearby.mounts));
+        tree.insert_boxed(element);
     }
 
     // Verify we consumed all data
@@ -143,22 +155,6 @@ pub fn decode_tree(data: &[u8]) -> Result<ElementTree, DecodeError> {
             "{} bytes remaining after parsing",
             cursor.remaining()
         )));
-    }
-
-    // Build the tree
-    let mut tree = ElementTree::new();
-
-    // First node is the root
-    let root_id = raw_nodes.first().map(|first| first.id);
-
-    // Insert all nodes first so child/nearby references can resolve in a second pass.
-    let mut topology_updates = Vec::with_capacity(raw_nodes.len());
-
-    for raw in raw_nodes {
-        let id = raw.id;
-        let element = Element::with_attrs(id, raw.kind, raw.attrs_raw, raw.attrs);
-        topology_updates.push((id, raw.child_ids, raw.nearby.mounts));
-        tree.insert(element);
     }
 
     for (id, child_ids, nearby_mounts) in topology_updates {

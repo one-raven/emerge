@@ -277,9 +277,10 @@ pub fn apply_patches(
     let batch_revision = tree.bump_revision();
     let mut invalidation = TreeInvalidation::None;
 
-    for patch in patches {
+    let mut patches = patches.into_iter();
+    while let Some(patch) = patches.next() {
         let structural = !matches!(patch, Patch::SetAttrs { .. });
-        let applied = match apply_patch(tree, patch, batch_revision) {
+        let applied = match apply_patch_before(tree, patch, batch_revision, patches.as_slice()) {
             Ok(applied) => applied,
             Err(error) => {
                 // A structural operation may fail after insertion/attachment has
@@ -947,10 +948,21 @@ fn subtree_has_animation_attrs(tree: &ElementTree) -> bool {
 }
 
 /// Apply a single patch to the tree.
+#[cfg(test)]
 fn apply_patch(
     tree: &mut ElementTree,
     patch: Patch,
     batch_revision: u64,
+) -> Result<TreeInvalidation, String> {
+    apply_patch_before(tree, patch, batch_revision, &[])
+}
+
+/// Apply a single patch, followed in its batch by `later`.
+fn apply_patch_before(
+    tree: &mut ElementTree,
+    patch: Patch,
+    batch_revision: u64,
+    later: &[Patch],
 ) -> Result<TreeInvalidation, String> {
     let invalidation = match patch {
         Patch::SetAttrs { id, attrs_raw } => {
@@ -1057,10 +1069,12 @@ fn apply_patch(
                     && decoded.animate_enter.is_none()
                     && decoded.animate_change.is_none()
                 {
-                    element.layout.effective =
-                        super::layout::scale_attrs(&decoded, element.layout.dimension_facts.scale);
+                    element.layout.effective.set(super::layout::scale_attrs(
+                        &decoded,
+                        element.layout.dimension_facts.scale,
+                    ));
                 }
-                let before_attrs = std::mem::replace(&mut element.spec.declared, decoded);
+                let before_attrs = std::mem::replace(&mut element.spec.declared, decoded.into());
                 element.normalize_extracted_state();
                 if slider_value_is_from_patch && !slider_value_is_runtime_owned {
                     element.runtime.slider_value_origin = SliderValueOrigin::TreePatch;
@@ -1218,7 +1232,7 @@ fn apply_patch(
 
             // Insert all nodes from subtree into main tree
             for element in subtree.nodes.into_iter().flatten() {
-                tree.insert(element);
+                tree.insert_boxed(element);
             }
 
             for (id, child_ids, paint_child_ids, nearby_mounts) in subtree_topology {
@@ -1277,7 +1291,7 @@ fn apply_patch(
             tree.pending_patch_effects.model_changed = true;
 
             for element in subtree.nodes.into_iter().flatten() {
-                tree.insert(element);
+                tree.insert_boxed(element);
             }
 
             for (id, child_ids, paint_child_ids, nearby_mounts) in subtree_topology {
@@ -1338,7 +1352,15 @@ fn apply_patch(
 
         Patch::Remove { id } => {
             if tree.get(&id).is_some() {
-                tree.capture_animation_subtree(&id);
+                // One Raven patch: capture only the removed sources a later
+                // read can tell apart (see `capture_removed_animation_subtree`).
+                tree.capture_removed_animation_subtree(&id, |id| {
+                    later.iter().any(|patch| match patch {
+                        Patch::InsertSubtree { subtree, .. }
+                        | Patch::InsertNearbySubtree { subtree, .. } => subtree.ix_of(id).is_some(),
+                        _ => false,
+                    })
+                });
                 tree.pending_patch_effects.model_changed = true;
             }
             let parent_link = tree.ix_of(&id).and_then(|ix| tree.parent_link_of(ix));
@@ -1354,7 +1376,7 @@ fn apply_patch(
                 attach_ghost_root(tree, &ghost_root_id)?;
             }
 
-            remove_subtree(tree, &id);
+            remove_captured_subtree(tree, &id);
             match parent_link {
                 Some(ParentLink::Nearby { .. }) if ghost_root_id.is_none() => {
                     tree.recompute_layout_descendant_dirty();
@@ -1684,6 +1706,7 @@ fn clone_as_ghost(
         .cloned()
         .expect("ghost id should exist for every cloned node");
     let (kind, attrs) = sanitize_ghost_visual(old.spec.kind, &old.layout.effective);
+    let attrs = super::attrs::SharedAttrs::from(attrs);
     let mut dimension_facts = old.layout.dimension_facts;
     dimension_facts.scale = 1.0;
 
@@ -1837,6 +1860,19 @@ fn sanitize_ghost_visual(kind: ElementKind, source: &Attrs) -> (ElementKind, Att
 
 /// Recursively remove a node and all its descendants.
 pub(crate) fn remove_subtree(tree: &mut ElementTree, id: &NodeId) {
+    remove_subtree_inner(tree, id, true);
+}
+
+/// One Raven patch: `remove_subtree` for a Remove patch, which has already
+/// captured the subtree's animation sources. Unlinking it from its parent
+/// captured the subtree again (each node already captured, or not capturable
+/// for the same reasons), and would now capture the descendants the patch
+/// leaves out on purpose.
+fn remove_captured_subtree(tree: &mut ElementTree, id: &NodeId) {
+    remove_subtree_inner(tree, id, false);
+}
+
+fn remove_subtree_inner(tree: &mut ElementTree, id: &NodeId, capture: bool) {
     // First collect all descendant IDs
     let mut to_remove = Vec::new();
     collect_descendants(tree, id, &mut to_remove);
@@ -1853,22 +1889,25 @@ pub(crate) fn remove_subtree(tree: &mut ElementTree, id: &NodeId) {
                 if let Some(parent_id) = tree.id_of(parent) {
                     let mut remaining = tree.child_ids(&parent_id);
                     remaining.retain(|child_id| child_id != id);
-                    let _ = tree.set_children(&parent_id, remaining);
+                    let _ = tree.set_children_capturing(&parent_id, remaining, capture);
                 }
             }
             ParentLink::Nearby { host, .. } => {
                 if let Some(host_id) = tree.id_of(host) {
                     let mut remaining = tree.nearby_mounts_for(&host_id);
                     remaining.retain(|mount| &mount.id != id);
-                    let _ = tree.set_nearby_mounts(&host_id, remaining);
+                    let _ = tree.set_nearby_mounts_capturing(&host_id, remaining, capture);
                 }
             }
         }
     }
 
     // Remove all collected nodes
+    // One Raven patch: dropped after the frame is published (`RetiredElements`).
     for remove_id in to_remove {
-        tree.remove_node(&remove_id);
+        if let Some(element) = tree.remove_node_boxed(&remove_id) {
+            tree.retire(element);
+        }
     }
 
     // If this was the root, clear it

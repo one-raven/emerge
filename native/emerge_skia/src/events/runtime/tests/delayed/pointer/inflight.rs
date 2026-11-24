@@ -67,7 +67,7 @@ fn scroller() -> ElementTree {
         .chain(node.spec.attrs_raw[2..].iter().copied())
         .chain([46, 0, 0, 0, 0, 60, 0, 0, 0, 0])
         .collect();
-    node.spec.declared = crate::tree::attrs::decode_attrs(&node.spec.attrs_raw).unwrap();
+    node.spec.declared = crate::tree::attrs::decode_attrs(&node.spec.attrs_raw).unwrap().into();
     node.layout.effective = node.spec.declared.clone();
     tree.insert(encoded_node(
         NodeId(10),

@@ -4761,7 +4761,7 @@ fn inline_decoration_animation_matches_fresh_frames_and_only_width_reflows() {
                 if ms > 0 {
                     assert_eq!(result.layout_performed, width_animation);
                 }
-                let mut sampled = tree.get(&owner).unwrap().layout.effective.clone();
+                let mut sampled = tree.get(&owner).unwrap().layout.effective.as_ref().clone();
                 sampled.animate = None;
                 let (mut fresh, _, _) = decorated_animation_tree(sampled);
                 layout_tree_default(&mut fresh, constraint, 1.0);

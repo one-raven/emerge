@@ -79,6 +79,9 @@ pub struct RenderState {
     /// One Raven patch: draw only this scene area (the rest of the buffer
     /// already holds this frame's pixels); None redraws everything.
     pub damage: Option<crate::tree::geometry::Rect>,
+    /// One Raven patch: where this scene's renderer-driven layers are, and
+    /// how fast each moves.
+    pub renderer_animations: crate::render_scene::RendererAnimationIndex,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -536,6 +539,7 @@ impl Default for RenderState {
             has_scroll_moving_paint_layers: false,
             video_target_ids: HashSet::new(),
             damage: None,
+            renderer_animations: Default::default(),
         }
     }
 }
@@ -558,6 +562,7 @@ impl RenderState {
             has_scroll_moving_paint_layers,
             video_target_ids,
             damage: None,
+            renderer_animations: Default::default(),
         }
     }
 
@@ -567,10 +572,17 @@ impl RenderState {
         &mut self,
         at: std::time::Instant,
     ) -> crate::render_scene::RendererAnimationAdvance {
-        self.scene.advance_renderer_animations(at)
+        self.renderer_animations.advance(&mut self.scene, at)
+    }
+
+    /// One Raven patch: how fast each renderer-driven layer moves (for the
+    /// presenter's frame-rate policy).
+    pub fn renderer_animation_motions(&mut self) -> Vec<crate::render_scene::AnimationMotion> {
+        self.renderer_animations.motions(&self.scene)
     }
 
     pub fn set_scene(&mut self, scene: RenderScene) {
+        self.renderer_animations.invalidate();
         self.has_cacheable_paint_layers = scene.has_payload_cache_candidate_layers();
         self.has_scroll_moving_paint_layers = scene.has_scroll_moving_paint_layers();
         self.video_target_ids = scene.video_target_ids();
@@ -3136,6 +3148,7 @@ pub struct RendererCacheManager {
     base_snapshot: Option<BaseSnapshot>,
     base_snapshot_max_bytes: u64,
     base_snapshot_counts: BaseSnapshotCounts,
+    last_frame_work: FrameWork,
 }
 
 /// One Raven patch: the root layer's base content (everything painted
@@ -3230,6 +3243,7 @@ impl RendererCacheManager {
                 .max_entry_bytes
                 .min(config.paint_layer.max_bytes),
             base_snapshot_counts: BaseSnapshotCounts::default(),
+            last_frame_work: FrameWork::default(),
             payloads: PaintLayerPayloadCache::with_config(
                 renderer_paint_layer_payload_cache_config(config),
             ),
@@ -3252,11 +3266,42 @@ impl RendererCacheManager {
         RendererCacheFrame {
             generation: self.generation,
             stats,
+            damage: None,
+            work: FrameWork::default(),
         }
+    }
+
+    /// One Raven patch: a partial-redraw frame (only `damage` is redrawn; the
+    /// rest of the buffer already holds the last frame) continues the cache's
+    /// last full frame instead of starting a new one. Runs outside the damage
+    /// aren't visited, so counting it as a frame would age their payloads
+    /// toward stale eviction and break consecutive-visibility admission just
+    /// because something else on the screen is animating.
+    fn begin_partial_frame(&mut self, damage: PaintLayerDeviceRect) -> RendererCacheFrame {
+        self.gpu_replacement_stores_remaining = GPU_PAINT_LAYER_REPLACEMENT_STORES_PER_FRAME;
+        let mut stats = RendererCacheFrameStats::default();
+        for bytes in self.payloads.begin_frame(self.frame_index) {
+            stats.paint_layer.record_stale_eviction(bytes);
+        }
+        RendererCacheFrame {
+            generation: self.generation,
+            stats,
+            damage: Some(damage),
+            work: FrameWork {
+                damage_pixels: damage.area(),
+                ..FrameWork::default()
+            },
+        }
+    }
+
+    /// One Raven patch: what the last cache-tracked frame touched.
+    pub fn last_frame_work(&self) -> FrameWork {
+        self.last_frame_work
     }
 
     pub fn end_frame(&mut self, frame: RendererCacheFrame) -> RendererCacheFrameStats {
         debug_assert_eq!(frame.generation, self.generation);
+        self.last_frame_work = frame.work;
         let mut stats = frame.stats;
         let (entries, bytes, gpu_payloads, cpu_payloads) = self.payload_resident_stats();
         stats.paint_layer.current_entries = entries;
@@ -3565,6 +3610,51 @@ impl RendererCacheManager {
 pub struct RendererCacheFrame {
     generation: u64,
     stats: RendererCacheFrameStats,
+    /// One Raven patch: the device area this frame redraws (partial redraw);
+    /// paint runs wholly outside it are not visited.
+    damage: Option<PaintLayerDeviceRect>,
+    work: FrameWork,
+}
+
+/// One Raven patch: how much of the scene one cache-tracked frame touched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameWork {
+    /// Paint runs reached by the traversal.
+    pub runs_visited: u64,
+    /// Of those, runs skipped because they lie outside the damage.
+    pub runs_culled: u64,
+    /// Primitives in the runs that were drawn (directly or from a payload).
+    pub run_primitives: u64,
+    /// Device pixels in the damage (0 for a full frame).
+    pub damage_pixels: u64,
+}
+
+/// One Raven patch: pixels around a paint run's bounds that it may still
+/// touch (antialiasing, the image bleed outset) when deciding it lies wholly
+/// outside the damage.
+const DAMAGE_CULL_OUTSET: i32 = 2;
+
+fn paint_run_outside_damage(
+    run: &RenderPaintRun,
+    eligibility: MovingLayerEligibility,
+    damage: PaintLayerDeviceRect,
+) -> bool {
+    // Unmeasured runs (no bounds) are always drawn.
+    if run.metrics.payload_pixels == 0 {
+        return false;
+    }
+    let Some(device) =
+        paint_layer_device_rect_from_geometry(eligibility.current_transform.map_rect_aabb(run.bounds))
+    else {
+        return false;
+    };
+    let device = PaintLayerDeviceRect {
+        x: device.x.saturating_sub(DAMAGE_CULL_OUTSET),
+        y: device.y.saturating_sub(DAMAGE_CULL_OUTSET),
+        width: device.width.saturating_add(2 * DAMAGE_CULL_OUTSET as u32),
+        height: device.height.saturating_add(2 * DAMAGE_CULL_OUTSET as u32),
+    };
+    paint_layer_intersect_device_rects(device, damage).is_none()
 }
 
 impl RendererCacheFrame {
@@ -5214,7 +5304,11 @@ impl SceneRenderer {
             renderer_cache,
             ..
         } = self;
-        let mut cache_frame = renderer_cache.begin_frame();
+        let damage = state.damage.and_then(paint_layer_device_rect_from_geometry);
+        let mut cache_frame = match damage {
+            Some(damage) => renderer_cache.begin_partial_frame(damage),
+            None => renderer_cache.begin_frame(),
+        };
         let options = RenderTraversalOptions::unclipped(video_state);
         let mut cache_tracking = RenderCacheTracking {
             renderer_cache: &mut *renderer_cache,
@@ -5254,6 +5348,8 @@ impl SceneRenderer {
                 // kind (color type, sample count, text properties).
                 let offscreen = target.canvas();
                 clear(offscreen, instrumentation);
+                // The snapshot is the whole base, whatever this frame redraws.
+                let damage = cache_tracking.frame.damage.take();
                 let mut mode = CacheTrackingRenderMode {
                     cache_tracking: &mut cache_tracking,
                 };
@@ -5266,6 +5362,7 @@ impl SceneRenderer {
                     root_eligibility,
                     instrumentation,
                 );
+                cache_tracking.frame.damage = damage;
                 let image = target.image_snapshot();
                 let cache = &mut *cache_tracking.renderer_cache;
                 if let Some(snapshot) = cache.base_snapshot.as_mut() {
@@ -7148,6 +7245,18 @@ impl<'video> RenderTraversalMode<'video> for CacheTrackingRenderMode<'_, '_> {
         eligibility: MovingLayerEligibility,
         instrumentation: &mut I,
     ) {
+        // One Raven patch: on a partial-redraw frame, a run wholly outside
+        // the damage would only be clipped away, so skip it before its
+        // payload key (a hash of all its nodes) is computed.
+        let frame = &mut *self.cache_tracking.frame;
+        frame.work.runs_visited += 1;
+        if let Some(damage) = frame.damage
+            && paint_run_outside_damage(run, eligibility, damage)
+        {
+            frame.work.runs_culled += 1;
+            return;
+        }
+        frame.work.run_primitives += u64::from(run.metrics.own_primitive_count);
         if I::ENABLED {
             let before = self.cache_tracking.frame.stats.paint_layer;
             let started_at = Instant::now();
@@ -15985,5 +16094,255 @@ mod base_snapshot_tests {
             &first.nodes,
             &base(0x112233FF, &changed_child).nodes
         ));
+    }
+}
+
+/// One Raven patch: what a frame costs when only renderer-driven animations
+/// moved (an idle dashboard with a spinning fan).
+#[cfg(test)]
+mod idle_animation_tests {
+    use super::*;
+    use crate::render_scene::{LayerRendererAnimation, PaintLayerPlacement};
+    use crate::tree::animation::{AnimationCurve, AnimationRepeat, AnimationSpec};
+    use crate::tree::attrs::Attrs;
+    use crate::tree::element::Frame;
+    use std::time::Duration;
+
+    const W: u32 = 480;
+    const H: u32 = 640;
+
+    fn geometry(x: f32, y: f32, width: f32, height: f32) -> GeometryRect {
+        GeometryRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn rect(x: f32, y: f32, width: f32, height: f32, color: u32) -> RenderNode {
+        RenderNode::Primitive(DrawPrimitive::Rect(x, y, width, height, color.into()))
+    }
+
+    /// A 140x130 card of ten rows.
+    fn card_nodes(x: f32, y: f32) -> Vec<RenderNode> {
+        let mut nodes = vec![rect(x, y, 140.0, 130.0, 0xDDE3EAFF)];
+        nodes.extend((0..9).map(|row| {
+            rect(
+                x + 8.0,
+                y + 8.0 + row as f32 * 13.0,
+                60.0 + row as f32 * 7.0,
+                9.0,
+                0x30405000 | (row * 20 + 40),
+            )
+        }));
+        nodes
+    }
+
+    fn layer(id: u64, bounds: GeometryRect, reason: PaintLayerReason) -> RenderPaintLayer {
+        let policy = if reason == PaintLayerReason::Root {
+            PaintLayerPolicy::DirectOnly
+        } else {
+            PaintLayerPolicy::Cacheable
+        };
+        RenderPaintLayer::from_children(id, bounds, PaintLayerPlacement::Fixed, policy, reason, 1, vec![])
+    }
+
+    /// A 24 px fan turning once every `period_ms`, as tree/render.rs builds a
+    /// renderer-driven layer: its own Transform node holding the built
+    /// transform.
+    fn fan(started_at: Instant, x: f32, y: f32, period_ms: f64) -> RenderNode {
+        let bounds = geometry(x, y, 24.0, 24.0);
+        let mut fan = layer(900, bounds, PaintLayerReason::Animation).with_children(vec![
+            RenderNode::Transform {
+                transform: Affine2::identity(),
+                children: vec![
+                    rect(x, y + 10.0, 24.0, 4.0, 0x1E88E5FF),
+                    rect(x + 10.0, y, 4.0, 24.0, 0x1E88E5FF),
+                ],
+            },
+        ]);
+        let turn = |deg: f64| Attrs {
+            rotate: Some(deg),
+            ..Attrs::default()
+        };
+        fan.renderer_animation = Some(Arc::new(LayerRendererAnimation {
+            spec: Arc::new(AnimationSpec {
+                keyframes: vec![turn(0.0), turn(360.0)],
+                duration_ms: period_ms,
+                curve: AnimationCurve::Linear,
+                repeat: AnimationRepeat::Loop,
+            }),
+            started_at,
+            revision: 0,
+            frame: Frame {
+                x,
+                y,
+                width: 24.0,
+                height: 24.0,
+                ..Frame::default()
+            },
+            base: Attrs::default(),
+            current_transform: Affine2::identity(),
+            current_alpha: 1.0,
+            offset: (0.0, 0.0),
+            bounds_transform: Affine2::identity(),
+        }));
+        RenderNode::PaintLayer(fan)
+    }
+
+    /// Twelve cards; the first holds the fan.
+    fn dashboard(started_at: Instant) -> RenderScene {
+        let cards = (0..12u64)
+            .map(|index| {
+                let (x, y) = (10.0 + (index % 3) as f32 * 155.0, 10.0 + (index / 3) as f32 * 155.0);
+                let bounds = geometry(x, y, 140.0, 130.0);
+                let mut nodes = card_nodes(x, y);
+                if index == 0 {
+                    nodes.push(fan(started_at, x + 100.0, y + 90.0, 1000.0));
+                }
+                RenderNode::PaintLayer(
+                    layer(10 + index, bounds, PaintLayerReason::ScrollContent).with_children(nodes),
+                )
+            })
+            .collect();
+        RenderScene {
+            fonts: None,
+            images: None,
+            nodes: vec![RenderNode::PaintLayer(
+                layer(1, geometry(0.0, 0.0, W as f32, H as f32), PaintLayerReason::Root)
+                    .with_children(cards),
+            )],
+        }
+    }
+
+    fn surface() -> Surface {
+        let info = skia_safe::ImageInfo::new(
+            (W as i32, H as i32),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        skia_safe::surfaces::raster(&info, None, None).expect("raster surface")
+    }
+
+    fn draw(renderer: &mut SceneRenderer, surface: &mut Surface, state: &RenderState) {
+        let mut frame = RenderFrame::new(surface, None);
+        renderer.render(&mut frame, state);
+    }
+
+    fn pixels(surface: &mut Surface) -> Vec<u8> {
+        let info = surface.image_info();
+        let mut pixels = vec![0u8; (W * H * 4) as usize];
+        assert!(surface.read_pixels(&info, pixels.as_mut_slice(), (W * 4) as usize, (0, 0)));
+        pixels
+    }
+
+    fn cached_renderer() -> SceneRenderer {
+        SceneRenderer::with_cache_config(RendererCacheConfig {
+            enabled: true,
+            ..RendererCacheConfig::default()
+        })
+    }
+
+    /// The pixels of `state` drawn in full on a fresh renderer.
+    fn reference(state: &RenderState) -> Vec<u8> {
+        let mut expected = RenderState::new(state.scene.clone(), state.clear_color, 1, false);
+        expected.damage = None;
+        let mut surface = surface();
+        draw(&mut SceneRenderer::new(), &mut surface, &expected);
+        pixels(&mut surface)
+    }
+
+    #[test]
+    fn an_animation_only_frame_walks_only_the_runs_under_its_damage() {
+        let started_at = Instant::now();
+        let mut renderer = cached_renderer();
+        let mut surface = surface();
+        let mut state = RenderState::new(dashboard(started_at), Color::WHITE, 1, false);
+        state.advance_renderer_animations(started_at);
+        draw(&mut renderer, &mut surface, &state);
+        let full = renderer.renderer_cache.last_frame_work();
+        // One run per card and the fan's own.
+        assert_eq!(full.runs_visited, 13, "{full:?}");
+        assert_eq!(full.runs_culled, 0);
+        assert_eq!(full.damage_pixels, 0);
+
+        for frame in 1..=6u64 {
+            let advance =
+                state.advance_renderer_animations(started_at + Duration::from_millis(frame * 37));
+            assert!(advance.changed);
+            state.damage = advance.damage;
+            draw(&mut renderer, &mut surface, &state);
+            let work = renderer.renderer_cache.last_frame_work();
+            // The fan and the card under it; the other eleven are culled.
+            assert_eq!(work.runs_visited, 13, "{work:?}");
+            assert_eq!(work.runs_culled, 11, "{work:?}");
+            assert_eq!(work.run_primitives, 2 + 10, "{work:?}");
+            assert!(
+                work.damage_pixels > 0 && work.damage_pixels < u64::from(W * H) / 100,
+                "{work:?}"
+            );
+            assert!(pixels(&mut surface) == reference(&state), "frame {frame}: wrong pixels");
+        }
+    }
+
+    #[test]
+    fn a_run_that_reaches_into_the_damage_is_still_drawn() {
+        // The damage clips the canvas; a run straddling its edge draws the
+        // part inside, so it must not be culled.
+        let started_at = Instant::now();
+        let mut renderer = cached_renderer();
+        let mut surface = surface();
+        // The fan sits on the corner shared by four cards.
+        let mut scene = dashboard(started_at);
+        if let RenderNode::PaintLayer(root) = &mut scene.nodes[0] {
+            let mut nodes = root.content_nodes();
+            nodes.push(fan(started_at, 140.0, 130.0, 700.0));
+            *root = root.with_children(nodes);
+        }
+        let mut state = RenderState::new(scene, Color::WHITE, 1, false);
+        state.advance_renderer_animations(started_at);
+        draw(&mut renderer, &mut surface, &state);
+        for frame in 1..=5u64 {
+            let advance =
+                state.advance_renderer_animations(started_at + Duration::from_millis(frame * 53));
+            state.damage = advance.damage;
+            draw(&mut renderer, &mut surface, &state);
+            assert!(pixels(&mut surface) == reference(&state), "frame {frame}: wrong pixels");
+        }
+    }
+
+    #[test]
+    fn partial_frames_do_not_age_the_cached_page() {
+        let started_at = Instant::now();
+        let mut renderer = cached_renderer();
+        let mut surface = surface();
+        let mut state = RenderState::new(dashboard(started_at), Color::WHITE, 1, false);
+        for _ in 0..4 {
+            draw(&mut renderer, &mut surface, &state);
+        }
+        let (stored, ..) = renderer.renderer_cache.payload_resident_stats();
+        assert!(stored >= 11, "the cards should be cached: {stored}");
+
+        // Several seconds of the fan alone: far past the stale-frame limit.
+        for frame in 1..=(MOVING_PAINT_LAYER_PAYLOAD_CACHE_MAX_STALE_FRAMES * 2) {
+            let advance =
+                state.advance_renderer_animations(started_at + Duration::from_millis(frame * 18));
+            state.damage = advance.damage;
+            draw(&mut renderer, &mut surface, &state);
+        }
+        let (kept, ..) = renderer.renderer_cache.payload_resident_stats();
+        assert_eq!(kept, stored, "unvisited cards must not go stale");
+
+        // The next full frame (a scene from the tree) composites them all.
+        state.damage = None;
+        let stats = {
+            let mut frame = RenderFrame::new(&mut surface, None);
+            renderer.render(&mut frame, &state).renderer_cache.expect("cache stats")
+        };
+        assert_eq!(stats.paint_layer.misses, 0, "{:?}", stats.paint_layer);
+        assert!(stats.paint_layer.hits >= 11, "{:?}", stats.paint_layer);
+        assert!(pixels(&mut surface) == reference(&state));
     }
 }

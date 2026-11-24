@@ -129,7 +129,7 @@ fn a_change_beside_a_clean_scroll_list_reuses_the_lists_canonical_layer() {
     let _ = super::super::render_tree_scene_with_scroll_layers(&tree);
     let _ = super::super::take_layer_rewrites_computed();
 
-    tree.get_mut(&badge_id).expect("badge").layout.effective = solid_fill_attrs((40, 200, 40));
+    tree.get_mut(&badge_id).expect("badge").layout.effective = solid_fill_attrs((40, 200, 40)).into();
     tree.mark_render_and_registry_refresh_dirty(&badge_id);
     super::super::reset_render_traversal_diagnostics_for_benchmark();
     let changed = super::super::render_tree_scene_with_scroll_layers(&tree).scene;
@@ -157,13 +157,13 @@ fn a_changed_list_is_canonicalized_again() {
     let _ = super::super::take_layer_rewrites_computed();
 
     let row_id = NodeId::from_u64(71_003);
-    tree.get_mut(&row_id).expect("row").layout.effective = solid_fill_attrs((1, 2, 3));
+    tree.get_mut(&row_id).expect("row").layout.effective = solid_fill_attrs((1, 2, 3)).into();
     tree.mark_render_and_registry_refresh_dirty(&row_id);
     let changed = super::super::render_tree_scene_with_scroll_layers(&tree).scene;
     assert!(super::super::take_layer_rewrites_computed() > 0);
 
     let mut cold_tree = screen((200, 40, 40)).tree;
-    cold_tree.get_mut(&row_id).expect("row").layout.effective = solid_fill_attrs((1, 2, 3));
+    cold_tree.get_mut(&row_id).expect("row").layout.effective = solid_fill_attrs((1, 2, 3)).into();
     let cold = super::super::render_tree_scene_with_scroll_layers(&cold_tree).scene;
     assert_eq!(changed.nodes, cold.nodes);
 }

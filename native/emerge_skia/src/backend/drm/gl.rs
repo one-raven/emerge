@@ -3419,6 +3419,18 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                 if renderer_animations_active {
                     desired_primary_generation = desired_primary_generation.wrapping_add(1);
                 }
+                // One Raven patch: animation-only frames are drawn at the
+                // rate `animation_rate` picks for the scene's animations
+                // (measured once per scene version), counted from the last
+                // presented primary; a frame skipped as unchanged waits
+                // `animation_retry_at`. The generation such a frame was armed
+                // with lets it be dropped when nothing it would draw changed.
+                let reduced_animation_rates = crate::backend::animation_rate::reduced_rates_enabled();
+                let mut animation_divisor = 1u32;
+                let mut animation_divisor_version: Option<u64> = None;
+                let mut last_primary_presented_at = first_presented_at;
+                let mut animation_retry_at: Option<Instant> = None;
+                let mut animation_armed_generation: Option<u64> = None;
                 let mut next_render_profile_at = Instant::now();
                 let mut cursor_snapshot = cursor_state.snapshot();
                 let mut cursor_pos = cursor_snapshot.state.pos;
@@ -3617,6 +3629,7 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
 
                                             frame.animation_frame.observed(presented_at);
                                             production.progress(predicted_next_present_at);
+                                            last_primary_presented_at = presented_at;
 
                                             if frame.animation_frame.active() {
                                                 follow_up_primary_until = Some(presented_at + FOLLOW_UP_PRIMARY_WINDOW);
@@ -3845,12 +3858,39 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                     // keep exactly one frame in the pipeline. Re-arming here,
                     // not on particular flip events, covers every path a flip
                     // can arrive by.
-                    if renderer_animations_active
+                    let animation_frame_waiting = renderer_animations_active
                         && desired_primary_generation == committed_primary_generation
                         && in_flight_primary_generation.is_none()
-                        && prepared_primary_generation.is_none()
-                    {
-                        desired_primary_generation = desired_primary_generation.wrapping_add(1);
+                        && prepared_primary_generation.is_none();
+                    if animation_frame_waiting {
+                        // One Raven patch: slow ambient loops are drawn at a
+                        // half or a third of the display rate.
+                        if animation_divisor_version != Some(render_state.render_version) {
+                            animation_divisor_version = Some(render_state.render_version);
+                            let divisor = crate::backend::animation_rate::frame_divisor(
+                                &render_state.renderer_animation_motions(),
+                                frame_interval,
+                                reduced_animation_rates,
+                            );
+                            if divisor != animation_divisor && config.renderer_stats_log {
+                                native_log.info(
+                                    "drm",
+                                    format!("renderer-driven animations drawn at 1/{divisor} of the display rate"),
+                                );
+                            }
+                            animation_divisor = divisor;
+                        }
+                        let due_at = crate::backend::animation_rate::frame_due_at(
+                            last_primary_presented_at,
+                            animation_retry_at,
+                            frame_interval,
+                            animation_divisor,
+                        );
+                        if Instant::now() >= due_at {
+                            animation_retry_at = None;
+                            desired_primary_generation = desired_primary_generation.wrapping_add(1);
+                            animation_armed_generation = Some(desired_primary_generation);
+                        }
                     }
                     let mut gbm_buffer_starved = false;
                     if should_prepare_primary(
@@ -3891,93 +3931,123 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                 && last_drawn_scene_version == Some(render_state.render_version)
                                 && !cursor_visible
                                 && render_state.video_target_ids.is_empty();
-                            damage_history.push_front(if animation_only { advance.damage } else { None });
-                            damage_history.truncate(4);
-                            let buffer_age = egl_surface_attribute(
-                                &egl_state.egl,
-                                egl_state.display,
-                                egl_state.surface,
-                                0x313D, // EGL_BUFFER_AGE_EXT
-                            )
-                            .unwrap_or(0);
-                            render_state.damage = if buffer_age >= 1
-                                && (buffer_age as usize) <= damage_history.len()
-                            {
-                                damage_history
-                                    .iter()
-                                    .take(buffer_age as usize)
-                                    .try_fold(None, |acc: Option<crate::tree::geometry::Rect>, d| {
-                                        d.map(|d| crate::render_scene::union_damage(acc, d))
-                                    })
-                                    .flatten()
-                            } else {
-                                None
-                            };
-                            last_drawn_scene_version = Some(render_state.render_version);
-                            // One Raven patch: a primary drawn without its own
-                            // unchanged-frame check must not leave the fingerprint
-                            // describing an older frame.
-                            if !fingerprint_describes_drawn_primary(
-                                fingerprinted_generation,
-                                desired_primary_generation,
-                            ) {
-                                renderer.invalidate_visible_frame_fingerprint();
-                                fingerprinted_generation = None;
-                            }
-                            match prepare_primary_frame(
-                                desired_primary_generation,
-                                config.rendering_api,
-                                &mut renderer,
-                                raster_renderer.as_mut(),
-                                frame_surface,
-                                dimensions,
-                                &render_state,
-                                cursor_pos,
-                                cursor_visible,
-                                hw_cursor_enabled,
-                                current_cursor_icon,
-                                &cursor_theme,
-                                &video_registry,
-                                video_import.as_ref(),
-                                &egl_state,
-                                &gbm_surface,
-                                config.force_gpu_finish,
-                                &card,
-                                stats.as_deref(),
-                                profile_render,
-                                config.renderer_cache_config.enabled,
-                                &mut gpu_render_timer,
-                                &native_log,
-                                &mut last_video_sync_error,
-                                &mut logged_video_import,
-                                &latest_frame,
-                            ) {
-                                Ok(frame) => {
-                                    frames.prepared = Some(frame);
-                                    let frame =
-                                        frames.prepared.as_ref().expect("prepared frame installed");
-                                    // Failed syncs and pending retired-import fences must survive stale
-                                    // prepared-frame replacement and unchanged-frame checks.
-                                    video_sync_required =
-                                        !frame.video_sync_succeeded || frame.video_needs_cleanup;
-                                    if let Some(stats) = stats.as_deref() {
-                                        stats.record_drm_primary_prepared(
-                                            frame.imported_video_frames > 0,
-                                        );
-                                    }
-                                    if let Some(accounting) = loop_accounting.as_mut() {
-                                        accounting
-                                            .add_work(LoopWork::Draw, draw_started_at.elapsed());
-                                        accounting.drew();
-                                    }
+                            // One Raven patch: an animation-only frame whose
+                            // samples all round to what is on screen (a hold in
+                            // the keyframes) isn't drawn or presented.
+                            let unchanged_animation_frame = animation_only
+                                && !advance.changed
+                                && animation_armed_generation == Some(desired_primary_generation)
+                                && !video_sync_required
+                                && capture_request_generation.is_none();
+                            if unchanged_animation_frame {
+                                committed_primary_generation = desired_primary_generation;
+                                animation_retry_at = Some(
+                                    crate::backend::animation_rate::retry_after_unchanged_at(
+                                        now,
+                                        frame_interval,
+                                        animation_divisor,
+                                    ),
+                                );
+                                if let Some(accounting) = loop_accounting.as_mut() {
+                                    accounting.animation_frame_unchanged(animation_divisor);
                                 }
-                                Err(err) => {
-                                    native_log.error(
-                                        "drm",
-                                        format!("DRM backend unavailable: frame preparation failed: {err}"),
+                            } else {
+                                damage_history.push_front(if animation_only { advance.damage } else { None });
+                                damage_history.truncate(4);
+                                let buffer_age = egl_surface_attribute(
+                                    &egl_state.egl,
+                                    egl_state.display,
+                                    egl_state.surface,
+                                    0x313D, // EGL_BUFFER_AGE_EXT
+                                )
+                                .unwrap_or(0);
+                                render_state.damage = if buffer_age >= 1
+                                    && (buffer_age as usize) <= damage_history.len()
+                                {
+                                    damage_history
+                                        .iter()
+                                        .take(buffer_age as usize)
+                                        .try_fold(None, |acc: Option<crate::tree::geometry::Rect>, d| {
+                                            d.map(|d| crate::render_scene::union_damage(acc, d))
+                                        })
+                                        .flatten()
+                                } else {
+                                    None
+                                };
+                                if animation_only && let Some(accounting) = loop_accounting.as_mut() {
+                                    accounting.animation_frame(
+                                        render_state.damage.map(|damage| {
+                                            (damage.width.max(0.0) * damage.height.max(0.0)) as u64
+                                        }),
+                                        animation_divisor,
                                     );
-                                    eprintln!("DRM backend unavailable: {err}");
-                                    break;
+                                }
+                                last_drawn_scene_version = Some(render_state.render_version);
+                                // One Raven patch: a primary drawn without its own
+                                // unchanged-frame check must not leave the fingerprint
+                                // describing an older frame.
+                                if !fingerprint_describes_drawn_primary(
+                                    fingerprinted_generation,
+                                    desired_primary_generation,
+                                ) {
+                                    renderer.invalidate_visible_frame_fingerprint();
+                                    fingerprinted_generation = None;
+                                }
+                                match prepare_primary_frame(
+                                    desired_primary_generation,
+                                    config.rendering_api,
+                                    &mut renderer,
+                                    raster_renderer.as_mut(),
+                                    frame_surface,
+                                    dimensions,
+                                    &render_state,
+                                    cursor_pos,
+                                    cursor_visible,
+                                    hw_cursor_enabled,
+                                    current_cursor_icon,
+                                    &cursor_theme,
+                                    &video_registry,
+                                    video_import.as_ref(),
+                                    &egl_state,
+                                    &gbm_surface,
+                                    config.force_gpu_finish,
+                                    &card,
+                                    stats.as_deref(),
+                                    profile_render,
+                                    config.renderer_cache_config.enabled,
+                                    &mut gpu_render_timer,
+                                    &native_log,
+                                    &mut last_video_sync_error,
+                                    &mut logged_video_import,
+                                    &latest_frame,
+                                ) {
+                                    Ok(frame) => {
+                                        frames.prepared = Some(frame);
+                                        let frame =
+                                            frames.prepared.as_ref().expect("prepared frame installed");
+                                        // Failed syncs and pending retired-import fences must survive stale
+                                        // prepared-frame replacement and unchanged-frame checks.
+                                        video_sync_required =
+                                            !frame.video_sync_succeeded || frame.video_needs_cleanup;
+                                        if let Some(stats) = stats.as_deref() {
+                                            stats.record_drm_primary_prepared(
+                                                frame.imported_video_frames > 0,
+                                            );
+                                        }
+                                        if let Some(accounting) = loop_accounting.as_mut() {
+                                            accounting
+                                                .add_work(LoopWork::Draw, draw_started_at.elapsed());
+                                            accounting.drew();
+                                        }
+                                    }
+                                    Err(err) => {
+                                        native_log.error(
+                                            "drm",
+                                            format!("DRM backend unavailable: frame preparation failed: {err}"),
+                                        );
+                                        eprintln!("DRM backend unavailable: {err}");
+                                        break;
+                                    }
                                 }
                             }
                         } else {
@@ -4271,6 +4341,21 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                                 .map(|current_deadline| current_deadline.min(deadline))
                                 .unwrap_or(deadline),
                         );
+                    }
+                    // One Raven patch: wake for the next animation-only frame
+                    // when one waits on its rate (nothing else would wake us).
+                    if renderer_animations_active
+                        && desired_primary_generation == committed_primary_generation
+                        && frames.in_flight.is_none()
+                        && frames.prepared.is_none()
+                    {
+                        let due_at = crate::backend::animation_rate::frame_due_at(
+                            last_primary_presented_at,
+                            animation_retry_at,
+                            frame_interval,
+                            animation_divisor,
+                        );
+                        next_deadline = Some(next_deadline.map_or(due_at, |deadline| deadline.min(due_at)));
                     }
                     if gpu_render_timer.window_drain_poll_required() {
                         let drain_poll_at = Instant::now() + Duration::from_millis(1);

@@ -25,6 +25,37 @@ pub type NodeIx = usize;
 const DETACHED_LAYOUT_CACHE_LIMIT: usize = 16;
 const DETACHED_LAYOUT_CACHE_MAX_NODES: usize = 128;
 
+/// One Raven patch: the hasher for maps keyed by `NodeId`. std's SipHash
+/// made the tree's id-to-index lookups (several per node per layout pass,
+/// decode, apply and refresh) a third of laying out an inserted 29k-node
+/// subtree. Ids are the app's own counters, so no DoS resistance is needed:
+/// one multiply (Fx), with the well-mixed high half folded into the low bits
+/// the table indexes by.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NodeIdHasher(u64);
+
+impl std::hash::Hasher for NodeIdHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+}
+
+/// One Raven patch: a `HashMap` keyed by `NodeId` with `NodeIdHasher`.
+pub type NodeIdMap<V> = HashMap<NodeId, V, std::hash::BuildHasherDefault<NodeIdHasher>>;
+
 /// Unique identifier for an element.
 /// Stored as the numeric runtime node id shared with Elixir.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -588,7 +619,8 @@ pub struct NodeSpec {
     pub attrs_raw: Vec<u8>,
 
     /// Original unscaled attributes (as received from Elixir).
-    pub declared: Attrs,
+    /// One Raven patch: shared copy-on-write (see `SharedAttrs`).
+    pub declared: super::attrs::SharedAttrs,
 }
 
 /// An Elixir-authored value, independent of the native rendering mirror.
@@ -738,7 +770,8 @@ pub struct NodeLayoutState {
     pub dimension_samples: Option<std::sync::Arc<super::layout::dimensions::DimensionSamples>>,
     pub dimension_facts: super::layout::dimensions::DimensionFacts,
     /// Scaled attributes (populated by layout pass, used by render).
-    pub effective: Attrs,
+    /// One Raven patch: shared copy-on-write (see `SharedAttrs`).
+    pub effective: super::attrs::SharedAttrs,
 
     /// Computed layout frame (populated after layout pass).
     pub frame: Option<Frame>,
@@ -775,7 +808,7 @@ impl Default for NodeLayoutState {
             renderer_animation: None,
             dimension_samples: None,
             dimension_facts: Default::default(),
-            effective: Attrs::default(),
+            effective: Default::default(),
             frame: None,
             render_frame: None,
             measured_frame: None,
@@ -840,7 +873,15 @@ struct TreeTopology {
 impl Element {
     /// Create an element with decoded attributes.
     /// The attrs are stored as base_attrs (original) and cloned to attrs (for scaling).
-    pub fn with_attrs(id: NodeId, kind: ElementKind, attrs_raw: Vec<u8>, attrs: Attrs) -> Self {
+    pub fn with_attrs(
+        id: NodeId,
+        kind: ElementKind,
+        attrs_raw: Vec<u8>,
+        attrs: impl Into<super::attrs::SharedAttrs>,
+    ) -> Self {
+        // One Raven patch: the declared and effective attrs start as one
+        // shared value; preparation replaces the effective ones.
+        let attrs: super::attrs::SharedAttrs = attrs.into();
         Self {
             id,
             spec: NodeSpec {
@@ -1262,6 +1303,26 @@ pub(crate) struct AnimationQueryRetirement {
     pub continuation_ancestry_visits: std::cell::Cell<u64>,
 }
 
+/// One Raven patch: elements a batch removed, kept until the tree actor has
+/// published the batch's frame (`ElementTree::release_retired`). Dropping a
+/// removed 29k-node list (every attrs, cache and layer allocation) took a
+/// quarter of applying its replacement, ahead of the frame that shows it.
+/// A clone of the tree starts with none.
+#[derive(Default)]
+pub(crate) struct RetiredElements(Vec<Box<Element>>);
+
+impl Clone for RetiredElements {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for RetiredElements {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RetiredElements({})", self.0.len())
+    }
+}
+
 /// The complete element tree with indexed access.
 #[derive(Clone, Debug)]
 pub struct ElementTree {
@@ -1298,13 +1359,20 @@ pub struct ElementTree {
     root: Option<NodeIx>,
 
     /// Dense node storage indexed by NodeIx.
-    pub nodes: Vec<Option<NodeRecord>>,
+    ///
+    /// One Raven patch: boxed. An `Element` is ~7.9 KB, and a subtree patch
+    /// moved each one several times (decoded into a growing arena, moved into
+    /// the tree, moved out on removal): a third of a 1,440-row re-sort was
+    /// `memmove`. A box moves as a pointer.
+    pub nodes: Vec<Option<Box<NodeRecord>>>,
 
     /// Shared node-id to internal index map.
-    pub id_to_ix: HashMap<NodeId, NodeIx>,
+    pub id_to_ix: NodeIdMap<NodeIx>,
 
     /// Reusable free slots in the arena.
     pub free_list: Vec<NodeIx>,
+
+    pub(crate) retired: RetiredElements,
 
     layout_cache_stats: LayoutCacheStats,
     layout_cache_stats_enabled: bool,
@@ -1354,8 +1422,9 @@ impl Default for ElementTree {
             current_scale: 1.0,
             root: None,
             nodes: Vec::new(),
-            id_to_ix: HashMap::new(),
+            id_to_ix: NodeIdMap::default(),
             free_list: Vec::new(),
+            retired: RetiredElements::default(),
             layout_cache_stats: LayoutCacheStats::default(),
             layout_cache_stats_enabled: false,
             detached_layout_cache: Vec::new(),
@@ -1470,11 +1539,11 @@ impl ElementTree {
                     copy.children = node.children.clone();
                     copy.nearby = node.nearby.clone();
                 }
-                Some(copy)
+                Some(Box::new(copy))
             })
             .collect();
         // Compact arena holes instead of retaining a second copy of free slots.
-        let id_to_ix: HashMap<_, _> = nodes
+        let id_to_ix: NodeIdMap<_> = nodes
             .iter()
             .enumerate()
             .filter_map(|(ix, node)| node.as_ref().map(|node| (node.id, ix)))
@@ -1961,7 +2030,7 @@ impl ElementTree {
     }
 
     pub fn get_ix(&self, ix: NodeIx) -> Option<&Element> {
-        self.nodes.get(ix).and_then(|slot| slot.as_ref())
+        self.nodes.get(ix).and_then(|slot| slot.as_deref())
     }
 
     pub(crate) fn invalidate_unapplied_frame(&mut self) {
@@ -1985,7 +2054,7 @@ impl ElementTree {
 
     pub fn get_ix_mut(&mut self, ix: NodeIx) -> Option<&mut Element> {
         self.invalidate_unapplied_frame();
-        self.nodes.get_mut(ix).and_then(|slot| slot.as_mut())
+        self.nodes.get_mut(ix).and_then(|slot| slot.as_deref_mut())
     }
 
     pub fn parent_link_of(&self, ix: NodeIx) -> Option<ParentLink> {
@@ -2345,20 +2414,20 @@ impl ElementTree {
     }
 
     pub fn iter_nodes(&self) -> impl Iterator<Item = &Element> {
-        self.nodes.iter().filter_map(|slot| slot.as_ref())
+        self.nodes.iter().filter_map(|slot| slot.as_deref())
     }
 
     pub fn iter_nodes_mut(&mut self) -> impl Iterator<Item = &mut Element> {
         self.invalidate_unapplied_frame();
         #[cfg(test)]
         self.mark_topology_dirty();
-        self.nodes.iter_mut().filter_map(|slot| slot.as_mut())
+        self.nodes.iter_mut().filter_map(|slot| slot.as_deref_mut())
     }
 
     pub fn iter_node_pairs(&self) -> impl Iterator<Item = (NodeId, &Element)> {
         self.nodes
             .iter()
-            .filter_map(|slot| slot.as_ref().map(|element| (element.id, element)))
+            .filter_map(|slot| slot.as_deref().map(|element| (element.id, element)))
     }
 
     /// Get an element by ID.
@@ -2374,6 +2443,11 @@ impl ElementTree {
 
     /// Insert or update an element.
     pub fn insert(&mut self, element: Element) {
+        self.insert_boxed(Box::new(element));
+    }
+
+    /// One Raven patch: `insert` for an element already boxed (see `nodes`).
+    pub fn insert_boxed(&mut self, element: Box<Element>) {
         if self.publication.0.is_some() && self.get(&element.id).is_some() {
             self.capture_animation_subtree(&element.id);
         }
@@ -2384,7 +2458,7 @@ impl ElementTree {
         let mut removed_scroll_active = false;
         if let Some(&ix) = self.id_to_ix.get(&element.id) {
             removed_scroll_active = self.nodes[ix]
-                .as_ref()
+                .as_deref()
                 .is_some_and(Self::element_has_active_scroll_offset);
             self.nodes[ix] = Some(element);
             self.mark_measure_dirty_ix(ix);
@@ -2417,12 +2491,34 @@ impl ElementTree {
     }
 
     pub fn remove_node(&mut self, id: &NodeId) -> Option<Element> {
+        self.remove_node_boxed(id).map(|element| *element)
+    }
+
+    /// One Raven patch: drop the elements removed since the last call (see
+    /// `RetiredElements`).
+    pub fn release_retired(&mut self) {
+        self.retired = RetiredElements::default();
+    }
+
+    /// One Raven patch: keep a removed element until `release_retired`.
+    pub(crate) fn retire(&mut self, element: Box<Element>) {
+        self.retired.0.push(element);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_len(&self) -> usize {
+        self.retired.0.len()
+    }
+
+    /// One Raven patch: `remove_node` without moving the element out of its
+    /// box (see `nodes`).
+    pub fn remove_node_boxed(&mut self, id: &NodeId) -> Option<Box<Element>> {
         self.invalidate_unapplied_frame();
         let ix = self.id_to_ix.remove(id)?;
         self.layout_structure_epoch = self.layout_structure_epoch.wrapping_add(1);
         self.layout_model_epoch = self.layout_model_epoch.wrapping_add(1);
         let removed_scroll_active = self.nodes[ix]
-            .as_ref()
+            .as_deref()
             .is_some_and(Self::element_has_active_scroll_offset);
         let dirty_parent = self
             .parent_link_of(ix)
@@ -2898,7 +2994,10 @@ impl ElementTree {
         uploaded.layout_model_epoch = self.layout_model_epoch.wrapping_add(1);
         uploaded.stamp_all_mounted_at_revision(revision);
         uploaded.finish_patch_frame();
-        *self = uploaded;
+        // One Raven patch: retire the replaced tree's elements (see `retired`).
+        let mut old = std::mem::replace(self, uploaded);
+        self.retired = std::mem::take(&mut old.retired);
+        self.retired.0.extend(old.nodes.drain(..).flatten());
 
         #[cfg(test)]
         self.mark_topology_dirty();
@@ -3013,11 +3112,23 @@ impl ElementTree {
         parent_id: &NodeId,
         child_ids: Vec<NodeId>,
     ) -> Result<(), String> {
+        self.set_children_capturing(parent_id, child_ids, true)
+    }
+
+    /// One Raven patch: `set_children`, optionally without capturing the
+    /// animation sources of the subtrees it attaches or detaches (for a caller
+    /// that has captured them).
+    pub(crate) fn set_children_capturing(
+        &mut self,
+        parent_id: &NodeId,
+        child_ids: Vec<NodeId>,
+        capture: bool,
+    ) -> Result<(), String> {
         let parent_ix = self
             .ix_of(parent_id)
             .ok_or_else(|| format!("parent not found: {:?}", parent_id.0))?;
         let child_ixs = self.resolve_child_ixs(&child_ids)?;
-        if self.publication.0.is_some() {
+        if capture && self.publication.0.is_some() {
             let old = self
                 .child_ids(parent_id)
                 .into_iter()
@@ -3070,12 +3181,23 @@ impl ElementTree {
         host_id: &NodeId,
         mounts: Vec<NearbyMount>,
     ) -> Result<(), String> {
+        self.set_nearby_mounts_capturing(host_id, mounts, true)
+    }
+
+    /// One Raven patch: `set_nearby_mounts`, optionally without capturing (see
+    /// `set_children_capturing`).
+    pub(crate) fn set_nearby_mounts_capturing(
+        &mut self,
+        host_id: &NodeId,
+        mounts: Vec<NearbyMount>,
+        capture: bool,
+    ) -> Result<(), String> {
         let host_ix = self
             .ix_of(host_id)
             .ok_or_else(|| format!("host not found: {:?}", host_id.0))?;
 
         let nearby_ixs = self.resolve_nearby_ixs(&mounts)?;
-        if self.publication.0.is_some() {
+        if capture && self.publication.0.is_some() {
             let old = self
                 .nearby_mounts_for(host_id)
                 .into_iter()

@@ -822,7 +822,7 @@ fn normal_layout_keeps_loading_and_read_only_image_lookup_stages() {
 fn declaration_preimages_restore_absent_attrs_and_do_not_leak_across_queries() {
     let mut source = tree();
     source.get_mut(&id(1)).unwrap().spec.declared.width = Some(Length::Px(800.0));
-    let original = source.get(&id(1)).unwrap().spec.declared.clone();
+    let original = source.get(&id(1)).unwrap().spec.declared.as_ref().clone();
     let mut before = original.clone();
     before.width = None;
     before.padding = Some(Padding::Uniform(20.0));

@@ -6735,7 +6735,7 @@ mod tests {
             focus_on_mount: None,
         };
 
-        let mut cleared_attrs = element.spec.declared.clone();
+        let mut cleared_attrs = (*element.spec.declared).clone();
         cleared_attrs.content = Some(String::new());
         cleared_attrs.text_input_cursor = Some(0);
         let cleared_element =

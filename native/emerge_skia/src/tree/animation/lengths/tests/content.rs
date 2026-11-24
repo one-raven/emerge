@@ -217,7 +217,7 @@ fn content_both_axes_use_joint_native_destinations_at_all_scales() {
                 width: Some(Length::Px(40.0)),
                 height: Some(Length::Px(20.0)),
                 ..Default::default()
-            };
+            }.into();
             Arc::make_mut(
                 tree.get_mut(&id(2))
                     .unwrap()
@@ -426,7 +426,7 @@ fn content_changes_use_frozen_image_facts_without_hydration() {
         )),
         width: Some(Length::Content),
         ..Default::default()
-    };
+    }.into();
     let mut rt = AnimationRuntime::default();
     let start = Instant::now();
     let tick = |tree: &mut ElementTree, rt: &mut AnimationRuntime, ms| {
@@ -525,7 +525,7 @@ fn content_policy_first_mount_does_not_turn_child_animation_ticks_into_changes()
             Axis::Width,
         )),
         ..Default::default()
-    };
+    }.into();
     let mut rt = AnimationRuntime::default();
     let start = Instant::now();
     for us in [0, 250_000, 500_000, 1_000_000] {

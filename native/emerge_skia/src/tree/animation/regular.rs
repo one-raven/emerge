@@ -311,8 +311,8 @@ fn handoff_source(
     enter: Option<&AnimationSpec>,
 ) -> Option<Arc<source::PresentationSource>> {
     let mut source = source::PresentationSource::capture(tree, &id)?;
-    source.declared = fields.select(&source.declared);
-    source.effective = fields.select(&source.effective);
+    source.declared = fields.select(&source.declared).into();
+    source.effective = fields.select(&source.effective).into();
     let first = spec.keyframes.first()?;
     for (i, field) in [change::Field::Width, change::Field::Height]
         .into_iter()

@@ -1,7 +1,7 @@
 //! First-write presentation preimages. This is pending frame work, not idle target history.
 use super::super::layout::dimensions::{Axis, AxisFootprint, capture_axis};
 use super::super::{
-    attrs::Attrs,
+    attrs::SharedAttrs,
     element::{ElementKind, ElementTree, NearbySlot, NodeId, ParentLink},
     invalidation::TreeInvalidation,
 };
@@ -12,9 +12,9 @@ type AttachmentPath = Vec<(NodeId, u64, ElementKind, Option<NearbySlot>)>;
 pub struct PresentationSource {
     pub mounted_at: u64,
     pub model: u64,
-    pub declared: Attrs,
+    pub declared: SharedAttrs,
     /// Existing effective coordinates, before patch or scale preparation.
-    pub effective: Attrs,
+    pub effective: SharedAttrs,
     pub scale: f32,
     pub dimensions: [Option<AxisFootprint>; 2],
     pub sampled: [bool; 2],
@@ -188,6 +188,52 @@ impl ElementTree {
     // own entry followed by its parent's, so derive it top-down (the same
     // path, checked against the walk in tests), and size the map once.
     pub(crate) fn capture_animation_subtree(&mut self, root: &NodeId) {
+        self.capture_subtree_sources(root, |_, _| true);
+    }
+
+    /// One Raven patch: capture for a subtree a Remove patch is about to drop.
+    ///
+    /// Every consumer reads the source map either as a whole (`is_empty`, and
+    /// `context_release`'s "all sources still valid") or by the id of a node
+    /// in the tree, checked against that node's mount; the one by-iteration
+    /// read of a source's own fields asks for `animate_change`. Once the root's
+    /// source is in the map (and invalid after the removal, as every removed
+    /// source is), a removed descendant's source can change a result only if
+    /// it has `animate_change` or its id comes back in this batch
+    /// (`reinserted`). Capture just those: a 1,440-node row list re-sorted on
+    /// the Stress screen cloned two `Attrs` and built a path for every node it
+    /// dropped, 26% of the patch. (A frame that fails to commit keeps its
+    /// sources for the next batch; an id reinserted there, before any commit,
+    /// would miss its old source. Emerge never reuses a removed id.)
+    pub(crate) fn capture_removed_animation_subtree(
+        &mut self,
+        root: &NodeId,
+        reinserted: impl Fn(&NodeId) -> bool,
+    ) {
+        self.capture_animation_source(root);
+        let root_captured = self
+            .pending_patch_effects
+            .sources
+            .get(root)
+            .zip(self.get(root))
+            .is_some_and(|(source, node)| source.mounted_at == node.lifecycle.mounted_at_revision);
+        if !root_captured {
+            self.capture_animation_subtree(root);
+            return;
+        }
+        self.capture_subtree_sources(root, |tree, id| {
+            reinserted(id)
+                || tree
+                    .get(id)
+                    .is_some_and(|node| node.spec.declared.animate_change.is_some())
+        });
+    }
+
+    fn capture_subtree_sources(
+        &mut self,
+        root: &NodeId,
+        wanted: impl Fn(&ElementTree, &NodeId) -> bool,
+    ) {
         let mut nodes: Vec<(NodeId, Option<usize>)> = Vec::new();
         let mut pending = vec![(*root, None)];
         while let Some((id, parent)) = pending.pop() {
@@ -204,13 +250,71 @@ impl ElementTree {
             );
             nodes.push((id, parent));
         }
-        self.pending_patch_effects.sources.reserve(nodes.len());
-        let mut paths: Vec<Arc<AttachmentPath>> = Vec::with_capacity(nodes.len());
-        for (id, parent) in nodes {
+        // One Raven patch: a node that can't be captured (no frame yet, mounted
+        // after the published frame, already captured for this mount) needs
+        // no path, and a freshly inserted subtree is all such nodes; paths are
+        // built only for the nodes captured, from the nearest built ancestor.
+        let Some(published) = self.publication.0 else {
+            return;
+        };
+        let capturable = |tree: &ElementTree, id: &NodeId| {
+            tree.get(id).is_some_and(|node| {
+                node.layout.frame.is_some()
+                    && node.lifecycle.mounted_at_revision <= published.revision
+                    && tree
+                        .pending_patch_effects
+                        .sources
+                        .get(id)
+                        .is_none_or(|source| {
+                            source.mounted_at != node.lifecycle.mounted_at_revision
+                        })
+            })
+        };
+        let mut paths: Vec<Option<Arc<AttachmentPath>>> = vec![None; nodes.len()];
+        let mut reserved = false;
+        for index in 0..nodes.len() {
+            let id = nodes[index].0;
+            if !wanted(self, &id) || !capturable(self, &id) {
+                continue;
+            }
+            #[cfg(any(test, feature = "bench-diagnostics"))]
+            SUBTREE_CAPTURE_VISITS.with(|count| count.set(count.get() + 1));
+            if !reserved {
+                self.pending_patch_effects
+                    .sources
+                    .reserve(nodes.len() - index);
+                reserved = true;
+            }
+            let path = self.subtree_attachment_path(&nodes, &mut paths, index);
+            debug_assert_eq!(*path, PresentationSource::attachment_path(self, &id));
+            self.capture_animation_source_with(&id, |_| path);
+        }
+    }
+
+    /// The attachment path of `nodes[index]`, built on its nearest ancestor's
+    /// (memoized in `paths`) as the walk to the root would build it.
+    fn subtree_attachment_path(
+        &self,
+        nodes: &[(NodeId, Option<usize>)],
+        paths: &mut [Option<Arc<AttachmentPath>>],
+        index: usize,
+    ) -> Arc<AttachmentPath> {
+        let mut chain = vec![index];
+        while let Some(&top) = chain.last() {
+            match nodes[top].1 {
+                Some(parent) if paths[top].is_none() => chain.push(parent),
+                _ => break,
+            }
+        }
+        for &at in chain.iter().rev() {
+            if paths[at].is_some() {
+                continue;
+            }
+            let (id, parent) = nodes[at];
             let entry = PresentationSource::attachment_entry(self, &id);
             let path = match (parent, entry) {
                 (Some(parent), Some(entry)) if self.root_id() != Some(id) => {
-                    let parent_path = &paths[parent];
+                    let parent_path = paths[parent].as_ref().expect("ancestor path built first");
                     let mut path = Vec::with_capacity(parent_path.len() + 1);
                     path.push(entry);
                     path.extend(parent_path.iter().copied());
@@ -218,15 +322,20 @@ impl ElementTree {
                 }
                 _ => Arc::new(PresentationSource::attachment_path(self, &id)),
             };
-            debug_assert_eq!(*path, PresentationSource::attachment_path(self, &id));
-            paths.push(Arc::clone(&path));
-            self.capture_animation_source_with(&id, |_| path);
+            paths[at] = Some(path);
         }
+        Arc::clone(paths[index].as_ref().expect("path built"))
     }
 
     pub(crate) fn finish_patch_frame(&mut self) {
         self.pending_patch_effects = PatchEffects::default();
     }
+}
+
+#[cfg(any(test, feature = "bench-diagnostics"))]
+thread_local! {
+    /// One Raven patch: nodes `capture_subtree_sources` built a source for.
+    pub(crate) static SUBTREE_CAPTURE_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

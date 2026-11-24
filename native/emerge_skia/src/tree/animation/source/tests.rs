@@ -1,6 +1,6 @@
 use super::*;
 use crate::tree::{
-    attrs::{Length, MouseOverAttrs},
+    attrs::{Attrs, Length, MouseOverAttrs},
     element::{Element, ElementKind},
     layout::{Constraint, layout_tree_default},
     patch::{Patch, apply_patches},
