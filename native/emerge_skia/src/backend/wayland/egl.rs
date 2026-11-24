@@ -147,11 +147,15 @@ pub(super) fn create_gl_env(
         gl_config.stencil_size() as usize,
     );
 
+    // One Raven patch: rasterize large SVGs off the render thread.
+    let mut renderer = SceneRenderer::with_cache_config(renderer_cache_config);
+    renderer
+        .set_async_vector_rasterization(crate::renderer::async_vector_rasterization_enabled(true));
     Ok(GlEnv {
         gl_surface,
         gl_context,
         swap_buffers_nonblocking,
-        renderer: SceneRenderer::with_cache_config(renderer_cache_config),
+        renderer,
         frame_surface,
         pending_capture: None,
     })

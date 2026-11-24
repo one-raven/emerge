@@ -7,6 +7,7 @@
 //! - Font cache for text rendering
 
 pub(crate) mod scene_images;
+mod vector_raster;
 use crate::fast_hash::FastHasher;
 use crate::render_color::RenderColor;
 pub use scene_images::{ImageSnapshot, ImageSnapshotRetention};
@@ -765,6 +766,18 @@ fn asset_context() -> Arc<RendererAssetContext> {
     crate::assets::current_renderer_context()
 }
 
+/// One Raven patch: whether a presenter rasterizes large SVG misses off the
+/// render thread (`SceneRenderer::set_async_vector_rasterization`).
+/// Interactive presenters do; headless capture does not, so a captured frame
+/// shows every picture. `EMERGE_ASYNC_SVG_RASTER=0` or `=1` overrides either.
+pub fn async_vector_rasterization_enabled(interactive: bool) -> bool {
+    match std::env::var("EMERGE_ASYNC_SVG_RASTER").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => interactive,
+    }
+}
+
 pub fn set_render_log_enabled(enabled: bool) {
     asset_context()
         .render_log_enabled
@@ -1149,6 +1162,9 @@ struct DecodedRaster {
 struct AssetPixelCache {
     entries: HashMap<String, DecodedRaster>,
     vectors: HashMap<RenderedVectorKey, RenderedVectorVariant>,
+    // One Raven patch: variants being rasterized off the render thread.
+    pending_vectors: HashSet<RenderedVectorKey>,
+    pending_notified_at: Option<Instant>,
     epoch: u64,
     total_bytes: u64,
     access_clock: u64,
@@ -1166,6 +1182,8 @@ impl Default for AssetPixelCache {
             total_bytes: 0,
             access_clock: 0,
             vectors: HashMap::new(),
+            pending_vectors: HashSet::new(),
+            pending_notified_at: None,
             epoch: 0,
             max_entries: ASSET_RASTER_CACHE_MAX_ENTRIES,
             max_bytes: ASSET_RASTER_CACHE_MAX_BYTES,
@@ -1718,12 +1736,24 @@ fn store_rendered_vector_variant(
     if !record_is_current_for_cache(&record) {
         return;
     }
-    let Some(bytes) = image_pixel_bytes(image) else {
-        return;
-    };
     let key = rendered_vector_key(asset_id, width, height, kind);
     let context = asset_context();
     let Ok(mut cache) = context.pixel_cache.lock() else {
+        return;
+    };
+    store_vector_variant_locked(&mut cache, &record, key, image);
+}
+
+// One Raven patch: split out so a variant rasterized off the render thread is
+// stored under the key its draw looked up. The caller has checked
+// `record_is_current_for_cache` (it takes this lock).
+fn store_vector_variant_locked(
+    cache: &mut AssetPixelCache,
+    record: &crate::assets::AssetRecord,
+    key: RenderedVectorKey,
+    image: &Image,
+) {
+    let Some(bytes) = image_pixel_bytes(image) else {
         return;
     };
     if record.epoch != cache.epoch || cache.max_entries == 0 || bytes > cache.max_bytes {
@@ -1732,7 +1762,7 @@ fn store_rendered_vector_variant(
     if let Some(existing) = cache.vectors.remove(&key) {
         cache.total_bytes = cache.total_bytes.saturating_sub(existing.bytes);
     }
-    let stamp = next_asset_raster_access_stamp(&mut cache);
+    let stamp = next_asset_raster_access_stamp(cache);
     cache.vectors.insert(
         key,
         RenderedVectorVariant {
@@ -1756,7 +1786,7 @@ fn store_rendered_vector_variant(
         .render_revision
         .store(crate::assets::next_render_revision(), Ordering::Relaxed);
     cache.total_bytes = cache.total_bytes.saturating_add(bytes);
-    evict_asset_rasters_if_needed(&mut cache);
+    evict_asset_rasters_if_needed(cache);
 }
 
 pub(crate) fn clear_rendered_vector_variants(asset_id: &str) {
@@ -4608,6 +4638,8 @@ pub struct SceneRenderer {
     video_state: RendererVideoState,
     renderer_cache: RendererCacheManager,
     last_visible_frame_fingerprint: Option<u64>,
+    // One Raven patch: rasterize large SVG misses off the render thread.
+    async_vector_rasterization: bool,
 }
 
 impl Default for SceneRenderer {
@@ -4626,7 +4658,16 @@ impl SceneRenderer {
             video_state: RendererVideoState::new(),
             renderer_cache: RendererCacheManager::with_config(cache_config),
             last_visible_frame_fingerprint: None,
+            async_vector_rasterization: false,
         }
+    }
+
+    /// One Raven patch: a presenter that redraws when the tree sends a new
+    /// scene can let a large SVG that misses the pixel cache be rasterized
+    /// on a worker instead of in the frame (see `vector_raster`). Off by
+    /// default, so a bare renderer draws every SVG in the frame it is asked for.
+    pub fn set_async_vector_rasterization(&mut self, enabled: bool) {
+        self.async_vector_rasterization = enabled;
     }
 
     pub fn render_grayscale_dither_policy(
@@ -5129,6 +5170,7 @@ impl SceneRenderer {
     ) -> RenderTimings {
         let _fonts = state.scene.fonts.as_ref().map(|fonts| fonts.enter());
         let _images = scene_images::enter(state.scene.images.as_ref());
+        let _vector_raster = vector_raster::enter_frame(self.async_vector_rasterization);
         let started_at = Instant::now();
         let draw_started_at = Instant::now();
         let root_eligibility = moving_layer_root_eligibility_for_surface(frame.surface);
@@ -8197,26 +8239,15 @@ fn get_or_rasterize_vector_variant(
     tree: Option<&usvg::Tree>,
     width: u32,
     height: u32,
-) -> Option<Image> {
-    if let Some(image) =
-        lookup_rendered_vector_variant(asset_id, width, height, RenderedVectorVariantKind::Full)
-    {
-        return Some(image);
-    }
-
-    let tree = tree.or_else(|| {
-        scene_images::request_hydration(asset_id);
-        None
-    })?;
-    let image = rasterize_vector_tree(tree, width, height)?;
-    store_rendered_vector_variant(
+) -> Result<Image, VectorMiss> {
+    get_or_rasterize_vector_variant_of_kind(
         asset_id,
+        tree,
         width,
         height,
         RenderedVectorVariantKind::Full,
-        &image,
-    );
-    Some(image)
+        None,
+    )
 }
 
 fn get_or_rasterize_vector_cover_viewport_variant(
@@ -8224,29 +8255,15 @@ fn get_or_rasterize_vector_cover_viewport_variant(
     tree: Option<&usvg::Tree>,
     width: u32,
     height: u32,
-) -> Option<Image> {
-    if let Some(image) = lookup_rendered_vector_variant(
+) -> Result<Image, VectorMiss> {
+    get_or_rasterize_vector_variant_of_kind(
         asset_id,
+        tree,
         width,
         height,
         RenderedVectorVariantKind::CoverViewport,
-    ) {
-        return Some(image);
-    }
-
-    let tree = tree.or_else(|| {
-        scene_images::request_hydration(asset_id);
-        None
-    })?;
-    let image = rasterize_vector_tree_cover_viewport(tree, width, height)?;
-    store_rendered_vector_variant(
-        asset_id,
-        width,
-        height,
-        RenderedVectorVariantKind::CoverViewport,
-        &image,
-    );
-    Some(image)
+        None,
+    )
 }
 
 fn get_or_rasterize_vector_variant_profiled(
@@ -8255,37 +8272,15 @@ fn get_or_rasterize_vector_variant_profiled(
     width: u32,
     height: u32,
     profile: &mut RenderImageDrawProfile,
-) -> Option<Image> {
-    let lookup_started_at = Instant::now();
-    let cached =
-        lookup_rendered_vector_variant(asset_id, width, height, RenderedVectorVariantKind::Full);
-    profile.vector_cache_lookup += lookup_started_at.elapsed();
-
-    if let Some(image) = cached {
-        profile.vector_cache_hit = Some(true);
-        return Some(image);
-    }
-
-    profile.vector_cache_hit = Some(false);
-    let tree = tree.or_else(|| {
-        scene_images::request_hydration(asset_id);
-        None
-    })?;
-    let rasterize_started_at = Instant::now();
-    let image = rasterize_vector_tree(tree, width, height);
-    profile.vector_rasterize += rasterize_started_at.elapsed();
-    let image = image?;
-
-    let store_started_at = Instant::now();
-    store_rendered_vector_variant(
+) -> Result<Image, VectorMiss> {
+    get_or_rasterize_vector_variant_of_kind(
         asset_id,
+        tree,
         width,
         height,
         RenderedVectorVariantKind::Full,
-        &image,
-    );
-    profile.vector_cache_store += store_started_at.elapsed();
-    Some(image)
+        Some(profile),
+    )
 }
 
 fn get_or_rasterize_vector_cover_viewport_variant_profiled(
@@ -8294,41 +8289,84 @@ fn get_or_rasterize_vector_cover_viewport_variant_profiled(
     width: u32,
     height: u32,
     profile: &mut RenderImageDrawProfile,
-) -> Option<Image> {
-    let lookup_started_at = Instant::now();
-    let cached = lookup_rendered_vector_variant(
+) -> Result<Image, VectorMiss> {
+    get_or_rasterize_vector_variant_of_kind(
         asset_id,
+        tree,
         width,
         height,
         RenderedVectorVariantKind::CoverViewport,
-    );
-    profile.vector_cache_lookup += lookup_started_at.elapsed();
+        Some(profile),
+    )
+}
 
+/// One Raven patch: why a vector variant isn't drawn this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VectorMiss {
+    /// No parsed tree (being hydrated) or rasterization failed: draw the
+    /// loading indicator, as before.
+    Loading,
+    /// Being rasterized off the render thread, nothing to stand in for it:
+    /// draw nothing; the tree is asked for a new frame when it is ready.
+    Deferred,
+}
+
+impl VectorMiss {
+    fn draw(self, canvas: &skia_safe::Canvas, x: f32, y: f32, w: f32, h: f32) {
+        if self == VectorMiss::Loading {
+            draw_image_loading(canvas, x, y, w, h);
+        }
+    }
+}
+
+// One Raven patch: the four lookups (plain/cover, profiled or not) share one
+// body, which may hand a large miss to `vector_raster` instead of rasterizing
+// it on the render thread.
+fn get_or_rasterize_vector_variant_of_kind(
+    asset_id: &str,
+    tree: Option<&usvg::Tree>,
+    width: u32,
+    height: u32,
+    kind: RenderedVectorVariantKind,
+    mut profile: Option<&mut RenderImageDrawProfile>,
+) -> Result<Image, VectorMiss> {
+    let lookup_started_at = Instant::now();
+    let cached = lookup_rendered_vector_variant(asset_id, width, height, kind);
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.vector_cache_lookup += lookup_started_at.elapsed();
+        profile.vector_cache_hit = Some(cached.is_some());
+    }
     if let Some(image) = cached {
-        profile.vector_cache_hit = Some(true);
-        return Some(image);
+        return Ok(image);
     }
 
-    profile.vector_cache_hit = Some(false);
-    let tree = tree.or_else(|| {
+    let Some(tree) = tree else {
         scene_images::request_hydration(asset_id);
-        None
-    })?;
+        return Err(VectorMiss::Loading);
+    };
+    if let Some(stand_in) = vector_raster::defer(asset_id, width, height, kind) {
+        return stand_in.ok_or(VectorMiss::Deferred);
+    }
     let rasterize_started_at = Instant::now();
-    let image = rasterize_vector_tree_cover_viewport(tree, width, height);
-    profile.vector_rasterize += rasterize_started_at.elapsed();
-    let image = image?;
+    let image = match kind {
+        RenderedVectorVariantKind::Full => rasterize_vector_tree(tree, width, height),
+        RenderedVectorVariantKind::CoverViewport => {
+            rasterize_vector_tree_cover_viewport(tree, width, height)
+        }
+    };
+    let rasterize_elapsed = rasterize_started_at.elapsed();
+    vector_raster::record_rasterization(asset_id, width, height, rasterize_elapsed);
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.vector_rasterize += rasterize_elapsed;
+    }
+    let image = image.ok_or(VectorMiss::Loading)?;
 
     let store_started_at = Instant::now();
-    store_rendered_vector_variant(
-        asset_id,
-        width,
-        height,
-        RenderedVectorVariantKind::CoverViewport,
-        &image,
-    );
-    profile.vector_cache_store += store_started_at.elapsed();
-    Some(image)
+    store_rendered_vector_variant(asset_id, width, height, kind, &image);
+    if let Some(profile) = profile {
+        profile.vector_cache_store += store_started_at.elapsed();
+    }
+    Ok(image)
 }
 
 fn draw_vector_asset_with_fit(
@@ -8352,14 +8390,17 @@ fn draw_vector_asset_with_fit(
 
             let raster_width = dst_rect.width().ceil().max(1.0) as u32;
             let raster_height = dst_rect.height().ceil().max(1.0) as u32;
-            let Some(image) = get_or_rasterize_vector_cover_viewport_variant(
+            let image = match get_or_rasterize_vector_cover_viewport_variant(
                 asset_id,
                 tree,
                 raster_width,
                 raster_height,
-            ) else {
-                draw_image_loading(canvas, x, y, w, h);
-                return;
+            ) {
+                Ok(image) => image,
+                Err(miss) => {
+                    miss.draw(canvas, x, y, w, h);
+                    return;
+                }
             };
 
             canvas.save();
@@ -8399,11 +8440,17 @@ fn draw_vector_asset_with_fit(
 
             let raster_width = dst_rect.width().ceil().max(1.0) as u32;
             let raster_height = dst_rect.height().ceil().max(1.0) as u32;
-            let Some(image) =
-                get_or_rasterize_vector_variant(asset_id, tree, raster_width, raster_height)
-            else {
-                draw_image_loading(canvas, x, y, w, h);
-                return;
+            let image = match get_or_rasterize_vector_variant(
+                asset_id,
+                tree,
+                raster_width,
+                raster_height,
+            ) {
+                Ok(image) => image,
+                Err(miss) => {
+                    miss.draw(canvas, x, y, w, h);
+                    return;
+                }
             };
 
             draw_image_fill_rect_tinted(
@@ -8417,12 +8464,14 @@ fn draw_vector_asset_with_fit(
             );
         }
         ImageFit::Repeat | ImageFit::RepeatX | ImageFit::RepeatY => {
-            let Some(image) =
-                get_or_rasterize_vector_variant(asset_id, tree, asset_width, asset_height)
-            else {
-                draw_image_loading(canvas, x, y, w, h);
-                return;
-            };
+            let image =
+                match get_or_rasterize_vector_variant(asset_id, tree, asset_width, asset_height) {
+                    Ok(image) => image,
+                    Err(miss) => {
+                        miss.draw(canvas, x, y, w, h);
+                        return;
+                    }
+                };
 
             draw_tiled_image(
                 canvas,
@@ -8460,15 +8509,18 @@ fn draw_vector_asset_with_fit_profiled(
             profile.draw_height = raster_height;
             profile.fit_compute += fit_started_at.elapsed();
 
-            let Some(image) = get_or_rasterize_vector_cover_viewport_variant_profiled(
+            let image = match get_or_rasterize_vector_cover_viewport_variant_profiled(
                 spec.image_id,
                 tree,
                 raster_width,
                 raster_height,
                 profile,
-            ) else {
-                draw_image_loading(canvas, x, y, w, h);
-                return;
+            ) {
+                Ok(image) => image,
+                Err(miss) => {
+                    miss.draw(canvas, x, y, w, h);
+                    return;
+                }
             };
 
             let draw_started_at = Instant::now();
@@ -8515,15 +8567,18 @@ fn draw_vector_asset_with_fit_profiled(
             profile.draw_height = raster_height;
             profile.fit_compute += fit_started_at.elapsed();
 
-            let Some(image) = get_or_rasterize_vector_variant_profiled(
+            let image = match get_or_rasterize_vector_variant_profiled(
                 spec.image_id,
                 tree,
                 raster_width,
                 raster_height,
                 profile,
-            ) else {
-                draw_image_loading(canvas, x, y, w, h);
-                return;
+            ) {
+                Ok(image) => image,
+                Err(miss) => {
+                    miss.draw(canvas, x, y, w, h);
+                    return;
+                }
             };
 
             let draw_started_at = Instant::now();
@@ -8544,15 +8599,18 @@ fn draw_vector_asset_with_fit_profiled(
             profile.draw_height = h.ceil().max(0.0) as u32;
             profile.fit_compute += fit_started_at.elapsed();
 
-            let Some(image) = get_or_rasterize_vector_variant_profiled(
+            let image = match get_or_rasterize_vector_variant_profiled(
                 spec.image_id,
                 tree,
                 asset_width,
                 asset_height,
                 profile,
-            ) else {
-                draw_image_loading(canvas, x, y, w, h);
-                return;
+            ) {
+                Ok(image) => image,
+                Err(miss) => {
+                    miss.draw(canvas, x, y, w, h);
+                    return;
+                }
             };
 
             let draw_started_at = Instant::now();

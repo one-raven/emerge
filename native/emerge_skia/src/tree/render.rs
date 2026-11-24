@@ -47,7 +47,11 @@ use crate::renderer::{make_font_with_style, measure_text_visual_metrics_with_fon
 #[cfg(any(test, feature = "bench-diagnostics"))]
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
+// One Raven patch: the fragment keys (built for every element on every
+// refresh: the context's clips, bounds, font) and layer content generations
+// use the crate's Fx hasher, as the renderer's per-frame keys do; SipHash was
+// ~10% of building a newly inserted screen's scene.
+use crate::fast_hash::FastHasher;
 use std::hash::Hasher;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -870,7 +874,7 @@ fn element_render_fragment_cache_key(
         &traversal.scene_ctx,
         traversal.render_ctx,
     )?;
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FastHasher::new();
     hasher.write_u64(key.context);
     hash_rect_bits(&mut hasher, traversal.render_ctx.scene_bounds);
     // Only the linear part: the render nodes are in layout coordinates, and
@@ -899,7 +903,7 @@ fn element_render_fragment_cache_key(
 // One Raven patch: hash the inherited font field by field. The key used to
 // hash `format!("{:?}", inherited)`, a string built for every element visited
 // on every refresh (5% of a one-text patch on a 1,400-node screen).
-fn hash_font_context(hasher: &mut DefaultHasher, font: &FontContext) {
+fn hash_font_context(hasher: &mut FastHasher, font: &FontContext) {
     use std::hash::Hash;
     let FontContext {
         font_family,
@@ -1964,7 +1968,7 @@ fn nearby_render_fragment_context_key(
     scene_ctx: &SceneContext,
     render_ctx: &RenderBuildContext,
 ) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FastHasher::new();
     hash_f32_bits(&mut hasher, scene_ctx.scroll_dx);
     hash_f32_bits(&mut hasher, scene_ctx.scroll_dy);
     hasher.write_u8(scene_ctx.front_nearby_subtree as u8);
@@ -1984,7 +1988,7 @@ fn nearby_render_fragment_context_key(
     hasher.finish()
 }
 
-fn hash_clip_shape(hasher: &mut DefaultHasher, clip: &ClipShape) {
+fn hash_clip_shape(hasher: &mut FastHasher, clip: &ClipShape) {
     hash_rect_bits(hasher, clip.rect);
     match clip.radii {
         Some(radii) => {
@@ -1998,14 +2002,14 @@ fn hash_clip_shape(hasher: &mut DefaultHasher, clip: &ClipShape) {
     }
 }
 
-fn hash_rect_bits(hasher: &mut DefaultHasher, rect: Rect) {
+fn hash_rect_bits(hasher: &mut FastHasher, rect: Rect) {
     hash_f32_bits(hasher, rect.x);
     hash_f32_bits(hasher, rect.y);
     hash_f32_bits(hasher, rect.width);
     hash_f32_bits(hasher, rect.height);
 }
 
-fn hash_f32_bits(hasher: &mut DefaultHasher, value: f32) {
+fn hash_f32_bits(hasher: &mut FastHasher, value: f32) {
     hasher.write_u32(if value == 0.0 { 0.0f32 } else { value }.to_bits());
 }
 
@@ -2547,7 +2551,7 @@ fn wrap_with_compositor_animation_layer(
 }
 
 fn paint_layer_content_generation(own_nodes: &[RenderNode], payload_bounds: Rect) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FastHasher::new();
     hash_paint_layer_render_nodes(
         &mut hasher,
         own_nodes,

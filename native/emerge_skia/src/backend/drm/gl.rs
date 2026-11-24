@@ -3166,6 +3166,9 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
             &native_log,
         );
         let mut renderer = SceneRenderer::with_cache_config(config.renderer_cache_config);
+        // One Raven patch: rasterize large SVGs off the render thread.
+        let async_vector_rasterization = crate::renderer::async_vector_rasterization_enabled(true);
+        renderer.set_async_vector_rasterization(async_vector_rasterization);
         let mut raster_renderer = if matches!(config.rendering_api, RenderingApi::Raster) {
             match RasterBackend::with_cache_config(
                 &RasterConfig {
@@ -3174,7 +3177,10 @@ pub(crate) fn run(context: DrmRunContext, config: DrmRunConfig) {
                 },
                 config.renderer_cache_config,
             ) {
-                Ok(renderer) => Some(renderer),
+                Ok(mut renderer) => {
+                    renderer.set_async_vector_rasterization(async_vector_rasterization);
+                    Some(renderer)
+                }
                 Err(err) => {
                     if handle_startup_failure(
                         &mut startup_tx,

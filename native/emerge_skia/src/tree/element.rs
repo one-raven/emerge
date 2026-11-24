@@ -2,9 +2,8 @@
 
 use super::animation::AnimationSpec;
 use super::attrs::{
-    AlignX, AlignY, Attrs, BorderWidth, Font, FontStyle, FontWeight, ImageFit, ImageSource, Length,
-    MouseOverAttrs, Padding, ScrollbarHoverAxis, TextAlign, TextFragment,
-    supports_mouse_over_tracking,
+    Attrs, BorderWidth, ImageSource, Length, MouseOverAttrs, Padding, ScrollbarHoverAxis,
+    TextAlign, TextFragment, supports_mouse_over_tracking,
 };
 use super::geometry::Rect;
 use super::invalidation::{
@@ -225,45 +224,89 @@ pub enum ResolveAvailableSpaceKey {
     MaxContent,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ResolveAttrs {
-    pub width: Option<Length>,
-    pub height: Option<Length>,
-    pub layout_scale: Option<f64>,
-    pub layout_rotate: Option<f64>,
-    pub padding: Option<Padding>,
-    pub border_width: Option<BorderWidth>,
-    pub spacing: Option<f64>,
-    pub spacing_x: Option<f64>,
-    pub spacing_y: Option<f64>,
-    pub align_x: Option<AlignX>,
-    pub align_y: Option<AlignY>,
-    pub scrollbar_y: Option<bool>,
-    pub scrollbar_x: Option<bool>,
-    pub ghost_scrollbar_y: Option<bool>,
-    pub ghost_scrollbar_x: Option<bool>,
-    pub scroll_x: Option<f64>,
-    pub scroll_y: Option<f64>,
-    pub clip_nearby: Option<bool>,
-    pub content: Option<String>,
-    pub font_size: Option<f64>,
-    pub font: Option<Font>,
-    pub font_weight: Option<FontWeight>,
-    pub font_style: Option<FontStyle>,
-    pub font_letter_spacing: Option<f64>,
-    pub font_word_spacing: Option<f64>,
-    pub image_src: Option<ImageSource>,
-    pub image_fit: Option<ImageFit>,
-    pub image_size: Option<(f64, f64)>,
-    pub slider_min: Option<f64>,
-    pub slider_max: Option<f64>,
-    pub slider_value: Option<f64>,
-    pub slider_step: Option<f64>,
-    pub text_align: Option<TextAlign>,
-    pub snap_layout: Option<bool>,
-    pub snap_text_metrics: Option<bool>,
-    pub space_evenly: Option<bool>,
-    pub has_animation_attrs: bool,
+macro_rules! layout_key_fields_eq {
+    ($a:ident, $b:ident; $($field:ident),* $(,)?) => {
+        true $(&& $a.$field == $b.$field)*
+    };
+}
+
+fn has_layout_animation_attrs(attrs: &Attrs) -> bool {
+    attrs.animate.is_some() || attrs.animate_enter.is_some() || attrs.animate_exit.is_some()
+}
+
+/// One Raven patch: the attrs a resolve result depends on, held by reference.
+/// Upstream copied these fields into the key (cloning the content, font and
+/// image strings) for every element on every pass, and moved the ~0.6 KB key
+/// into its cache. Equality compares the same fields as before, and is
+/// immediate when both keys hold the same attrs.
+#[derive(Clone)]
+pub struct ResolveAttrs(pub(crate) super::attrs::SharedAttrs);
+
+impl ResolveAttrs {
+    pub(crate) fn new(attrs: &super::attrs::SharedAttrs) -> Self {
+        Self(attrs.clone())
+    }
+}
+
+impl PartialEq for ResolveAttrs {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0.ptr_eq(&other.0) {
+            return true;
+        }
+        let (a, b): (&Attrs, &Attrs) = (&self.0, &other.0);
+        layout_key_fields_eq!(
+            a,
+            b;
+            width,
+            height,
+            layout_scale,
+            layout_rotate,
+            padding,
+            border_width,
+            spacing,
+            spacing_x,
+            spacing_y,
+            align_x,
+            align_y,
+            scrollbar_y,
+            scrollbar_x,
+            ghost_scrollbar_y,
+            ghost_scrollbar_x,
+            scroll_x,
+            scroll_y,
+            clip_nearby,
+            content,
+            font_size,
+            font,
+            font_weight,
+            font_style,
+            font_letter_spacing,
+            font_word_spacing,
+            image_src,
+            image_fit,
+            image_size,
+            slider_min,
+            slider_max,
+            slider_value,
+            slider_step,
+            text_align,
+            snap_layout,
+            snap_text_metrics,
+            space_evenly
+        ) && has_layout_animation_attrs(a) == has_layout_animation_attrs(b)
+    }
+}
+
+impl std::fmt::Debug for ResolveAttrs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let a: &Attrs = &self.0;
+        f.debug_struct("ResolveAttrs")
+            .field("width", &a.width)
+            .field("height", &a.height)
+            .field("content", &a.content)
+            .field("has_animation_attrs", &has_layout_animation_attrs(a))
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -290,44 +333,78 @@ pub struct TopologyDependencyKey {
     pub nearby_count: usize,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct SubtreeMeasureAttrs {
-    pub width: Option<Length>,
-    pub height: Option<Length>,
-    pub layout_scale: Option<f64>,
-    pub layout_rotate: Option<f64>,
-    pub padding: Option<Padding>,
-    pub border_width: Option<BorderWidth>,
-    pub spacing: Option<f64>,
-    pub spacing_x: Option<f64>,
-    pub spacing_y: Option<f64>,
-    pub scrollbar_y: Option<bool>,
-    pub scrollbar_x: Option<bool>,
-    pub ghost_scrollbar_y: Option<bool>,
-    pub ghost_scrollbar_x: Option<bool>,
-    pub scroll_x: Option<f64>,
-    pub scroll_y: Option<f64>,
-    pub clip_nearby: Option<bool>,
-    pub content: Option<String>,
-    pub font_size: Option<f64>,
-    pub font: Option<Font>,
-    pub font_weight: Option<FontWeight>,
-    pub font_style: Option<FontStyle>,
-    pub font_letter_spacing: Option<f64>,
-    pub font_word_spacing: Option<f64>,
-    pub image_src: Option<ImageSource>,
-    pub image_fit: Option<ImageFit>,
-    pub image_size: Option<(f64, f64)>,
-    pub text_align: Option<TextAlign>,
-    pub snap_layout: Option<bool>,
-    pub snap_text_metrics: Option<bool>,
-    pub space_evenly: Option<bool>,
-    pub has_animation_attrs: bool,
+/// One Raven patch: the attrs a subtree measurement depends on, held by reference.
+/// Upstream copied these fields into the key (cloning the content, font and
+/// image strings) for every element on every pass, and moved the ~0.6 KB key
+/// into its cache. Equality compares the same fields as before, and is
+/// immediate when both keys hold the same attrs.
+#[derive(Clone)]
+pub struct SubtreeMeasureAttrs(pub(crate) super::attrs::SharedAttrs);
+
+impl SubtreeMeasureAttrs {
+    pub(crate) fn new(attrs: &super::attrs::SharedAttrs) -> Self {
+        Self(attrs.clone())
+    }
+}
+
+impl PartialEq for SubtreeMeasureAttrs {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0.ptr_eq(&other.0) {
+            return true;
+        }
+        let (a, b): (&Attrs, &Attrs) = (&self.0, &other.0);
+        layout_key_fields_eq!(
+            a,
+            b;
+            width,
+            height,
+            layout_scale,
+            layout_rotate,
+            padding,
+            border_width,
+            spacing,
+            spacing_x,
+            spacing_y,
+            scrollbar_y,
+            scrollbar_x,
+            ghost_scrollbar_y,
+            ghost_scrollbar_x,
+            scroll_x,
+            scroll_y,
+            clip_nearby,
+            content,
+            font_size,
+            font,
+            font_weight,
+            font_style,
+            font_letter_spacing,
+            font_word_spacing,
+            image_src,
+            image_fit,
+            image_size,
+            text_align,
+            snap_layout,
+            snap_text_metrics,
+            space_evenly
+        ) && has_layout_animation_attrs(a) == has_layout_animation_attrs(b)
+    }
+}
+
+impl std::fmt::Debug for SubtreeMeasureAttrs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let a: &Attrs = &self.0;
+        f.debug_struct("SubtreeMeasureAttrs")
+            .field("width", &a.width)
+            .field("height", &a.height)
+            .field("content", &a.content)
+            .field("has_animation_attrs", &has_layout_animation_attrs(a))
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InheritedMeasureFontKey {
-    pub family: Option<String>,
+    pub family: Option<std::sync::Arc<str>>,
     pub weight: Option<u16>,
     pub italic: Option<bool>,
     pub font_size: Option<f32>,
@@ -712,6 +789,13 @@ pub struct RenderFragmentCacheKey {
     pub context: u64,
 }
 
+// One Raven patch: elements visited marking refresh dirty, so tests can tell
+// a decode that links nodes from one that re-invalidates them.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REFRESH_DIRTY_MARKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Default for NodeRefreshState {
     fn default() -> Self {
         Self {
@@ -793,11 +877,14 @@ pub struct NodeLayoutState {
     pub paragraph_fragments: Option<Vec<TextFragment>>,
     pub paragraph_boxes: Vec<InlineBox>,
     pub topology_versions: LayoutTopologyVersions,
-    pub intrinsic_measure_cache: Option<IntrinsicMeasureCache>,
-    pub subtree_measure_cache: Option<SubtreeMeasureCache>,
+    // One Raven patch: the three layout caches are boxed. Inline they were
+    // 1.6 KB of a 2.9 KB element, copied whenever an element is built and
+    // boxed (every inserted node) whether or not it is ever laid out.
+    pub intrinsic_measure_cache: Option<Box<IntrinsicMeasureCache>>,
+    pub subtree_measure_cache: Option<Box<SubtreeMeasureCache>>,
     pub measure_dirty: bool,
     pub measure_descendant_dirty: bool,
-    pub resolve_cache: Option<ResolveCache>,
+    pub resolve_cache: Option<Box<ResolveCache>>,
     pub resolve_dirty: bool,
     pub resolve_descendant_dirty: bool,
 }
@@ -2363,14 +2450,10 @@ impl ElementTree {
         };
 
         element_affects_registry(element)
-            || self
-                .child_ixs(ix)
-                .into_iter()
-                .any(|child_ix| self.subtree_affects_registry_ix(child_ix))
-            || self
-                .nearby_ixs(ix)
-                .into_iter()
-                .any(|mount| mount.slot.is_overlay() || self.subtree_affects_registry_ix(mount.ix))
+            || self.any_child_ix(ix, |child_ix| self.subtree_affects_registry_ix(child_ix))
+            || self.any_nearby_ix(ix, |mount| {
+                mount.slot.is_overlay() || self.subtree_affects_registry_ix(mount.ix)
+            })
     }
 
     #[allow(clippy::unnecessary_fold)]
@@ -2743,6 +2826,8 @@ impl ElementTree {
         let mut origin = true;
 
         while let Some(ix) = current_ix {
+            #[cfg(test)]
+            REFRESH_DIRTY_MARKS.with(|count| count.set(count.get() + 1));
             if let Some(element) = self.get_ix_mut(ix) {
                 if render {
                     element.refresh.mark_render_changed();
@@ -3069,40 +3154,86 @@ impl ElementTree {
         }
     }
 
+    // One Raven patch: read a node's topology in place. The id lists below
+    // were built from a cloned index list, two allocations per call; layout
+    // asks for them for every element on both passes.
+    fn with_topology_node<R>(
+        &self,
+        ix: NodeIx,
+        read: impl FnOnce(&NodeTopology) -> R,
+    ) -> Option<R> {
+        #[cfg(test)]
+        {
+            self.ensure_topology();
+            self.topology.borrow().nodes.get(ix).map(read)
+        }
+        #[cfg(not(test))]
+        {
+            self.topology.nodes.get(ix).map(read)
+        }
+    }
+
+    /// One Raven patch: a node's children without copying the list.
+    pub(crate) fn any_child_ix(&self, ix: NodeIx, mut f: impl FnMut(NodeIx) -> bool) -> bool {
+        self.with_topology_node(ix, |node| node.children.iter().any(|&child| f(child)))
+            .unwrap_or(false)
+    }
+
+    /// One Raven patch: a node's nearby mounts without copying the list.
+    pub(crate) fn any_nearby_ix(
+        &self,
+        ix: NodeIx,
+        mut f: impl FnMut(NearbyMountIx) -> bool,
+    ) -> bool {
+        self.with_topology_node(ix, |node| node.nearby.iter().any(|&mount| f(mount)))
+            .unwrap_or(false)
+    }
+
     pub fn child_ids(&self, parent_id: &NodeId) -> Vec<NodeId> {
         self.ix_of(parent_id)
-            .map(|parent_ix| {
-                self.child_ixs(parent_ix)
-                    .into_iter()
-                    .filter_map(|ix| self.id_of(ix))
-                    .collect()
+            .and_then(|parent_ix| {
+                self.with_topology_node(parent_ix, |node| {
+                    node.children
+                        .iter()
+                        .filter_map(|&ix| self.id_of(ix))
+                        .collect()
+                })
             })
             .unwrap_or_default()
     }
 
     pub fn paint_child_ids_for(&self, parent_id: &NodeId) -> Vec<NodeId> {
         self.ix_of(parent_id)
-            .map(|parent_ix| {
-                self.paint_child_ixs(parent_ix)
-                    .into_iter()
-                    .filter_map(|ix| self.id_of(ix))
+            .and_then(|parent_ix| {
+                self.with_topology_node(parent_ix, |node| {
+                    // As `paint_child_ixs`: no paint order means child order.
+                    if node.paint_children.is_empty() {
+                        &node.children
+                    } else {
+                        &node.paint_children
+                    }
+                    .iter()
+                    .filter_map(|&ix| self.id_of(ix))
                     .collect()
+                })
             })
             .unwrap_or_default()
     }
 
     pub fn nearby_mounts_for(&self, host_id: &NodeId) -> Vec<NearbyMount> {
         self.ix_of(host_id)
-            .map(|host_ix| {
-                self.nearby_ixs(host_ix)
-                    .into_iter()
-                    .filter_map(|mount| {
-                        self.id_of(mount.ix).map(|id| NearbyMount {
-                            slot: mount.slot,
-                            id,
+            .and_then(|host_ix| {
+                self.with_topology_node(host_ix, |node| {
+                    node.nearby
+                        .iter()
+                        .filter_map(|mount| {
+                            self.id_of(mount.ix).map(|id| NearbyMount {
+                                slot: mount.slot,
+                                id,
+                            })
                         })
-                    })
-                    .collect()
+                        .collect()
+                })
             })
             .unwrap_or_default()
     }
@@ -3481,6 +3612,71 @@ impl ElementTree {
         let child_ixs = self.resolve_child_ixs(&child_ids)?;
         let paint_child_ixs = self.resolve_child_ixs(&paint_child_ids)?;
         let nearby_ixs = self.resolve_nearby_ixs(&nearby_mounts)?;
+        self.set_inserted_node_topology_ixs(ix, child_ixs, paint_child_ixs, nearby_ixs);
+        Ok(())
+    }
+
+    /// One Raven patch: move a decoded subtree's nodes into this tree with
+    /// their topology, remapping arena indices. Upstream read each node's
+    /// children, paint order and nearby mounts out of the subtree as id lists
+    /// and resolved them back to indices (six allocations and as many id
+    /// lookups per inserted node).
+    pub(crate) fn adopt_subtree_nodes(&mut self, mut subtree: ElementTree) {
+        #[cfg(test)]
+        let mut topology = {
+            subtree.ensure_topology();
+            std::mem::take(subtree.topology.get_mut())
+        };
+        #[cfg(not(test))]
+        let mut topology = std::mem::take(&mut subtree.topology);
+
+        let mut new_ixs = vec![usize::MAX; subtree.nodes.len()];
+        for (old_ix, slot) in subtree.nodes.into_iter().enumerate() {
+            if let Some(element) = slot {
+                let id = element.id;
+                self.insert_boxed(element);
+                new_ixs[old_ix] = self.ix_of(&id).expect("just inserted");
+            }
+        }
+
+        for (old_ix, &ix) in new_ixs.iter().enumerate() {
+            if ix == usize::MAX {
+                continue;
+            }
+            let node = topology
+                .nodes
+                .get_mut(old_ix)
+                .map(std::mem::take)
+                .unwrap_or_default();
+            let remap = |ixs: Vec<NodeIx>| -> Vec<NodeIx> {
+                ixs.into_iter().map(|child| new_ixs[child]).collect()
+            };
+            let children = remap(node.children);
+            // As `paint_child_ids_for` read it: no paint order is child order.
+            let paint_children = if node.paint_children.is_empty() {
+                children.clone()
+            } else {
+                remap(node.paint_children)
+            };
+            let nearby = node
+                .nearby
+                .into_iter()
+                .map(|mount| NearbyMountIx {
+                    slot: mount.slot,
+                    ix: new_ixs[mount.ix],
+                })
+                .collect();
+            self.set_inserted_node_topology_ixs(ix, children, paint_children, nearby);
+        }
+    }
+
+    fn set_inserted_node_topology_ixs(
+        &mut self,
+        ix: NodeIx,
+        child_ixs: Vec<NodeIx>,
+        paint_child_ixs: Vec<NodeIx>,
+        nearby_ixs: Vec<NearbyMountIx>,
+    ) {
         self.ensure_topology();
 
         self.ensure_topology_capacity(ix);
@@ -3493,10 +3689,26 @@ impl ElementTree {
             .for_each(|mount| self.ensure_topology_capacity(mount.ix));
 
         #[cfg(test)]
-        if let Some(element) = self.get_mut(id) {
-            element.children = child_ids;
-            element.paint_children = paint_child_ids;
-            element.nearby.set_mounts(nearby_mounts);
+        {
+            let ids = |ixs: &[NodeIx]| -> Vec<NodeId> {
+                ixs.iter().filter_map(|&ix| self.id_of(ix)).collect()
+            };
+            let child_ids = ids(&child_ixs);
+            let paint_child_ids = ids(&paint_child_ixs);
+            let nearby_mounts = nearby_ixs
+                .iter()
+                .filter_map(|mount| {
+                    self.id_of(mount.ix).map(|id| NearbyMount {
+                        slot: mount.slot,
+                        id,
+                    })
+                })
+                .collect();
+            if let Some(element) = self.get_ix_mut(ix) {
+                element.children = child_ids;
+                element.paint_children = paint_child_ids;
+                element.nearby.set_mounts(nearby_mounts);
+            }
         }
 
         let (children_changed, paint_children_changed, nearby_changed) = {
@@ -3548,8 +3760,6 @@ impl ElementTree {
         if nearby_changed {
             self.bump_nearby_version(ix);
         }
-
-        Ok(())
     }
 
     fn set_children_ix(&mut self, parent_ix: NodeIx, child_ixs: Vec<NodeIx>) {
@@ -4338,6 +4548,233 @@ fn normalize_preedit_cursor(text: Option<&str>, cursor: Option<(u32, u32)>) -> O
 mod tests {
     use super::*;
     use crate::tree::attrs::AlignX;
+
+    // One Raven patch: `adopt_subtree_nodes` must leave the tree as reading
+    // the subtree's topology out by id and setting it back did.
+    fn adoption_fixture() -> (ElementTree, ElementTree) {
+        let id = NodeId::from_wire_u64;
+        let el = |n, kind| Element::with_attrs(id(n), kind, Vec::new(), Attrs::default());
+        let mut tree = ElementTree::new();
+        tree.insert(el(1, ElementKind::Column));
+        tree.insert(el(2, ElementKind::Text));
+        tree.set_root_id(id(1));
+        tree.set_children(&id(1), vec![id(2)]).unwrap();
+
+        let mut subtree = ElementTree::new();
+        // Arena order differs from tree order, and a slot is left free.
+        for (n, kind) in [
+            (13, ElementKind::Text),
+            (99, ElementKind::El),
+            (10, ElementKind::Row),
+            (11, ElementKind::El),
+            (12, ElementKind::Text),
+            (14, ElementKind::El),
+        ] {
+            subtree.insert(el(n, kind));
+        }
+        subtree.remove_node(&id(99));
+        subtree.set_root_id(id(10));
+        subtree.set_children(&id(10), vec![id(11), id(12)]).unwrap();
+        subtree
+            .set_paint_children(&id(10), vec![id(12), id(11)])
+            .unwrap();
+        subtree.set_children(&id(11), vec![id(13)]).unwrap();
+        subtree
+            .set_nearby_mounts(
+                &id(12),
+                vec![NearbyMount {
+                    slot: NearbySlot::Below,
+                    id: id(14),
+                }],
+            )
+            .unwrap();
+        (tree, subtree)
+    }
+
+    fn adoption_state(tree: &ElementTree, n: u64) -> String {
+        let id = NodeId::from_wire_u64(n);
+        let ix = tree.ix_of(&id).unwrap();
+        let element = tree.get(&id).unwrap();
+        format!(
+            "{:?} parent={:?} children={:?} paint={:?} nearby={:?} versions={:?} \
+             layout=({} {}) refresh=({} {} {} {} gen={})",
+            element.spec.kind,
+            tree.parent_link_of(ix).map(|link| match link {
+                ParentLink::Child { parent } => (tree.id_of(parent), None),
+                ParentLink::Nearby { host, slot } => (tree.id_of(host), Some(slot)),
+            }),
+            tree.child_ids(&id),
+            tree.paint_child_ids_for(&id),
+            tree.nearby_mounts_for(&id),
+            element.layout.topology_versions,
+            element.layout.measure_dirty,
+            element.layout.measure_descendant_dirty,
+            element.refresh.render_dirty,
+            element.refresh.render_descendant_dirty,
+            element.refresh.registry_dirty,
+            element.refresh.registry_descendant_dirty,
+            element.refresh.paint_generation,
+        )
+    }
+
+    // One Raven patch: an element is built on the stack and moved into its
+    // box for every decoded node; the layout caches no longer ride inline.
+    #[test]
+    fn layout_caches_are_boxed_out_of_the_element() {
+        assert_eq!(
+            std::mem::size_of::<Option<Box<ResolveCache>>>(),
+            std::mem::size_of::<usize>()
+        );
+        assert!(
+            std::mem::size_of::<Element>() < 1_536,
+            "Element is {} bytes",
+            std::mem::size_of::<Element>()
+        );
+    }
+
+    // One Raven patch: layout cache keys hold the attrs by reference and
+    // compare exactly the fields they used to copy.
+    #[test]
+    fn layout_cache_keys_share_attrs_and_compare_their_fields() {
+        use crate::tree::attrs::{Background, Color, SharedAttrs};
+        assert_eq!(
+            std::mem::size_of::<ResolveAttrs>(),
+            std::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            std::mem::size_of::<SubtreeMeasureAttrs>(),
+            std::mem::size_of::<usize>()
+        );
+
+        let base = Attrs {
+            width: Some(Length::Px(10.0)),
+            content: Some("Living room".into()),
+            ..Attrs::default()
+        };
+        let shared = SharedAttrs::from(base.clone());
+        assert_eq!(
+            ResolveAttrs::new(&shared),
+            ResolveAttrs::new(&shared.clone())
+        );
+        // A copy with equal fields is an equal key.
+        assert_eq!(
+            ResolveAttrs::new(&shared),
+            ResolveAttrs::new(&SharedAttrs::from(base.clone()))
+        );
+
+        let with = |change: fn(&mut Attrs)| {
+            let mut attrs = base.clone();
+            change(&mut attrs);
+            SharedAttrs::from(attrs)
+        };
+        // Paint-only attrs don't take part in either key.
+        let painted =
+            with(|attrs| attrs.background = Some(Background::Color(Color::Named("red".into()))));
+        assert_eq!(ResolveAttrs::new(&shared), ResolveAttrs::new(&painted));
+        assert_eq!(
+            SubtreeMeasureAttrs::new(&shared),
+            SubtreeMeasureAttrs::new(&painted)
+        );
+        // Layout attrs do.
+        for changed in [
+            with(|attrs| attrs.content = Some("Kitchen".into())),
+            with(|attrs| attrs.width = Some(Length::Px(11.0))),
+            with(|attrs| attrs.font_size = Some(18.0)),
+            with(|attrs| {
+                attrs.animate_enter = Some(crate::tree::animation::AnimationSpec {
+                    keyframes: Vec::new(),
+                    duration_ms: 100.0,
+                    curve: crate::tree::animation::AnimationCurve::Linear,
+                    repeat: crate::tree::animation::AnimationRepeat::Once,
+                })
+            }),
+        ] {
+            assert_ne!(ResolveAttrs::new(&shared), ResolveAttrs::new(&changed));
+            assert_ne!(
+                SubtreeMeasureAttrs::new(&shared),
+                SubtreeMeasureAttrs::new(&changed)
+            );
+        }
+        // Alignment places children after measuring: resolve only.
+        let aligned = with(|attrs| attrs.align_x = Some(crate::tree::attrs::AlignX::Center));
+        assert_ne!(ResolveAttrs::new(&shared), ResolveAttrs::new(&aligned));
+        assert_eq!(
+            SubtreeMeasureAttrs::new(&shared),
+            SubtreeMeasureAttrs::new(&aligned)
+        );
+    }
+
+    // One Raven patch: inheriting a font family shares it.
+    #[test]
+    fn inherited_font_family_is_shared_not_copied() {
+        use crate::tree::attrs::Font;
+        use crate::tree::layout::FontContext;
+        let parent = FontContext::default().merge_with_attrs(&Attrs {
+            font: Some(Font::String("Outfit".into())),
+            ..Attrs::default()
+        });
+        let child = parent.merge_with_attrs(&Attrs::default());
+        assert_eq!(child.font_family.as_deref(), Some("Outfit"));
+        assert!(std::sync::Arc::ptr_eq(
+            parent.font_family.as_ref().unwrap(),
+            child.font_family.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn paint_child_ids_fall_back_to_child_order() {
+        let id = NodeId::from_wire_u64;
+        let el = |n| Element::with_attrs(id(n), ElementKind::El, Vec::new(), Attrs::default());
+        let mut tree = ElementTree::new();
+        for n in 1..=3 {
+            tree.insert(el(n));
+        }
+        tree.set_root_id(id(1));
+        tree.set_children(&id(1), vec![id(2), id(3)]).unwrap();
+        assert_eq!(tree.child_ids(&id(1)), vec![id(2), id(3)]);
+        assert_eq!(tree.paint_child_ids_for(&id(1)), vec![id(2), id(3)]);
+        tree.set_paint_children(&id(1), vec![id(3), id(2)]).unwrap();
+        assert_eq!(tree.paint_child_ids_for(&id(1)), vec![id(3), id(2)]);
+        assert!(tree.child_ids(&id(2)).is_empty());
+        assert!(tree.child_ids(&id(9)).is_empty());
+    }
+
+    #[test]
+    fn adopting_a_subtree_matches_setting_its_topology_by_id() {
+        let (mut adopted, subtree) = adoption_fixture();
+        adopted.adopt_subtree_nodes(subtree);
+
+        let (mut expected, subtree) = adoption_fixture();
+        let topology: Vec<_> = subtree
+            .iter_node_pairs()
+            .map(|(id, _)| {
+                (
+                    id,
+                    subtree.child_ids(&id),
+                    subtree.paint_child_ids_for(&id),
+                    subtree.nearby_mounts_for(&id),
+                )
+            })
+            .collect();
+        for element in subtree.nodes.into_iter().flatten() {
+            expected.insert_boxed(element);
+        }
+        for (id, children, paint, nearby) in topology {
+            expected
+                .set_inserted_node_topology(&id, children, paint, nearby)
+                .unwrap();
+        }
+
+        assert_eq!(adopted.len(), 7);
+        for n in [1, 2, 10, 11, 12, 13, 14] {
+            assert_eq!(
+                adoption_state(&adopted, n),
+                adoption_state(&expected, n),
+                "node {n}"
+            );
+        }
+        assert!(adopted.get(&NodeId::from_wire_u64(99)).is_none());
+    }
 
     #[test]
     fn test_element_kind_from_tag() {

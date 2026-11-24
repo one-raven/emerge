@@ -267,7 +267,10 @@ impl TextMeasurer for SkiaTextMeasurer {
 /// Font context inherited from ancestors during measurement and rendering.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FontContext {
-    pub font_family: Option<String>,
+    /// One Raven patch: shared, so inheriting it (every element, on every
+    /// measure and resolve pass, and in every layout cache key) is a
+    /// reference count rather than a string allocation.
+    pub font_family: Option<std::sync::Arc<str>>,
     pub font_weight: Option<u16>,
     pub font_italic: Option<bool>,
     pub font_size: Option<f32>,
@@ -287,7 +290,7 @@ impl FontContext {
                 .font
                 .as_ref()
                 .map(|f| match f {
-                    Font::Atom(s) | Font::String(s) => s.clone(),
+                    Font::Atom(s) | Font::String(s) => std::sync::Arc::from(s.as_str()),
                 })
                 .or_else(|| self.font_family.clone()),
             font_weight: attrs
@@ -422,7 +425,7 @@ pub fn font_info_with_inheritance(attrs: &Attrs, inherited: &FontContext) -> (St
         .map(|f| match f {
             Font::Atom(s) | Font::String(s) => s.clone(),
         })
-        .or_else(|| inherited.font_family.clone())
+        .or_else(|| inherited.font_family.as_deref().map(str::to_string))
         .unwrap_or_else(|| "default".to_string());
 
     let weight = attrs
@@ -2286,20 +2289,20 @@ fn measure_element<M: TextMeasurer>(
     let measured_frame = layout_frame_for_rotation(measured_render_frame, &attrs);
     let intrinsic_measure_cache = cache_key.map(|key| {
         tree.record_layout_cache_stats(|stats| stats.record_intrinsic_measure_store());
-        IntrinsicMeasureCache {
+        Box::new(IntrinsicMeasureCache {
             key,
             frame: measured_frame,
             render_frame: measured_render_frame,
-        }
+        })
     });
     let subtree_measure_cache = if use_subtree_cache {
         subtree_cache_key.map(|key| {
             tree.record_layout_cache_stats(|stats| stats.record_subtree_measure_store());
-            SubtreeMeasureCache {
+            Box::new(SubtreeMeasureCache {
                 key,
                 frame: measured_frame,
                 render_frame: measured_render_frame,
-            }
+            })
         })
     } else {
         None
@@ -2325,7 +2328,7 @@ fn measure_element<M: TextMeasurer>(
 
 fn subtree_measure_cache_key(
     kind: ElementKind,
-    attrs: &Attrs,
+    attrs: &super::attrs::SharedAttrs,
     inherited: &FontContext,
     topology: TopologyDependencyKey,
     dimension_samples: dimensions::DimensionCacheKey,
@@ -2333,47 +2336,9 @@ fn subtree_measure_cache_key(
     SubtreeMeasureCacheKey {
         dimension_samples,
         kind,
-        attrs: subtree_measure_attrs(attrs),
+        attrs: SubtreeMeasureAttrs::new(attrs),
         inherited: inherited_measure_font_key(inherited),
         topology,
-    }
-}
-
-fn subtree_measure_attrs(attrs: &Attrs) -> SubtreeMeasureAttrs {
-    SubtreeMeasureAttrs {
-        width: attrs.width.clone(),
-        height: attrs.height.clone(),
-        layout_scale: attrs.layout_scale,
-        layout_rotate: attrs.layout_rotate,
-        padding: attrs.padding.clone(),
-        border_width: attrs.border_width.clone(),
-        spacing: attrs.spacing,
-        spacing_x: attrs.spacing_x,
-        spacing_y: attrs.spacing_y,
-        scrollbar_y: attrs.scrollbar_y,
-        scrollbar_x: attrs.scrollbar_x,
-        ghost_scrollbar_y: attrs.ghost_scrollbar_y,
-        ghost_scrollbar_x: attrs.ghost_scrollbar_x,
-        scroll_x: attrs.scroll_x,
-        scroll_y: attrs.scroll_y,
-        clip_nearby: attrs.clip_nearby,
-        content: attrs.content.clone(),
-        font_size: attrs.font_size,
-        font: attrs.font.clone(),
-        font_weight: attrs.font_weight.clone(),
-        font_style: attrs.font_style.clone(),
-        font_letter_spacing: attrs.font_letter_spacing,
-        font_word_spacing: attrs.font_word_spacing,
-        image_src: attrs.image_src.clone(),
-        image_fit: attrs.image_fit,
-        image_size: attrs.image_size,
-        text_align: attrs.text_align,
-        snap_layout: attrs.snap_layout,
-        snap_text_metrics: attrs.snap_text_metrics,
-        space_evenly: attrs.space_evenly,
-        has_animation_attrs: attrs.animate.is_some()
-            || attrs.animate_enter.is_some()
-            || attrs.animate_exit.is_some(),
     }
 }
 
@@ -3677,10 +3642,10 @@ fn resolve_element<M: TextMeasurer>(
         tree.record_layout_cache_stats(|stats| stats.record_resolve_store());
 
         if let Some(element) = tree.get_mut(id) {
-            element.layout.resolve_cache = Some(ResolveCache {
+            element.layout.resolve_cache = Some(Box::new(ResolveCache {
                 key,
                 extent: resolve_extent(frame, render_frame),
-            });
+            }));
             element.layout.resolve_dirty = false;
             element.layout.resolve_descendant_dirty = false;
         }
@@ -3724,7 +3689,7 @@ fn apply_layout_rotation_to_resolved_element(tree: &mut ElementTree, id: &NodeId
 
 fn resolve_cache_key(
     kind: ElementKind,
-    attrs: &Attrs,
+    attrs: &super::attrs::SharedAttrs,
     inherited: &FontContext,
     measured_frame: Option<Frame>,
     constraint: Constraint,
@@ -3734,7 +3699,7 @@ fn resolve_cache_key(
     ResolveCacheKey {
         dimension_samples,
         kind,
-        attrs: resolve_attrs(attrs),
+        attrs: ResolveAttrs::new(attrs),
         inherited: inherited_measure_font_key(inherited),
         inherited_text_align: inherited.text_align,
         measured_frame,
@@ -3776,50 +3741,6 @@ fn frames_from_resolve_extent(extent: ResolveExtent, x: f32, y: f32) -> (Frame, 
         content_height: extent.render_content_height,
     };
     (frame, render_frame)
-}
-
-fn resolve_attrs(attrs: &Attrs) -> ResolveAttrs {
-    ResolveAttrs {
-        width: attrs.width.clone(),
-        height: attrs.height.clone(),
-        layout_scale: attrs.layout_scale,
-        layout_rotate: attrs.layout_rotate,
-        padding: attrs.padding.clone(),
-        border_width: attrs.border_width.clone(),
-        spacing: attrs.spacing,
-        spacing_x: attrs.spacing_x,
-        spacing_y: attrs.spacing_y,
-        align_x: attrs.align_x,
-        align_y: attrs.align_y,
-        scrollbar_y: attrs.scrollbar_y,
-        scrollbar_x: attrs.scrollbar_x,
-        ghost_scrollbar_y: attrs.ghost_scrollbar_y,
-        ghost_scrollbar_x: attrs.ghost_scrollbar_x,
-        scroll_x: attrs.scroll_x,
-        scroll_y: attrs.scroll_y,
-        clip_nearby: attrs.clip_nearby,
-        content: attrs.content.clone(),
-        font_size: attrs.font_size,
-        font: attrs.font.clone(),
-        font_weight: attrs.font_weight.clone(),
-        font_style: attrs.font_style.clone(),
-        font_letter_spacing: attrs.font_letter_spacing,
-        font_word_spacing: attrs.font_word_spacing,
-        image_src: attrs.image_src.clone(),
-        image_fit: attrs.image_fit,
-        image_size: attrs.image_size,
-        slider_min: attrs.slider_min,
-        slider_max: attrs.slider_max,
-        slider_value: attrs.slider_value,
-        slider_step: attrs.slider_step,
-        text_align: attrs.text_align,
-        snap_layout: attrs.snap_layout,
-        snap_text_metrics: attrs.snap_text_metrics,
-        space_evenly: attrs.space_evenly,
-        has_animation_attrs: attrs.animate.is_some()
-            || attrs.animate_enter.is_some()
-            || attrs.animate_exit.is_some(),
-    }
 }
 
 fn resolve_constraint_key(constraint: Constraint) -> ResolveConstraintKey {
@@ -3999,10 +3920,10 @@ fn try_reuse_resolve_cache_with_dirty_descendants<M: TextMeasurer>(
             Some((frame, element.layout.render_frame.unwrap_or(frame)))
         }) && let Some(element) = tree.get_mut(id)
         {
-            element.layout.resolve_cache = Some(ResolveCache {
+            element.layout.resolve_cache = Some(Box::new(ResolveCache {
                 key: key.clone(),
                 extent: resolve_extent(frame, render_frame),
-            });
+            }));
         }
     }
 
@@ -6566,8 +6487,9 @@ fn resolve_paragraph_children<M: TextMeasurer>(
         let font_size = font_ctx.font_size.unwrap_or(16.0);
         let family = font_ctx
             .font_family
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
+            .as_deref()
+            .unwrap_or("default")
+            .to_string();
         let weight = font_ctx.font_weight.unwrap_or(400);
         let italic = font_ctx.font_italic.unwrap_or(false);
         let color = font_ctx

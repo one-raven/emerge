@@ -1209,18 +1209,6 @@ fn apply_patch_before(
                 .root_id()
                 .ok_or_else(|| "InsertSubtree: subtree has no root".to_string())?;
 
-            let subtree_topology: Vec<_> = subtree
-                .iter_node_pairs()
-                .map(|(id, _)| {
-                    (
-                        id,
-                        subtree.child_ids(&id),
-                        subtree.paint_child_ids_for(&id),
-                        subtree.nearby_mounts_for(&id),
-                    )
-                })
-                .collect();
-
             subtree.stamp_all_mounted_at_revision(batch_revision);
             if let Some(parent) = parent_id {
                 tree.capture_animation_source(&parent);
@@ -1231,13 +1219,8 @@ fn apply_patch_before(
                 .add(TreeInvalidation::Structure);
 
             // Insert all nodes from subtree into main tree
-            for element in subtree.nodes.into_iter().flatten() {
-                tree.insert_boxed(element);
-            }
-
-            for (id, child_ids, paint_child_ids, nearby_mounts) in subtree_topology {
-                tree.set_inserted_node_topology(&id, child_ids, paint_child_ids, nearby_mounts)?;
-            }
+            // One Raven patch: nodes and topology move in by arena index.
+            tree.adopt_subtree_nodes(subtree);
 
             // Update parent's children or set as tree root
             match parent_id {
@@ -1270,17 +1253,6 @@ fn apply_patch_before(
                 .root_id()
                 .ok_or_else(|| "InsertNearbySubtree: subtree has no root".to_string())?;
 
-            let subtree_topology: Vec<_> = subtree
-                .iter_node_pairs()
-                .map(|(id, _)| {
-                    (
-                        id,
-                        subtree.child_ids(&id),
-                        subtree.paint_child_ids_for(&id),
-                        subtree.nearby_mounts_for(&id),
-                    )
-                })
-                .collect();
             let has_animation_attrs = subtree_has_animation_attrs(&subtree);
 
             subtree.stamp_all_mounted_at_revision(batch_revision);
@@ -1290,13 +1262,8 @@ fn apply_patch_before(
             }
             tree.pending_patch_effects.model_changed = true;
 
-            for element in subtree.nodes.into_iter().flatten() {
-                tree.insert_boxed(element);
-            }
-
-            for (id, child_ids, paint_child_ids, nearby_mounts) in subtree_topology {
-                tree.set_inserted_node_topology(&id, child_ids, paint_child_ids, nearby_mounts)?;
-            }
+            // One Raven patch: nodes and topology move in by arena index.
+            tree.adopt_subtree_nodes(subtree);
 
             let mut live_mounts = tree.live_nearby_mounts(&host_id);
             let insert_index = index.min(live_mounts.len());

@@ -100,6 +100,11 @@ impl RasterBackend {
         })
     }
 
+    /// One Raven patch: see `SceneRenderer::set_async_vector_rasterization`.
+    pub fn set_async_vector_rasterization(&mut self, enabled: bool) {
+        self.renderer.set_async_vector_rasterization(enabled);
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
         if self.width == width && self.height == height {
             return Ok(());

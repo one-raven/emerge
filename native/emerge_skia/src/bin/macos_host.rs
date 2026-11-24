@@ -2188,7 +2188,14 @@ mod app {
                 _input_view: input_view,
                 _window_delegate: window_delegate,
                 surface,
-                renderer: SceneRenderer::with_cache_config(renderer_cache_config),
+                // One Raven patch: rasterize large SVGs off the render thread.
+                renderer: {
+                    let mut renderer = SceneRenderer::with_cache_config(renderer_cache_config);
+                    renderer.set_async_vector_rasterization(
+                        emerge_skia::renderer::async_vector_rasterization_enabled(true),
+                    );
+                    renderer
+                },
                 video: emerge_skia::cpu_video::CpuVideoFrames::new()?,
                 runtime: HostSessionRuntime::new(
                     event_runtime,

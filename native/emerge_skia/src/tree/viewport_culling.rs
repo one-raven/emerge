@@ -154,15 +154,15 @@ fn subtree_has_retained_registry_exception(tree: &ElementTree, ix: NodeIx) -> bo
         return false;
     };
 
+    // One Raven patch: walk the topology in place (this visits every node of
+    // a culled subtree, e.g. a screen's content below the fold).
     element_has_retained_registry_exception(element)
-        || tree
-            .child_ixs(ix)
-            .into_iter()
-            .any(|child_ix| subtree_has_retained_registry_exception(tree, child_ix))
-        || tree
-            .nearby_ixs(ix)
-            .into_iter()
-            .any(|mount| subtree_has_retained_registry_exception(tree, mount.ix))
+        || tree.any_child_ix(ix, |child_ix| {
+            subtree_has_retained_registry_exception(tree, child_ix)
+        })
+        || tree.any_nearby_ix(ix, |mount| {
+            subtree_has_retained_registry_exception(tree, mount.ix)
+        })
 }
 
 fn element_has_retained_registry_exception(element: &Element) -> bool {

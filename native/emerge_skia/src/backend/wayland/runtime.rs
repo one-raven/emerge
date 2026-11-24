@@ -212,13 +212,17 @@ impl RasterWaylandEnv {
                 );
             }
         };
-        let renderer = RasterBackend::with_cache_config(
+        let mut renderer = RasterBackend::with_cache_config(
             &RasterConfig {
                 width: size.0,
                 height: size.1,
             },
             renderer_cache_config,
         )?;
+        // One Raven patch: rasterize large SVGs off the render thread.
+        renderer.set_async_vector_rasterization(
+            crate::renderer::async_vector_rasterization_enabled(true),
+        );
 
         Ok(Self {
             renderer,

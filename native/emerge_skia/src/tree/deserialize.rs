@@ -16,7 +16,9 @@
 //!   - attr_count (2 bytes BE)
 //!   - For each attr: tag (1 byte) + value (varies by tag)
 
-use super::attrs::{Attrs, decode_attrs};
+use super::attrs::{SharedAttrs, decode_attrs_shared};
+#[cfg(test)]
+use super::element::NearbyMount;
 use super::element::{Element, ElementKind, ElementTree, NearbyMounts, NearbySlot, NodeId};
 
 const MAGIC: &[u8] = b"EMRG";
@@ -104,7 +106,7 @@ struct RawNode {
     id: NodeId,
     kind: ElementKind,
     attrs_raw: Vec<u8>,
-    attrs: Attrs,
+    attrs: SharedAttrs,
     child_ids: Vec<NodeId>,
     nearby: NearbyMounts,
 }
@@ -157,10 +159,13 @@ pub fn decode_tree(data: &[u8]) -> Result<ElementTree, DecodeError> {
         )));
     }
 
+    // One Raven patch: link the decoded nodes without `set_children`'s
+    // invalidation. Every node of a decoded tree is new, so already measure-,
+    // render- and registry-dirty; `set_children` still walked each parent's
+    // ancestor chain marking it dirty again (a fifth of decoding a 2,300-node
+    // screen). Topology versions are bumped as before.
     for (id, child_ids, nearby_mounts) in topology_updates {
-        tree.set_children(&id, child_ids)
-            .map_err(DecodeError::InvalidStructure)?;
-        tree.set_nearby_mounts(&id, nearby_mounts)
+        tree.set_inserted_node_topology(&id, child_ids.clone(), child_ids, nearby_mounts)
             .map_err(DecodeError::InvalidStructure)?;
     }
 
@@ -182,7 +187,7 @@ fn decode_node(cursor: &mut Cursor) -> Result<RawNode, DecodeError> {
 
     // Read attributes
     let attrs_raw = cursor.read_length_prefixed()?;
-    let attrs = decode_attrs(&attrs_raw)?;
+    let attrs = decode_attrs_shared(&attrs_raw)?;
 
     // Read children
     let child_count = cursor.read_u16_be()? as usize;
@@ -215,6 +220,125 @@ fn decode_node(cursor: &mut Cursor) -> Result<RawNode, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decoding as upstream linked the nodes: `set_children` and
+    /// `set_nearby_mounts` per node, with their invalidation.
+    fn decode_tree_linking_with_set_children(data: &[u8]) -> ElementTree {
+        let mut cursor = Cursor::new(data);
+        cursor.read_bytes(5).unwrap();
+        let node_count = cursor.read_u32_be().unwrap() as usize;
+        let mut tree = ElementTree::new();
+        let mut root_id = None;
+        let mut topology = Vec::new();
+        for _ in 0..node_count {
+            let raw = decode_node(&mut cursor).unwrap();
+            root_id.get_or_insert(raw.id);
+            topology.push((raw.id, raw.child_ids, raw.nearby.mounts));
+            tree.insert(Element::with_attrs(
+                raw.id,
+                raw.kind,
+                raw.attrs_raw,
+                raw.attrs,
+            ));
+        }
+        for (id, child_ids, mounts) in topology {
+            tree.set_children(&id, child_ids).unwrap();
+            tree.set_nearby_mounts(&id, mounts).unwrap();
+        }
+        tree.set_root_id(root_id.unwrap());
+        tree
+    }
+
+    fn node_state(tree: &ElementTree, id: &NodeId) -> String {
+        let element = tree.get(id).unwrap();
+        let ix = tree.ix_of(id).unwrap();
+        format!(
+            "{:?} layout=({} {} {} {}) refresh=({} {} {} {} gen={} reg_cache={} frag={}) \
+             versions={:?} key={:?} parent={:?} children={:?} paint={:?} nearby={:?}",
+            element.spec.kind,
+            element.layout.measure_dirty,
+            element.layout.measure_descendant_dirty,
+            element.layout.resolve_dirty,
+            element.layout.resolve_descendant_dirty,
+            element.refresh.render_dirty,
+            element.refresh.render_descendant_dirty,
+            element.refresh.registry_dirty,
+            element.refresh.registry_descendant_dirty,
+            element.refresh.paint_generation,
+            element.refresh.registry_cache.is_some(),
+            element.refresh.render_fragment_cache.borrow().is_some(),
+            element.layout.topology_versions,
+            tree.topology_dependency_key_for(id),
+            tree.parent_link_of(ix).map(|link| match link {
+                super::super::element::ParentLink::Child { parent } => (tree.id_of(parent), None),
+                super::super::element::ParentLink::Nearby { host, slot } =>
+                    (tree.id_of(host), Some(slot)),
+            }),
+            tree.child_ids(id),
+            tree.paint_child_ids_for(id),
+            tree.nearby_mounts_for(id),
+        )
+    }
+
+    // One Raven patch: decoding links nodes without re-marking them dirty;
+    // the result must be the tree upstream's linking produced.
+    #[test]
+    fn decoded_tree_matches_linking_with_set_children() {
+        let id = NodeId::from_wire_u64;
+        let mut source = ElementTree::new();
+        let nodes = [
+            (1, ElementKind::Column),
+            (2, ElementKind::Row),
+            (3, ElementKind::Text),
+            (4, ElementKind::El),
+            (5, ElementKind::El),
+            (6, ElementKind::Text),
+            (7, ElementKind::El),
+            (8, ElementKind::Text),
+        ];
+        for (n, kind) in nodes {
+            source.insert(Element::with_attrs(
+                id(n),
+                kind,
+                Vec::new(),
+                crate::tree::attrs::Attrs::default(),
+            ));
+        }
+        source.set_root_id(id(1));
+        source.set_children(&id(1), vec![id(2), id(4)]).unwrap();
+        source.set_children(&id(2), vec![id(3)]).unwrap();
+        source.set_children(&id(4), vec![id(7)]).unwrap();
+        source.set_children(&id(5), vec![id(6)]).unwrap();
+        source.set_children(&id(7), vec![id(8)]).unwrap();
+        source
+            .set_nearby_mounts(
+                &id(4),
+                vec![NearbyMount {
+                    slot: NearbySlot::InFront,
+                    id: id(5),
+                }],
+            )
+            .unwrap();
+        let bytes = super::super::serialize::encode_tree(&source);
+
+        super::super::element::REFRESH_DIRTY_MARKS.with(|count| count.set(0));
+        let decoded = decode_tree(&bytes).unwrap();
+        assert_eq!(
+            super::super::element::REFRESH_DIRTY_MARKS.with(|count| count.get()),
+            0,
+            "decoding re-marked new nodes dirty"
+        );
+        let expected = decode_tree_linking_with_set_children(&bytes);
+        assert_eq!(decoded.len(), 8);
+        assert_eq!(decoded.root_id(), expected.root_id());
+        for (n, _) in nodes {
+            assert_eq!(
+                node_state(&decoded, &id(n)),
+                node_state(&expected, &id(n)),
+                "node {n}"
+            );
+        }
+    }
 
     fn make_header(node_count: u32) -> Vec<u8> {
         let mut buf = Vec::new();

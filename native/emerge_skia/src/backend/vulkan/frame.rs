@@ -100,8 +100,13 @@ impl VulkanEngine {
         renderer_cache_config: RendererCacheConfig,
     ) -> Result<Self, String> {
         let ganesh = GaneshContext::new(&device)?;
+        // One Raven patch: rasterize large SVGs off the render thread.
+        let mut renderer = SceneRenderer::with_cache_config(renderer_cache_config);
+        renderer.set_async_vector_rasterization(
+            crate::renderer::async_vector_rasterization_enabled(true),
+        );
         Ok(Self {
-            renderer: Some(SceneRenderer::with_cache_config(renderer_cache_config)),
+            renderer: Some(renderer),
             ganesh,
             device,
         })

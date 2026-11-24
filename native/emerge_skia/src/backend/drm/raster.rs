@@ -544,6 +544,9 @@ fn run_session(
     let mut first_present = true;
     let mut application_frame_ready = false;
     let mut renderer = SceneRenderer::with_cache_config(config.renderer_cache_config);
+    // One Raven patch: rasterize large SVGs off the render thread.
+    renderer
+        .set_async_vector_rasterization(crate::renderer::async_vector_rasterization_enabled(true));
     let mut state = RenderState::default();
     let mut cursor = context.cursor_state.snapshot();
     let mut icon = CursorIcon::Default;

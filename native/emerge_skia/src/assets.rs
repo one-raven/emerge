@@ -262,6 +262,7 @@ impl AssetRuntime {
                 match msg {
                     AssetMsg::Stop => break,
                     AssetMsg::Load(request) => worker.handle_load(request),
+                    AssetMsg::TreeUpdate => send_tree_update(&worker.tree_tx, worker.log_render),
                 }
             }
         });
@@ -375,6 +376,9 @@ pub(crate) fn current_renderer_context() -> Arc<crate::renderer::RendererAssetCo
 
 enum AssetMsg {
     Load(LoadRequest),
+    // One Raven patch: ask the tree for a new frame (an SVG rasterized off
+    // the render thread is ready); this worker owns the tree's sender.
+    TreeUpdate,
     Stop,
 }
 
@@ -698,6 +702,21 @@ pub(crate) fn request_asset_hydration(id: &str) {
     };
     crate::renderer::invalidate_asset_render_revision(id);
     send_load_request(&context, request);
+}
+
+/// One Raven patch: whether a running asset worker can ask the tree for a new
+/// frame. Without one (a bare renderer, unit tests) drawing stays synchronous.
+pub(crate) fn can_request_tree_update() -> bool {
+    current_context().tx.lock().is_ok_and(|tx| tx.is_some())
+}
+
+/// One Raven patch: ask the tree for a new frame through the asset worker.
+pub(crate) fn request_tree_update() {
+    let context = current_context();
+    let tx = context.tx.lock().ok().and_then(|tx| tx.clone());
+    if let Some(tx) = tx {
+        let _ = tx.try_send(AssetMsg::TreeUpdate);
+    }
 }
 
 fn resolved_source_path(source: &ImageSource, config: &AssetConfig) -> Result<PathBuf, String> {

@@ -1029,11 +1029,16 @@ impl RasterHeadlessRenderer {
         renderer_cache_config: RendererCacheConfig,
         pixel_format: RasterPixelFormat,
     ) -> Result<Self, String> {
-        let renderer = RasterBackend::with_cache_config_and_format(
+        let mut renderer = RasterBackend::with_cache_config_and_format(
             &RasterConfig { width, height },
             renderer_cache_config,
             pixel_format,
         )?;
+        // One Raven patch: off unless EMERGE_ASYNC_SVG_RASTER=1, so a captured
+        // frame shows every picture.
+        renderer.set_async_vector_rasterization(
+            crate::renderer::async_vector_rasterization_enabled(false),
+        );
         Ok(Self {
             renderer,
             width,

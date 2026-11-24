@@ -314,6 +314,22 @@ impl SharedAttrs {
     pub fn ptr_eq(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
+
+    /// One Raven patch: a fresh default value, initialized in its allocation
+    /// rather than built on the stack and copied in (see `decode_attrs_shared`).
+    pub(crate) fn default_unique() -> Self {
+        let mut arc = std::sync::Arc::<Attrs>::new_uninit();
+        std::sync::Arc::get_mut(&mut arc)
+            .expect("a new Arc is unique")
+            .write(Attrs::default());
+        // SAFETY: initialized just above.
+        Self(unsafe { arc.assume_init() })
+    }
+
+    /// Mutable access to a value this handle doesn't share.
+    pub(crate) fn unique_mut(&mut self) -> &mut Attrs {
+        std::sync::Arc::get_mut(&mut self.0).expect("attrs are not shared")
+    }
 }
 
 impl AsRef<Attrs> for SharedAttrs {
@@ -643,19 +659,33 @@ impl<'a> AttrCursor<'a> {
 
 /// Decode an attribute block into Attrs struct.
 pub fn decode_attrs(data: &[u8]) -> Result<Attrs, DecodeError> {
-    let mut cursor = AttrCursor::new(data);
     let mut attrs = Attrs::default();
+    decode_attrs_into(data, &mut attrs)?;
+    Ok(attrs)
+}
+
+/// One Raven patch: decode straight into a shared allocation. `Attrs` is
+/// ~2.5 KB; decoding it on the stack and handing it to `SharedAttrs` copied
+/// it twice per inserted node (a sixth of decoding a 2,300-node screen).
+pub fn decode_attrs_shared(data: &[u8]) -> Result<SharedAttrs, DecodeError> {
+    let mut shared = SharedAttrs::default_unique();
+    decode_attrs_into(data, shared.unique_mut())?;
+    Ok(shared)
+}
+
+fn decode_attrs_into(data: &[u8], attrs: &mut Attrs) -> Result<(), DecodeError> {
+    let mut cursor = AttrCursor::new(data);
 
     // Empty block is valid
     if cursor.remaining() == 0 {
-        return Ok(attrs);
+        return Ok(());
     }
 
     let attr_count = cursor.read_u16_be()? as usize;
 
     for _ in 0..attr_count {
         let tag = cursor.read_u8()?;
-        decode_attr(&mut cursor, tag, &mut attrs)?;
+        decode_attr(&mut cursor, tag, attrs)?;
     }
 
     if cursor.remaining() != 0 {
@@ -664,8 +694,8 @@ pub fn decode_attrs(data: &[u8]) -> Result<Attrs, DecodeError> {
             cursor.remaining()
         )));
     }
-    super::animation::change::validate_policies(&attrs).map_err(DecodeError::InvalidStructure)?;
-    Ok(attrs)
+    super::animation::change::validate_policies(attrs).map_err(DecodeError::InvalidStructure)?;
+    Ok(())
 }
 
 fn decode_attr(cursor: &mut AttrCursor, tag: u8, attrs: &mut Attrs) -> Result<(), DecodeError> {
@@ -1405,6 +1435,29 @@ fn decode_font_style(cursor: &mut AttrCursor) -> Result<FontStyle, DecodeError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // One Raven patch: decoding into a shared allocation gives the value
+    // `decode_attrs` gives, in an allocation nothing else holds (preparation
+    // and layout may then share it without a copy).
+    #[test]
+    fn decode_attrs_shared_matches_decode_attrs() {
+        let mut data = vec![0, 3, TAG_WIDTH, 2];
+        data.extend_from_slice(&100.0_f64.to_be_bytes());
+        data.push(TAG_FONT);
+        data.push(1);
+        data.extend_from_slice(&6u16.to_be_bytes());
+        data.extend_from_slice(b"Outfit");
+        data.push(TAG_SPACING);
+        data.extend_from_slice(&8.0_f64.to_be_bytes());
+
+        let plain = decode_attrs(&data).unwrap();
+        let mut shared = decode_attrs_shared(&data).unwrap();
+        assert_eq!(*shared, plain);
+        assert_eq!(plain.font, Some(Font::String("Outfit".into())));
+        shared.unique_mut().spacing = Some(9.0);
+        assert_eq!(*decode_attrs_shared(&[]).unwrap(), Attrs::default());
+        assert!(decode_attrs_shared(&data[..data.len() - 1]).is_err());
+    }
 
     #[test]
     fn test_decode_empty_attrs() {
