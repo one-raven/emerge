@@ -16109,7 +16109,7 @@ mod base_snapshot_tests {
             started_at: Instant::now(),
             revision: 0,
             frame: crate::tree::element::Frame::default(),
-            base: crate::tree::attrs::Attrs::default(),
+            base: Default::default(),
             current_transform: Affine2::identity(),
             current_alpha: 1.0,
             offset: (0.0, 0.0),
@@ -16386,7 +16386,7 @@ mod idle_animation_tests {
                 height: 24.0,
                 ..Frame::default()
             },
-            base: Attrs::default(),
+            base: Default::default(),
             current_transform: Affine2::identity(),
             current_alpha: 1.0,
             offset: (0.0, 0.0),

@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 
 use crate::{
     RenderSender,
@@ -84,6 +84,12 @@ pub(crate) fn spawn_tree_actor_with_initial_tree(
 
         // At most one unsent full registry and one latest scene. Continue
         // processing input while the event consumer is blocked, especially Stop.
+        // One Raven patch: a scene waits only while its registry can't be
+        // sent (the event channel is full). Each batch sends its registry and
+        // publishes its scene before the next message is taken; upstream left
+        // that to `select!`, which picks a ready arm at random, so a patch
+        // already queued replaced the waiting scene unpublished about half
+        // the time, and two patches reached the screen as one late frame.
         let mut pending_registry = None;
         let mut pending_layout: Option<PendingLayout> = None;
         let targets = || LayoutOutputPublishTargets {
@@ -180,18 +186,52 @@ pub(crate) fn spawn_tree_actor_with_initial_tree(
                         tree_batch_started_at,
                         animation_trace,
                     };
-                    if pending_registry.is_some() {
-                        pending_layout = Some(layout);
-                    } else {
-                        layout.publish(targets());
+                    if pending_layout.replace(layout).is_some()
+                        && let Some(stats) = stats.as_ref()
+                    {
+                        // A scene that never reaches the presenter.
+                        stats.record_render_queue_overwrite();
                     }
                 }
                 Err(err) => eprintln!("tree update failed: {err}"),
             }
-            // One Raven patch: drop removed elements after the frame is queued.
+            publish_pending(
+                &event_tx,
+                &mut pending_registry,
+                &mut pending_layout,
+                targets(),
+            );
+            // One Raven patch: drop removed elements after the frame is queued
+            // (or, with the event channel full, held).
             engine.release_retired();
         }
     })
+}
+
+/// One Raven patch: send the pending registry, then publish the pending
+/// scene, which must not reach the presenter before its registry. With the
+/// event channel full both stay pending.
+fn publish_pending(
+    event_tx: &Sender<EventMsg>,
+    pending_registry: &mut Option<crate::events::RegistryRebuildPayload>,
+    pending_layout: &mut Option<PendingLayout>,
+    targets: LayoutOutputPublishTargets<'_>,
+) {
+    if let Some(rebuild) = pending_registry.take() {
+        match event_tx.try_send(EventMsg::registry_update(rebuild)) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(message)) => {
+                let EventMsg::RegistryUpdate { rebuild } = message else {
+                    unreachable!("a registry update comes back as one");
+                };
+                *pending_registry = Some(*rebuild);
+                return;
+            }
+        }
+    }
+    if let Some(layout) = pending_layout.take() {
+        layout.publish(targets);
+    }
 }
 
 fn coalesce_registry(
@@ -491,6 +531,247 @@ mod tests {
             }
             RenderMsg::Stop => panic!("expected scene render message"),
         }
+    }
+
+    /// A column of `count` listener cells: big enough that a patch takes a
+    /// while to lay out and refresh.
+    fn listener_column_tree(count: u64) -> ElementTree {
+        let mut tree = ElementTree::new();
+        tree.insert(Element::with_attrs(
+            NodeId(1),
+            ElementKind::Column,
+            vec![],
+            Attrs {
+                width: Some(Length::Fill),
+                ..Default::default()
+            },
+        ));
+        let cells: Vec<_> = (2..count + 2).map(NodeId).collect();
+        for id in &cells {
+            tree.insert(Element::with_attrs(
+                *id,
+                ElementKind::El,
+                fixed_listener_attrs_raw(),
+                Attrs {
+                    width: Some(Length::Px(64.0)),
+                    height: Some(Length::Px(32.0)),
+                    on_mouse_move: Some(true),
+                    ..Default::default()
+                },
+            ));
+        }
+        tree.set_children(&NodeId(1), cells).unwrap();
+        tree.set_root_id(NodeId(1));
+        tree
+    }
+
+    // One Raven patch: a scene held for its registry used to race the next
+    // patch (`select!` picks a ready arm at random), and losing replaced it
+    // unpublished, so two patches showed up as one late frame.
+    #[test]
+    fn patches_queued_while_a_scene_waits_for_its_registry_each_publish_in_order() {
+        let assets = crate::assets::AssetRuntime::new();
+        let _assets = assets.enter();
+        let actor = TreeActorHarness::new(listener_column_tree(1500), 600, 60);
+        actor.send(TreeMsg::RebuildRegistry);
+        actor.recv_registry_update();
+        let RenderMsg::Scene { mut version, .. } = actor.recv_scene() else {
+            panic!("expected scene");
+        };
+        for round in 0..16 {
+            // Each patch adds or removes a listener, so each scene comes with
+            // a registry and is held until that is sent.
+            for (second, listener) in [(false, false), (true, true)] {
+                let attrs = if listener {
+                    fixed_listener_attrs_raw()
+                } else {
+                    rgba_background_attrs_raw(0, 0, 255, 255)
+                };
+                if second {
+                    // Let the actor take the first patch off the queue, so
+                    // this one lands while the first is being processed.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !actor.tree_tx.is_empty() {
+                        assert!(Instant::now() < deadline);
+                        thread::yield_now();
+                    }
+                    thread::sleep(Duration::from_micros(500));
+                }
+                actor.send(TreeMsg::PatchTree {
+                    bytes: encode_set_attrs_patch(NodeId(2), attrs),
+                    submitted_at: None,
+                });
+            }
+            for _ in 0..2 {
+                let RenderMsg::Scene { version: next, .. } = actor
+                    .render_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| panic!("round {round}: a scene went missing"))
+                else {
+                    panic!("expected scene");
+                };
+                assert_eq!(next, version + 1, "round {round}");
+                version = next;
+            }
+            while actor.event_rx.try_recv().is_ok() {}
+        }
+        actor.stop();
+    }
+
+    /// A scrolling screen of `cards` cards, each a row of three tiles of two
+    /// boxes, with click handlers, shadows and rounded corners.
+    fn card_screen_tree(cards: u64) -> (ElementTree, NodeId) {
+        use crate::tree::attrs::{BorderRadius, BoxShadow};
+        let mut tree = ElementTree::new();
+        let mut next = 1;
+        let mut id = || {
+            next += 1;
+            NodeId(next)
+        };
+        let root = id();
+        let mut card_ids = Vec::new();
+        let mut patched = None;
+        for card in 0..cards {
+            let card_id = id();
+            let mut tiles = Vec::new();
+            for tile in 0..3 {
+                let tile_id = id();
+                let boxes: Vec<_> = (0..2).map(|_| id()).collect();
+                for (k, box_id) in boxes.iter().enumerate() {
+                    tree.insert(Element::with_attrs(
+                        *box_id,
+                        ElementKind::El,
+                        vec![],
+                        Attrs {
+                            width: Some(Length::Fill),
+                            height: Some(Length::Px(24.0)),
+                            background: Some(Background::Color(Color::Rgb {
+                                r: (card % 255) as u8,
+                                g: k as u8 * 40,
+                                b: tile * 60,
+                            })),
+                            border_radius: Some(BorderRadius::Uniform(6.0)),
+                            ..Default::default()
+                        },
+                    ));
+                }
+                if card == 5 && tile == 1 {
+                    patched = Some(boxes[0]);
+                }
+                tree.insert(Element::with_attrs(
+                    tile_id,
+                    ElementKind::Column,
+                    vec![],
+                    Attrs {
+                        width: Some(Length::Fill),
+                        on_click: Some(true),
+                        mouse_over: Some(MouseOverAttrs {
+                            alpha: Some(0.8),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ));
+                tree.set_children(&tile_id, boxes).unwrap();
+                tiles.push(tile_id);
+            }
+            tree.insert(Element::with_attrs(
+                card_id,
+                ElementKind::Row,
+                vec![],
+                Attrs {
+                    width: Some(Length::Fill),
+                    spacing: Some(8.0),
+                    background: Some(Background::Color(Color::Rgb {
+                        r: 250,
+                        g: 250,
+                        b: 250,
+                    })),
+                    border_radius: Some(BorderRadius::Uniform(12.0)),
+                    box_shadows: Some(vec![BoxShadow {
+                        offset_x: 0.0,
+                        offset_y: 2.0,
+                        blur: 8.0,
+                        size: 0.0,
+                        color: Color::Rgba {
+                            r: 0,
+                            g: 0,
+                            b: 0,
+                            a: 40,
+                        },
+                        inset: false,
+                    }]),
+                    on_click: Some(true),
+                    ..Default::default()
+                },
+            ));
+            tree.set_children(&card_id, tiles).unwrap();
+            card_ids.push(card_id);
+        }
+        tree.insert(Element::with_attrs(
+            root,
+            ElementKind::Column,
+            vec![],
+            Attrs {
+                width: Some(Length::Fill),
+                height: Some(Length::Fill),
+                spacing: Some(12.0),
+                scrollbar_y: Some(true),
+                ..Default::default()
+            },
+        ));
+        tree.set_children(&root, card_ids).unwrap();
+        tree.set_root_id(root);
+        (tree, patched.unwrap())
+    }
+
+    /// The tree actor's work for one small patch into a big screen, the
+    /// patch adding or removing a handler (so the registry is rebuilt).
+    /// `cargo test --release --lib tree_patch_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn tree_patch_timing() {
+        let assets = crate::assets::AssetRuntime::new();
+        let _assets = assets.enter();
+        let (tree, patched) = card_screen_tree(250);
+        let mut engine = TreeUpdateEngine::new(tree, 1200, 1920);
+        let options = || TreeUpdateOptions::new(None, TreeUpdateDecodePolicy::ReturnErr);
+        engine
+            .process_messages(vec![TreeMsg::RebuildRegistry], options())
+            .unwrap();
+        engine.release_retired();
+        let runs: u32 = std::env::var("EMERGE_TIMING_RUNS")
+            .ok()
+            .and_then(|runs| runs.parse().ok())
+            .unwrap_or(200);
+        let started = Instant::now();
+        for run in 0..runs {
+            let attrs = if run % 2 == 0 {
+                fixed_listener_attrs_raw()
+            } else {
+                rgba_background_attrs_raw(0, 0, 255, 255)
+            };
+            let effect = engine
+                .process_messages(
+                    vec![TreeMsg::PatchTree {
+                        bytes: encode_set_attrs_patch(patched, attrs),
+                        submitted_at: None,
+                    }],
+                    options(),
+                )
+                .unwrap();
+            let TreeUpdateEffect::Layout { output, .. } = effect else {
+                panic!("expected a scene");
+            };
+            assert!(output.event_rebuild_changed);
+            drop(output);
+            engine.release_retired();
+        }
+        eprintln!(
+            "tree patch, {} nodes: {:.3} ms per patch",
+            250 * 10 + 1,
+            started.elapsed().as_secs_f64() * 1000.0 / f64::from(runs)
+        );
     }
 
     #[test]

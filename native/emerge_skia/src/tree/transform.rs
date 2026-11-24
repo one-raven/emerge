@@ -201,10 +201,28 @@ impl InteractionClip {
 }
 
 pub fn element_transform(frame: Frame, attrs: &Attrs) -> Affine2 {
-    let move_x = attrs.move_x.unwrap_or(0.0) as f32;
-    let move_y = attrs.move_y.unwrap_or(0.0) as f32;
-    let rotate = attrs.layout_rotate.or(attrs.rotate).unwrap_or(0.0) as f32;
-    let scale = attrs.scale.unwrap_or(1.0) as f32;
+    element_transform_of(
+        frame,
+        attrs.move_x,
+        attrs.move_y,
+        attrs.layout_rotate.or(attrs.rotate),
+        attrs.scale,
+    )
+}
+
+/// One Raven patch: `element_transform` from the four values it reads, for
+/// callers that hold them without an `Attrs`.
+pub fn element_transform_of(
+    frame: Frame,
+    move_x: Option<f64>,
+    move_y: Option<f64>,
+    rotate: Option<f64>,
+    scale: Option<f64>,
+) -> Affine2 {
+    let move_x = move_x.unwrap_or(0.0) as f32;
+    let move_y = move_y.unwrap_or(0.0) as f32;
+    let rotate = rotate.unwrap_or(0.0) as f32;
+    let scale = scale.unwrap_or(1.0) as f32;
     let center_x = frame.x + frame.width / 2.0;
     let center_y = frame.y + frame.height / 2.0;
 

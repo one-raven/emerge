@@ -68,7 +68,16 @@ defmodule Emerge.Engine.Tree.Nearby do
     Enum.filter(nearby, fn {slot, _element} -> slot in @escape_slots end)
   end
 
+  # One Raven patch: nearby elements live in `Element.nearby`, so attrs almost
+  # never hold a slot key; check before rebuilding the map six times.
   @doc false
+  def strip_nearby_attrs(attrs)
+      when is_map(attrs) and not is_map_key(attrs, :behind) and
+             not is_map_key(attrs, :above) and not is_map_key(attrs, :on_right) and
+             not is_map_key(attrs, :below) and not is_map_key(attrs, :on_left) and
+             not is_map_key(attrs, :in_front),
+      do: attrs
+
   def strip_nearby_attrs(attrs) when is_map(attrs) do
     Enum.reduce(@slots, attrs, fn slot, acc -> Map.delete(acc, slot) end)
   end

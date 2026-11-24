@@ -192,21 +192,19 @@ defmodule Emerge.Engine.Reconcile do
 
     {new_attrs, ctx} = resolve_scroll_attrs(element.attrs, old.attrs, ctx)
     ctx = remember_key(ctx, key, old.id)
-    events = vnode_events(old, new_attrs)
+
+    # One Raven patch: compare the attrs once for both the events and the
+    # attr patch, and skip the patch-list reversals when nothing changed.
+    same_attrs? = old.attrs === new_attrs
+    events = vnode_events(old, new_attrs, same_attrs?)
 
     parent_patches =
       []
       |> maybe_set_nearby_mounts(old, nearby_vnodes)
       |> maybe_set_children(old, child_vnodes)
-      |> maybe_set_attrs(old, new_attrs, old.id)
+      |> maybe_set_attrs(old, new_attrs, old.id, same_attrs?)
 
-    patches_rev =
-      []
-      |> prepend_many(nearby_patches)
-      |> prepend_many(child_patches)
-      |> prepend_many(parent_patches)
-
-    patches = Enum.reverse(patches_rev)
+    patches = concat_patches(parent_patches, child_patches, nearby_patches)
 
     vnode = %VNode{
       id: old.id,
@@ -225,6 +223,9 @@ defmodule Emerge.Engine.Reconcile do
 
     {vnode, patches, assigned, maybe_update_event_node(ctx, old.id, old.events, events)}
   end
+
+  # One Raven patch: a leaf (most nodes) has nothing to reconcile.
+  defp reconcile_children([], [], _parent_node_id, ctx), do: {[], [], [], ctx}
 
   defp reconcile_children(old_children, new_children, parent_node_id, ctx) do
     case children_mode(new_children) do
@@ -318,75 +319,39 @@ defmodule Emerge.Engine.Reconcile do
     end
   end
 
+  # One Raven patch: body recursion builds the vnode, element and patch lists
+  # in order, instead of three accumulators reversed at the end.
   defp reconcile_children_unkeyed(old_children, new_children, parent_node_id, ctx) do
-    {vnodes_rev, elements_rev, patches_rev, ctx} =
-      do_reconcile_children_unkeyed(
-        old_children,
-        new_children,
-        0,
-        parent_node_id,
-        ctx,
-        [],
-        [],
-        []
-      )
-
-    {Enum.reverse(vnodes_rev), Enum.reverse(elements_rev), Enum.reverse(patches_rev), ctx}
+    do_reconcile_children_unkeyed(old_children, new_children, 0, parent_node_id, ctx)
   end
 
-  defp do_reconcile_children_unkeyed(
-         [],
-         [],
-         _index,
-         _parent_node_id,
-         ctx,
-         vnodes_rev,
-         elements_rev,
-         patches_rev
-       ) do
-    {vnodes_rev, elements_rev, patches_rev, ctx}
-  end
+  defp do_reconcile_children_unkeyed([], [], _index, _parent_node_id, ctx),
+    do: {[], [], [], ctx}
 
   defp do_reconcile_children_unkeyed(
          [%VNode{} = old_child | old_rest],
          [%Element{} = child | new_rest],
          index,
          parent_node_id,
-         ctx,
-         vnodes_rev,
-         elements_rev,
-         patches_rev
+         ctx
        ) do
     if old_child.kind == child.type and old_child.key == nil and not has_key?(child) do
       {vnode, child_patches, assigned, ctx} = reconcile_matched_node(old_child, child, ctx)
 
-      do_reconcile_children_unkeyed(
-        old_rest,
-        new_rest,
-        index + 1,
-        parent_node_id,
-        ctx,
-        [vnode | vnodes_rev],
-        prepend_assigned(ctx, assigned, elements_rev),
-        prepend_many(patches_rev, child_patches)
-      )
+      {vnodes, elements, patches, ctx} =
+        do_reconcile_children_unkeyed(old_rest, new_rest, index + 1, parent_node_id, ctx)
+
+      {[vnode | vnodes], prepend_assigned(ctx, assigned, elements), child_patches ++ patches, ctx}
     else
       {vnode, assigned, ctx} = build_fresh_subtree_for_patches(child, ctx)
       ctx = maybe_delete_event_tree(ctx, old_child)
 
-      do_reconcile_children_unkeyed(
-        old_rest,
-        new_rest,
-        index + 1,
-        parent_node_id,
-        ctx,
-        [vnode | vnodes_rev],
-        prepend_assigned(ctx, assigned, elements_rev),
-        [
-          {:insert_subtree, parent_node_id, index, assigned},
-          {:remove, old_child.id} | patches_rev
-        ]
-      )
+      {vnodes, elements, patches, ctx} =
+        do_reconcile_children_unkeyed(old_rest, new_rest, index + 1, parent_node_id, ctx)
+
+      {[vnode | vnodes], prepend_assigned(ctx, assigned, elements),
+       [{:remove, old_child.id}, {:insert_subtree, parent_node_id, index, assigned} | patches],
+       ctx}
     end
   end
 
@@ -395,23 +360,15 @@ defmodule Emerge.Engine.Reconcile do
          [%Element{} = child | new_rest],
          index,
          parent_node_id,
-         ctx,
-         vnodes_rev,
-         elements_rev,
-         patches_rev
+         ctx
        ) do
     {vnode, assigned, ctx} = build_fresh_subtree_for_patches(child, ctx)
 
-    do_reconcile_children_unkeyed(
-      [],
-      new_rest,
-      index + 1,
-      parent_node_id,
-      ctx,
-      [vnode | vnodes_rev],
-      prepend_assigned(ctx, assigned, elements_rev),
-      [{:insert_subtree, parent_node_id, index, assigned} | patches_rev]
-    )
+    {vnodes, elements, patches, ctx} =
+      do_reconcile_children_unkeyed([], new_rest, index + 1, parent_node_id, ctx)
+
+    {[vnode | vnodes], prepend_assigned(ctx, assigned, elements),
+     [{:insert_subtree, parent_node_id, index, assigned} | patches], ctx}
   end
 
   defp do_reconcile_children_unkeyed(
@@ -419,24 +376,17 @@ defmodule Emerge.Engine.Reconcile do
          [],
          index,
          parent_node_id,
-         ctx,
-         vnodes_rev,
-         elements_rev,
-         patches_rev
+         ctx
        ) do
     ctx = maybe_delete_event_tree(ctx, old_child)
 
-    do_reconcile_children_unkeyed(
-      old_rest,
-      [],
-      index + 1,
-      parent_node_id,
-      ctx,
-      vnodes_rev,
-      elements_rev,
-      [{:remove, old_child.id} | patches_rev]
-    )
+    {vnodes, elements, patches, ctx} =
+      do_reconcile_children_unkeyed(old_rest, [], index + 1, parent_node_id, ctx)
+
+    {vnodes, elements, [{:remove, old_child.id} | patches], ctx}
   end
+
+  defp reconcile_nearby([], [], _host_node_id, ctx), do: {[], [], [], ctx}
 
   defp reconcile_nearby(old_nearby, new_nearby, host_node_id, ctx) do
     case nearby_mode(new_nearby) do
@@ -666,8 +616,10 @@ defmodule Emerge.Engine.Reconcile do
     {vnode, assigned, maybe_register_event_tree(ctx, vnode)}
   end
 
+  # One Raven patch: a fresh subtree's ids are new, so only its nodes with
+  # events need adding.
   defp maybe_register_event_tree(%{event_registry: registry} = ctx, %VNode{} = vnode) do
-    %{ctx | event_registry: EventRegistry.merge_tree(registry, vnode)}
+    %{ctx | event_registry: EventRegistry.merge_new_tree(registry, vnode)}
   end
 
   defp maybe_register_event_tree(ctx, _vnode), do: ctx
@@ -686,10 +638,16 @@ defmodule Emerge.Engine.Reconcile do
 
   defp maybe_delete_event_tree(ctx, _vnode), do: ctx
 
-  defp vnode_events(%VNode{attrs: attrs, events: events}, attrs) when is_map(events), do: events
-  defp vnode_events(%VNode{attrs: attrs}, attrs), do: EventRegistry.node_events(attrs)
-  defp vnode_events(_old, attrs), do: EventRegistry.node_events(attrs)
+  defp vnode_events(%VNode{events: events}, _attrs, true) when is_map(events), do: events
+  defp vnode_events(_old, attrs, _same_attrs?), do: EventRegistry.node_events(attrs)
 
+  defp concat_patches([], [], []), do: []
+  # The order the old prepend-and-reverse produced: nearby, children, parent.
+  defp concat_patches(parent, children, nearby), do: nearby ++ children ++ parent
+
+  # One Raven patch: children and nearby mounts are built by plain recursion
+  # (no closures or accumulator tuples per child), and the element is copied
+  # once, with its id, attrs and assigned children together.
   defp build_fresh_subtree(%Element{} = element, ctx) do
     key = element_key(element)
     ctx = ctx |> ensure_unique_key!(key) |> collect_scroll_keys(element.attrs)
@@ -697,39 +655,18 @@ defmodule Emerge.Engine.Reconcile do
     _ = nearby_mode(element.nearby)
 
     {id, ctx} = alloc_id(ctx)
-
-    {child_vnodes_rev, child_elements_rev, ctx} =
-      Enum.reduce(element.children, {[], [], ctx}, fn child, {vnodes_rev, elements_rev, ctx} ->
-        {child_vnode, child_element, ctx} = build_fresh_subtree(child, ctx)
-        {[child_vnode | vnodes_rev], [child_element | elements_rev], ctx}
-      end)
-
-    {nearby_vnodes_rev, nearby_elements_rev, ctx} =
-      Enum.reduce(element.nearby, {[], [], ctx}, fn {slot, child},
-                                                    {vnodes_rev, elements_rev, ctx} ->
-        {nearby_vnode, nearby_element, ctx} = build_fresh_subtree(child, ctx)
-
-        {
-          [{slot, nearby_vnode} | vnodes_rev],
-          [{slot, nearby_element} | elements_rev],
-          ctx
-        }
-      end)
+    {child_vnodes, child_elements, ctx} = build_fresh_children(element.children, ctx)
+    {nearby_vnodes, nearby_elements, ctx} = build_fresh_nearby(element.nearby, ctx)
 
     {attrs, ctx} = resolve_scroll_attrs(element.attrs, %{}, ctx)
     ctx = remember_key(ctx, key, id)
-    element = %{element | attrs: attrs}
-    child_vnodes = Enum.reverse(child_vnodes_rev)
-    child_elements = Enum.reverse(child_elements_rev)
-    nearby_vnodes = Enum.reverse(nearby_vnodes_rev)
-    nearby_elements = Enum.reverse(nearby_elements_rev)
 
     vnode = %VNode{
       id: id,
       kind: element.type,
       key: key,
-      attrs: element.attrs,
-      events: EventRegistry.node_events(element.attrs),
+      attrs: attrs,
+      events: EventRegistry.node_events(attrs),
       children: child_vnodes,
       nearby: nearby_vnodes
     }
@@ -739,11 +676,28 @@ defmodule Emerge.Engine.Reconcile do
     assigned = %{
       element
       | id: id,
+        attrs: attrs,
         children: child_elements,
         nearby: nearby_elements
     }
 
     {vnode, assigned, ctx}
+  end
+
+  defp build_fresh_children([], ctx), do: {[], [], ctx}
+
+  defp build_fresh_children([child | rest], ctx) do
+    {vnode, assigned, ctx} = build_fresh_subtree(child, ctx)
+    {vnodes, elements, ctx} = build_fresh_children(rest, ctx)
+    {[vnode | vnodes], [assigned | elements], ctx}
+  end
+
+  defp build_fresh_nearby([], ctx), do: {[], [], ctx}
+
+  defp build_fresh_nearby([{slot, child} | rest], ctx) do
+    {vnode, assigned, ctx} = build_fresh_subtree(child, ctx)
+    {vnodes, elements, ctx} = build_fresh_nearby(rest, ctx)
+    {[{slot, vnode} | vnodes], [{slot, assigned} | elements], ctx}
   end
 
   # One Raven patch: a lazy subtree's vnode remembers its tag, every explicit
@@ -767,6 +721,11 @@ defmodule Emerge.Engine.Reconcile do
     do: {inner ++ keys, reusable? and inner_reusable?}
 
   defp memo_walk_child(%VNode{} = vnode, acc), do: memo_walk(vnode, acc)
+
+  defp keyed_scroll?(attrs)
+       when not is_map_key(attrs, :scroll_position_x) and
+              not is_map_key(attrs, :scroll_position_y),
+       do: false
 
   defp keyed_scroll?(attrs),
     do:
@@ -838,34 +797,44 @@ defmodule Emerge.Engine.Reconcile do
     kind == element.type and key == element_key(element)
   end
 
-  defp children_mode(children) do
-    sibling_mode(children, &has_key?/1, "All siblings must have key when any key is provided")
+  # One Raven patch: the sibling-mode check walks the list with plain
+  # recursion (no closures), and an empty list returns at once.
+  defp children_mode([]), do: :unkeyed
+
+  defp children_mode([first | rest]) do
+    keyed? = has_key?(first)
+    check_children_mode!(rest, keyed?)
+    if keyed?, do: :keyed, else: :unkeyed
   end
 
-  defp nearby_mode(nearby) do
-    sibling_mode(
-      nearby,
-      fn {_slot, element} -> has_key?(element) end,
-      "All nearby mounts on a host must have key when any key is provided"
-    )
+  defp check_children_mode!([], _keyed?), do: :ok
+
+  defp check_children_mode!([child | rest], keyed?) do
+    if has_key?(child) != keyed?,
+      do: raise(ArgumentError, "All siblings must have key when any key is provided")
+
+    check_children_mode!(rest, keyed?)
   end
 
-  defp sibling_mode(items, has_key_fun, mixed_error) do
-    mode =
-      Enum.reduce(items, :unknown, fn item, mode ->
-        case {mode, has_key_fun.(item)} do
-          {:unknown, true} -> :keyed
-          {:unknown, false} -> :unkeyed
-          {:keyed, true} -> :keyed
-          {:unkeyed, false} -> :unkeyed
-          _ -> raise ArgumentError, mixed_error
-        end
-      end)
+  defp nearby_mode([]), do: :unkeyed
 
-    case mode do
-      :keyed -> :keyed
-      _ -> :unkeyed
-    end
+  defp nearby_mode([{_slot, first} | rest]) do
+    keyed? = has_key?(first)
+    check_nearby_mode!(rest, keyed?)
+    if keyed?, do: :keyed, else: :unkeyed
+  end
+
+  defp check_nearby_mode!([], _keyed?), do: :ok
+
+  defp check_nearby_mode!([{_slot, element} | rest], keyed?) do
+    if has_key?(element) != keyed?,
+      do:
+        raise(
+          ArgumentError,
+          "All nearby mounts on a host must have key when any key is provided"
+        )
+
+    check_nearby_mode!(rest, keyed?)
   end
 
   defp prepend_removed_children(old_children, used_old_ids, patches_rev, ctx) do
@@ -888,7 +857,9 @@ defmodule Emerge.Engine.Reconcile do
     end)
   end
 
-  defp maybe_set_attrs(patches, %VNode{attrs: old_attrs}, new_attrs, id) do
+  defp maybe_set_attrs(patches, _old, _new_attrs, _id, true), do: patches
+
+  defp maybe_set_attrs(patches, %VNode{attrs: old_attrs}, new_attrs, id, false) do
     if old_attrs == new_attrs do
       patches
     else
@@ -904,7 +875,17 @@ defmodule Emerge.Engine.Reconcile do
     end
   end
 
+  # One Raven patch: children and nearby mounts are usually the same nodes in
+  # the same order; check that by walking both lists before building id lists.
+  defp maybe_set_children(patches, %VNode{children: []}, []), do: patches
+
   defp maybe_set_children(patches, %VNode{id: id, children: old_children}, new_children) do
+    if same_ids?(old_children, new_children),
+      do: patches,
+      else: set_children(patches, id, old_children, new_children)
+  end
+
+  defp set_children(patches, id, old_children, new_children) do
     old_ids = Enum.map(old_children, & &1.id)
     new_ids = Enum.map(new_children, & &1.id)
 
@@ -915,11 +896,30 @@ defmodule Emerge.Engine.Reconcile do
     end
   end
 
+  defp maybe_set_nearby_mounts(patches, %VNode{nearby: []}, []), do: patches
+
   defp maybe_set_nearby_mounts(
          patches,
          %VNode{id: id, nearby: old_nearby},
          new_nearby
        ) do
+    if same_mounts?(old_nearby, new_nearby),
+      do: patches,
+      else: set_nearby_mounts(patches, id, old_nearby, new_nearby)
+  end
+
+  defp same_ids?([], []), do: true
+  defp same_ids?([%VNode{id: id} | old], [%VNode{id: id} | new]), do: same_ids?(old, new)
+  defp same_ids?(_old, _new), do: false
+
+  defp same_mounts?([], []), do: true
+
+  defp same_mounts?([{slot, %VNode{id: id}} | old], [{slot, %VNode{id: id}} | new]),
+    do: same_mounts?(old, new)
+
+  defp same_mounts?(_old, _new), do: false
+
+  defp set_nearby_mounts(patches, id, old_nearby, new_nearby) do
     old_refs = mount_refs(old_nearby)
     new_refs = mount_refs(new_nearby)
 
@@ -967,6 +967,8 @@ defmodule Emerge.Engine.Reconcile do
       old_remaining != new_remaining
     end
   end
+
+  defp prepend_many(acc, []), do: acc
 
   defp prepend_many(acc, patches) when is_list(patches) do
     Enum.reverse(patches, acc)

@@ -21,8 +21,13 @@ defmodule Emerge.UI.Internal.Builder do
     # One Raven patch: no `:__attrs_hash`. Nothing reads it (it is a runtime
     # attr, stripped before diffing and encoding; the native side hashes on
     # its own), and computing it (`Map.drop` of 18 keys and `phash2`) was a
-    # tenth of building an element.
-    {key, attrs} = Map.pop(attrs, :key)
+    # tenth of building an element. Most elements have no key: match before
+    # popping it.
+    {key, attrs} =
+      case attrs do
+        %{key: key} -> {key, Map.delete(attrs, :key)}
+        _ -> {nil, attrs}
+      end
 
     %Element{
       type: type,

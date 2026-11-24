@@ -93,25 +93,38 @@ defmodule Emerge.Engine.AttrCodec do
   @tag_type Map.new(@type_tag, fn {type, tag} -> {tag, type} end)
 
   @spec encode_attrs(map()) :: binary()
-  def encode_attrs(attrs) when is_map(attrs) do
-    attrs
-    |> TreeAttrs.strip_runtime_attrs()
-    |> Nearby.strip_nearby_attrs()
-    |> AttrValidation.validate_change_attrs!()
-    |> Map.to_list()
-    |> Enum.map(fn {key, value} ->
-      tag = Map.fetch!(@type_tag, key)
-      {tag, key, value}
-    end)
-    |> Enum.sort_by(fn {tag, _key, _value} -> tag end)
-    |> Enum.map(fn {tag, key, value} ->
-      [<<tag::unsigned-8>>, encode_value(key, value)]
-    end)
-    |> then(fn encoded ->
-      count = length(encoded)
-      [<<count::unsigned-16>> | encoded] |> IO.iodata_to_binary()
-    end)
+  def encode_attrs(attrs) when is_map(attrs), do: IO.iodata_to_binary(encode_attrs_iodata(attrs))
+
+  # One Raven patch: one pass over the attrs drops runtime and nearby keys and
+  # tags the rest, then one keysort, instead of dropping 27 keys from every
+  # element's map, three list passes, a `sort_by` with closures and a
+  # `length/1`. Change policies only name animatable attrs, never a dropped
+  # key, so they're checked on the attrs as given. The tree encoder takes the
+  # iodata (sized with `:erlang.iolist_size/1`), so attrs are copied once,
+  # into the whole payload.
+  @doc false
+  @spec encode_attrs_iodata(map()) :: iodata()
+  def encode_attrs_iodata(attrs) when is_map(attrs) do
+    attrs = AttrValidation.validate_change_attrs!(attrs)
+    {count, tagged} = tag_attrs(Map.to_list(attrs), 0, [])
+
+    encoded =
+      Enum.map(:lists.keysort(1, tagged), fn {tag, key, value} ->
+        [<<tag::unsigned-8>>, encode_value(key, value)]
+      end)
+
+    [<<count::unsigned-16>> | encoded]
   end
+
+  defp tag_attrs([], count, tagged), do: {count, tagged}
+
+  for key <- TreeAttrs.runtime_attrs() ++ Nearby.nearby_slots() do
+    defp tag_attrs([{unquote(key), _value} | rest], count, tagged),
+      do: tag_attrs(rest, count, tagged)
+  end
+
+  defp tag_attrs([{key, value} | rest], count, tagged),
+    do: tag_attrs(rest, count + 1, [{Map.fetch!(@type_tag, key), key, value} | tagged])
 
   @spec decode_attrs(binary()) :: map()
   def decode_attrs(<<count::unsigned-16, rest::binary>>) do

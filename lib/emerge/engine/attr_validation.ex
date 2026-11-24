@@ -142,6 +142,10 @@ defmodule Emerge.Engine.AttrValidation do
 
   def normalize_change_policies!(_), do: raise(ArgumentError, "change policies must be a map")
 
+  # One Raven patch: most elements have no change policy; skip building an
+  # empty policy map for them (twice per element: parse and encode).
+  def validate_change_attrs!(attrs) when not is_map_key(attrs, :animate_change), do: attrs
+
   def validate_change_attrs!(attrs) do
     policies = normalize_change_policies!(Map.get(attrs, :animate_change, %{}))
 
@@ -833,14 +837,16 @@ defmodule Emerge.Engine.AttrValidation do
           "#{attrs_owner} expects :spacing_xy to be {x, y} with numeric values, got: #{inspect(value)}"
   end
 
-  defp valid_color?({:color_rgb, {r, g, b}}),
-    do: valid_byte?(r) and valid_byte?(g) and valid_byte?(b)
+  # One Raven patch: channel checks as guards, not a call per channel.
+  defguardp is_byte(value) when is_integer(value) and value >= 0 and value <= 255
 
-  defp valid_color?({:color_rgba, {r, g, b, a}}),
-    do: valid_byte?(r) and valid_byte?(g) and valid_byte?(b) and valid_byte?(a)
+  defp valid_color?({:color_rgb, {r, g, b}}) when is_byte(r) and is_byte(g) and is_byte(b),
+    do: true
+
+  defp valid_color?({:color_rgba, {r, g, b, a}})
+       when is_byte(r) and is_byte(g) and is_byte(b) and is_byte(a),
+       do: true
 
   defp valid_color?(color) when is_atom(color), do: true
   defp valid_color?(_other), do: false
-
-  defp valid_byte?(value), do: is_integer(value) and value >= 0 and value <= 255
 end

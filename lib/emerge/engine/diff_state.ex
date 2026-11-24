@@ -26,10 +26,13 @@ defmodule Emerge.Engine.DiffState do
   def new(tree) do
     {vdom, tree, next_id} = Reconcile.assign_ids(tree, 1)
 
+    # One Raven patch: the registry is read from the vdom, whose nodes already
+    # carry their events, instead of recomputed from every element's attrs
+    # (here and in `diff_and_encode/2`, `Emerge.Engine.encode_full/2`).
     %__MODULE__{
       tree: tree,
       vdom: vdom,
-      event_registry: build_event_registry(tree),
+      event_registry: build_event_registry(vdom),
       next_id: next_id
     }
   end
@@ -48,7 +51,7 @@ defmodule Emerge.Engine.DiffState do
       %__MODULE__{
         tree: assigned,
         vdom: vdom,
-        event_registry: build_event_registry(assigned),
+        event_registry: build_event_registry(vdom),
         next_id: next_id
       },
       assigned

@@ -617,18 +617,19 @@ fn build_element_subtree<R: RegistryTraversalSink>(
     let element_cache_key = (!traversal.is_root)
         .then(|| element_render_fragment_cache_key(tree, ix, element, &traversal, inherited))
         .flatten();
+    // One Raven patch: copy the cached nodes once (they were copied out of
+    // the cache whole, then again into the subtree).
     if let Some(cache_key) = element_cache_key
         && !(element.refresh.render_dirty || element.refresh.render_descendant_dirty)
-        && let Some(cached) = element
+        && let Some(subtree) = element
             .refresh
             .render_fragment_cache
             .borrow()
             .as_ref()
             .filter(|cache| cache.key == cache_key)
-            .cloned()
+            .map(RenderSubtree::from_fragment_cache)
     {
         registry.collect_registry_for_render_skipped_subtree(tree, ix);
-        let subtree = RenderSubtree::from_fragment_cache(&cached);
         apply_subtree_outputs(outputs, &subtree);
         return subtree;
     }
@@ -1882,8 +1883,9 @@ fn build_nearby_mount_subtree<R: RegistryTraversalSink>(
             traversal.render_ctx,
         )
     });
+    // One Raven patch: copy the cached nodes once (see build_element_subtree).
     if let Some(cache_key) = cache_key
-        && let Some(cached) = tree
+        && let Some(subtree) = tree
             .get_ix(nearby_ix)
             .filter(|element| {
                 !(element.refresh.render_dirty || element.refresh.render_descendant_dirty)
@@ -1895,11 +1897,10 @@ fn build_nearby_mount_subtree<R: RegistryTraversalSink>(
                     .borrow()
                     .as_ref()
                     .filter(|cache| cache.key == cache_key)
-                    .cloned()
+                    .map(RenderSubtree::from_fragment_cache)
             })
     {
         registry.collect_registry_for_render_skipped_subtree(tree, nearby_ix);
-        let subtree = RenderSubtree::from_fragment_cache(&cached);
         apply_subtree_outputs(outputs, &subtree);
         return subtree;
     }
@@ -2749,7 +2750,7 @@ fn attach_renderer_animation(
             started_at: animation.started_at,
             revision: animation.revision,
             frame: render_frame,
-            base: attrs.clone(),
+            base: crate::render_scene::AnimatedBase::of(attrs),
             current_transform: built_transform,
             current_alpha: built_alpha,
             offset: (0.0, 0.0),

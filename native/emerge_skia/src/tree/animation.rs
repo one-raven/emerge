@@ -2,6 +2,9 @@ mod admission;
 pub mod change;
 mod content;
 mod fields;
+// One Raven patch: a structural spec fingerprint (was the `Debug` text).
+mod fingerprint;
+pub use fingerprint::spec_fingerprint;
 pub(crate) mod frame;
 use frame::{RuntimeAuthority, RuntimeIdentity};
 pub(crate) mod groups;
@@ -13,8 +16,8 @@ pub(crate) mod timing;
 use super::layout::projection::ProjectionError;
 use admission::AdmissionMap;
 use groups::RunGeneration;
-use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,7 +27,7 @@ use super::attrs::{
 use super::element::{ElementTree, NodeId};
 use super::invalidation::{TreeInvalidation, animation_attrs_affect_registry_refresh};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub enum AnimationCurve {
     Linear,
     EaseIn,
@@ -32,7 +35,7 @@ pub enum AnimationCurve {
     EaseInOut,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub enum AnimationRepeat {
     Once,
     Times(u32),
@@ -960,11 +963,6 @@ fn entry_is_active(spec: &AnimationSpec, started_at: Instant, now: Instant) -> b
     timing::position(spec, Some(&entry), Some(now)).is_some_and(|p| p.active)
 }
 
-pub fn spec_fingerprint(spec: &AnimationSpec) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    format!("{spec:?}").hash(&mut hasher);
-    hasher.finish()
-}
 
 pub fn scale_animation_spec(spec: &AnimationSpec, scale: f64) -> AnimationSpec {
     AnimationSpec {

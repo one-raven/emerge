@@ -44,7 +44,7 @@ impl Default for Padding {
 }
 
 /// Horizontal alignment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum AlignX {
     #[default]
     Left,
@@ -53,7 +53,7 @@ pub enum AlignX {
 }
 
 /// Vertical alignment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum AlignY {
     #[default]
     Top,
@@ -62,7 +62,7 @@ pub enum AlignY {
 }
 
 /// Text alignment within element bounds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum TextAlign {
     #[default]
     Left,
@@ -71,7 +71,7 @@ pub enum TextAlign {
 }
 
 /// Non-recursive gradient stop.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub enum SolidColor {
     Rgb { r: u8, g: u8, b: u8 },
     Rgba { r: u8, g: u8, b: u8, a: u8 },
@@ -135,7 +135,7 @@ pub enum ImageSource {
     RuntimePath(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum ImageFit {
     #[default]
     Contain,
@@ -165,7 +165,7 @@ pub enum BorderWidth {
 }
 
 /// Border style specification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum BorderStyle {
     #[default]
     Solid,
@@ -185,18 +185,18 @@ pub struct BoxShadow {
 }
 
 /// Font specification.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub enum Font {
     Atom(String),
     String(String),
 }
 
 /// Font weight.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FontWeight(pub String);
 
 /// Font style.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FontStyle(pub String);
 
 /// Runtime hover axis for scrollbar thumb styling.
@@ -249,13 +249,13 @@ pub struct TextFragment {
     pub ascent: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyBindingMatch {
     Exact,
     All,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KeyBindingSpec {
     pub route: String,
     pub key: CanonicalKey,
@@ -263,7 +263,7 @@ pub struct KeyBindingSpec {
     pub match_mode: KeyBindingMatch,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum VirtualKeyTapAction {
     Text(String),
     Key {
@@ -277,14 +277,14 @@ pub enum VirtualKeyTapAction {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VirtualKeyHoldMode {
     None,
     Repeat,
     Event,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct VirtualKeySpec {
     pub tap: VirtualKeyTapAction,
     pub hold: VirtualKeyHoldMode,

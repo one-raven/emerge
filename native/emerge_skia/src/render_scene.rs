@@ -390,13 +390,54 @@ pub struct LayerRendererAnimation {
     pub started_at: std::time::Instant,
     pub revision: u64,
     pub frame: crate::tree::element::Frame,
-    pub base: crate::tree::attrs::Attrs,
+    pub base: AnimatedBase,
     pub current_transform: Affine2,
     pub current_alpha: f32,
     /// Translation scroll layers prepend to the element's transform.
     pub offset: (f32, f32),
     /// The transform the layer's bounds were measured under.
     pub bounds_transform: Affine2,
+}
+
+/// One Raven patch: the element's own (non-animated) values its transform
+/// and alpha are computed from. The render thread samples every animated
+/// layer every frame; it held the element's whole `Attrs` (~2.5 KB, with its
+/// strings and lists), cloned it for each sample and again whenever the layer
+/// was copied on write.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AnimatedBase {
+    pub move_x: Option<f64>,
+    pub move_y: Option<f64>,
+    pub layout_rotate: Option<f64>,
+    pub rotate: Option<f64>,
+    pub scale: Option<f64>,
+    pub alpha: Option<f64>,
+}
+
+impl AnimatedBase {
+    pub fn of(attrs: &crate::tree::attrs::Attrs) -> Self {
+        Self {
+            move_x: attrs.move_x,
+            move_y: attrs.move_y,
+            layout_rotate: attrs.layout_rotate,
+            rotate: attrs.rotate,
+            scale: attrs.scale,
+            alpha: attrs.alpha,
+        }
+    }
+
+    /// These values with a sample laid over them, as
+    /// `tree::animation::apply_sample_attrs` lays it over the attrs.
+    fn with_sample(self, sample: &crate::tree::attrs::Attrs) -> Self {
+        Self {
+            move_x: sample.move_x.or(self.move_x),
+            move_y: sample.move_y.or(self.move_y),
+            layout_rotate: sample.layout_rotate.or(self.layout_rotate),
+            rotate: sample.rotate.or(self.rotate),
+            scale: sample.scale.or(self.scale),
+            alpha: sample.alpha.or(self.alpha),
+        }
+    }
 }
 
 /// One Raven patch: result of advancing renderer-driven animations.
@@ -466,15 +507,20 @@ impl LayerRendererAnimation {
         };
         let sample =
             crate::tree::animation::sample_animation_spec(&self.spec, Some(&entry), Some(at));
-        let mut attrs = self.base.clone();
-        crate::tree::animation::apply_sample_attrs(&mut attrs, &sample.attrs);
-        let transform = crate::tree::transform::element_transform(self.frame, &attrs);
+        let values = self.base.with_sample(&sample.attrs);
+        let transform = crate::tree::transform::element_transform_of(
+            self.frame,
+            values.move_x,
+            values.move_y,
+            values.layout_rotate.or(values.rotate),
+            values.scale,
+        );
         let transform = if self.offset == (0.0, 0.0) {
             transform
         } else {
             Affine2::translation(self.offset.0, self.offset.1).then(transform)
         };
-        (transform, attrs.alpha.unwrap_or(1.0) as f32)
+        (transform, values.alpha.unwrap_or(1.0) as f32)
     }
 }
 
@@ -644,7 +690,7 @@ struct MotionEntry {
     spec: Arc<crate::tree::animation::AnimationSpec>,
     revision: u64,
     frame: crate::tree::element::Frame,
-    base: crate::tree::attrs::Attrs,
+    base: AnimatedBase,
     bounds: Rect,
     bounds_transform: Affine2,
     motion: AnimationMotion,
@@ -693,12 +739,14 @@ impl RendererAnimationIndex {
             // The scene changed shape under the index without `invalidate`.
             self.paths = None;
         }
-        let paths = self.paths(scene).to_vec();
+        // One Raven patch: borrow the paths (they were copied every frame).
+        self.paths(scene);
+        let paths = self.paths.as_deref().unwrap_or_default();
         let mut advance = RendererAnimationAdvance {
             found: !paths.is_empty(),
             ..RendererAnimationAdvance::default()
         };
-        for path in &paths {
+        for path in paths {
             advance_at_path(&mut scene.nodes, path, at, &mut advance);
         }
         advance
@@ -707,7 +755,8 @@ impl RendererAnimationIndex {
     /// The motion of every renderer-driven layer in the scene, measured once
     /// per animation and layout.
     pub fn motions(&mut self, scene: &RenderScene) -> Vec<AnimationMotion> {
-        let paths = self.paths(scene).to_vec();
+        self.paths(scene);
+        let paths = self.paths.as_deref().unwrap_or_default();
         let mut seen = HashSet::new();
         let motions = paths
             .iter()
@@ -730,7 +779,7 @@ impl RendererAnimationIndex {
                             spec: animation.spec.clone(),
                             revision: animation.revision,
                             frame: animation.frame,
-                            base: animation.base.clone(),
+                            base: animation.base,
                             bounds: layer.bounds,
                             bounds_transform: animation.bounds_transform,
                             motion: measure_animation_motion(layer, animation),
@@ -2553,13 +2602,163 @@ mod renderer_animation_tests {
             started_at,
             revision: 0,
             frame: frame(),
-            base: Attrs::default(),
+            base: AnimatedBase::default(),
             current_transform: built,
             current_alpha: 1.0,
             offset: (0.0, 0.0),
             bounds_transform: built,
         }));
         layer
+    }
+
+    // One Raven patch: the render thread samples from the six values the
+    // element's transform and alpha read, not a clone of its whole attrs.
+    #[test]
+    fn sampling_from_the_animated_base_matches_sampling_from_the_attrs() {
+        use crate::tree::attrs::{Background, Color, Length};
+        let attrs = Attrs {
+            width: Some(Length::Px(80.0)),
+            content: Some("label".into()),
+            background: Some(Background::Color(Color::Named("red".into()))),
+            move_x: Some(5.0),
+            move_y: Some(-3.0),
+            layout_rotate: Some(10.0),
+            scale: Some(1.25),
+            alpha: Some(0.5),
+            ..Attrs::default()
+        };
+        let keyframe = |t: f64| Attrs {
+            move_y: Some(20.0 * t),
+            rotate: Some(90.0 * t),
+            alpha: Some(1.0 - t / 2.0),
+            ..Attrs::default()
+        };
+        let started_at = Instant::now();
+        let animation = LayerRendererAnimation {
+            spec: Arc::new(AnimationSpec {
+                keyframes: vec![keyframe(0.0), keyframe(1.0)],
+                duration_ms: 1000.0,
+                curve: AnimationCurve::EaseInOut,
+                repeat: AnimationRepeat::Loop,
+            }),
+            started_at,
+            revision: 0,
+            frame: frame(),
+            base: AnimatedBase::of(&attrs),
+            current_transform: Affine2::identity(),
+            current_alpha: 1.0,
+            offset: (3.0, 4.0),
+            bounds_transform: Affine2::identity(),
+        };
+        for ms in [0, 130, 500, 999, 1700] {
+            let at = started_at + std::time::Duration::from_millis(ms);
+            // What the sample did before: the whole attrs, sample laid over.
+            let entry = crate::tree::animation::AnimationRuntimeEntry {
+                spec_hash: 0,
+                started_at,
+            };
+            let sample = crate::tree::animation::sample_animation_spec(
+                &animation.spec,
+                Some(&entry),
+                Some(at),
+            );
+            let mut expected = attrs.clone();
+            crate::tree::animation::apply_sample_attrs(&mut expected, &sample.attrs);
+            let transform = Affine2::translation(3.0, 4.0).then(
+                crate::tree::transform::element_transform(frame(), &expected),
+            );
+            assert_eq!(
+                animation.sample(at),
+                (transform, expected.alpha.unwrap() as f32),
+                "{ms} ms"
+            );
+        }
+    }
+
+    /// `cargo test --release --lib renderer_animation_sample_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn renderer_animation_sample_timing() {
+        use crate::tree::attrs::{Background, BoxShadow, Color, Font, Length};
+        // A card's attrs as the tree holds them: text, font, colours, shadow.
+        let attrs = Attrs {
+            width: Some(Length::Px(320.0)),
+            height: Some(Length::Px(180.0)),
+            content: Some("Living room lamp".into()),
+            font: Some(Font::String("Inter".into())),
+            font_size: Some(18.0),
+            background: Some(Background::Color(Color::Rgba {
+                r: 30,
+                g: 30,
+                b: 40,
+                a: 255,
+            })),
+            box_shadows: Some(vec![BoxShadow {
+                offset_x: 0.0,
+                offset_y: 4.0,
+                blur: 12.0,
+                size: 0.0,
+                color: Color::Named("black".into()),
+                inset: false,
+            }]),
+            on_click: Some(true),
+            ..Attrs::default()
+        };
+        let started_at = Instant::now();
+        let animation = LayerRendererAnimation {
+            spec: spin_spec(),
+            started_at,
+            revision: 0,
+            frame: frame(),
+            base: AnimatedBase::of(&attrs),
+            current_transform: Affine2::identity(),
+            current_alpha: 1.0,
+            offset: (0.0, 0.0),
+            bounds_transform: Affine2::identity(),
+        };
+        let runs = 50_000;
+        let time = |f: &dyn Fn(Instant) -> (Affine2, f32)| {
+            let begun = Instant::now();
+            for k in 0..runs {
+                std::hint::black_box(f(started_at + std::time::Duration::from_micros(k * 16)));
+            }
+            begun.elapsed().as_nanos() as f64 / runs as f64
+        };
+        // Before: sample, then lay it over a clone of the whole attrs.
+        let cloned = time(&|at| {
+            let entry = crate::tree::animation::AnimationRuntimeEntry {
+                spec_hash: 0,
+                started_at,
+            };
+            let sample = crate::tree::animation::sample_animation_spec(
+                &animation.spec,
+                Some(&entry),
+                Some(at),
+            );
+            let mut attrs = std::hint::black_box(&attrs).clone();
+            crate::tree::animation::apply_sample_attrs(&mut attrs, &sample.attrs);
+            (
+                crate::tree::transform::element_transform(animation.frame, &attrs),
+                attrs.alpha.unwrap_or(1.0) as f32,
+            )
+        });
+        let base = time(&|at| animation.sample(at));
+        // Copy-on-write of the layer's animation (Arc::make_mut while shared).
+        let copies = 50_000;
+        let begun = Instant::now();
+        for _ in 0..copies {
+            std::hint::black_box((std::hint::black_box(&attrs).clone(), animation.clone()));
+        }
+        let copy_before = begun.elapsed().as_nanos() as f64 / copies as f64;
+        let begun = Instant::now();
+        for _ in 0..copies {
+            std::hint::black_box(std::hint::black_box(&animation).clone());
+        }
+        let copy_after = begun.elapsed().as_nanos() as f64 / copies as f64;
+        eprintln!(
+            "renderer animation sample: {cloned:.0} ns with the attrs cloned, {base:.0} ns from the base; \
+             copy of the animation: {copy_before:.0} ns with attrs, {copy_after:.0} ns with the base"
+        );
     }
 
     fn child_layer(generation: u64) -> RenderPaintLayer {

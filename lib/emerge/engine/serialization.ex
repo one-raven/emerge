@@ -61,42 +61,45 @@ defmodule Emerge.Engine.Serialization do
   """
   @spec encode_tree(Element.t()) :: binary()
   def encode_tree(%Element{} = tree) do
-    nodes = collect_nodes(tree)
-    node_count = length(nodes)
-
-    encoded_nodes =
-      Enum.map(nodes, fn %{
-                           id: id,
-                           type: type,
-                           attrs: attrs,
-                           children: children,
-                           nearby: nearby
-                         } ->
-        type_tag = Map.fetch!(@type_tag, type)
-        attr_bin = Emerge.Engine.AttrCodec.encode_attrs(attrs)
-        child_ids = Enum.map(children, & &1.id)
-        child_count = length(child_ids)
-        children_bin = encode_ids(child_ids)
-        nearby_count = length(nearby)
-        nearby_bin = encode_nearby(nearby)
-
-        <<
-          id::unsigned-big-64,
-          type_tag::unsigned-8,
-          byte_size(attr_bin)::unsigned-32,
-          attr_bin::binary,
-          child_count::unsigned-16,
-          children_bin::binary,
-          nearby_count::unsigned-16,
-          nearby_bin::binary
-        >>
-      end)
-
+    # One Raven patch: nodes are encoded straight into one iolist in the same
+    # order (pre-order, children before nearby mounts), without collecting an
+    # intermediate map per node or building a binary per node or per attrs.
+    {node_count, encoded_nodes} = encode_node(tree, {0, []})
     header = <<"EMRG", @version::unsigned-8, node_count::unsigned-32>>
 
-    [header | encoded_nodes]
-    |> IO.iodata_to_binary()
+    IO.iodata_to_binary([header | Enum.reverse(encoded_nodes)])
   end
+
+  defp encode_node(
+         %Element{id: id, type: type, attrs: attrs, children: children, nearby: nearby},
+         {count, acc}
+       ) do
+    type_tag = Map.fetch!(@type_tag, type)
+    attrs_io = Emerge.Engine.AttrCodec.encode_attrs_iodata(attrs)
+
+    node = [
+      <<id::unsigned-big-64, type_tag::unsigned-8, :erlang.iolist_size(attrs_io)::unsigned-32>>,
+      attrs_io,
+      <<length(children)::unsigned-16>>,
+      Enum.map(children, fn %Element{id: child_id} -> <<child_id::unsigned-big-64>> end),
+      <<length(nearby)::unsigned-16>>,
+      Enum.map(nearby, fn {slot, %Element{id: mount_id}} ->
+        <<Nearby.slot_tag(slot)::unsigned-8, mount_id::unsigned-big-64>>
+      end)
+    ]
+
+    {count + 1, [node | acc]}
+    |> encode_children(children)
+    |> encode_nearby_children(nearby)
+  end
+
+  defp encode_children(acc, []), do: acc
+  defp encode_children(acc, [child | rest]), do: encode_children(encode_node(child, acc), rest)
+
+  defp encode_nearby_children(acc, []), do: acc
+
+  defp encode_nearby_children(acc, [{_slot, child} | rest]),
+    do: encode_nearby_children(encode_node(child, acc), rest)
 
   defp decode_nodes(rest, 0, acc), do: {Enum.reverse(acc), rest}
 
@@ -149,46 +152,10 @@ defmodule Emerge.Engine.Serialization do
     }
   end
 
-  defp collect_nodes(%Element{} = element) do
-    do_collect_nodes([element], [])
-  end
-
-  defp do_collect_nodes([], acc), do: Enum.reverse(acc)
-
-  defp do_collect_nodes([%Element{} = element | rest], acc) do
-    nearby_children = Enum.map(element.nearby, fn {_slot, child} -> child end)
-
-    node = %{
-      id: element.id,
-      type: element.type,
-      attrs: element.attrs,
-      children: element.children,
-      nearby: element.nearby
-    }
-
-    do_collect_nodes(element.children ++ nearby_children ++ rest, [node | acc])
-  end
-
-  defp encode_ids(ids) do
-    ids
-    |> Enum.map(fn id ->
-      <<id::unsigned-big-64>>
-    end)
-    |> IO.iodata_to_binary()
-  end
-
   defp decode_ids(rest, 0, acc), do: {Enum.reverse(acc), rest}
 
   defp decode_ids(<<id::unsigned-big-64, rest::binary>>, count, acc) do
     decode_ids(rest, count - 1, [id | acc])
-  end
-
-  defp encode_nearby(nearby) do
-    nearby
-    |> Enum.map(fn {slot, %Element{id: id}} ->
-      <<Nearby.slot_tag(slot)::unsigned-8, id::unsigned-big-64>>
-    end)
-    |> IO.iodata_to_binary()
   end
 
   defp decode_nearby(rest, 0, acc), do: {Enum.reverse(acc), rest}

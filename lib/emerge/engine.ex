@@ -45,7 +45,7 @@ defmodule Emerge.Engine do
         state
         | tree: assigned,
           vdom: vdom,
-          event_registry: DiffState.build_event_registry(assigned),
+          event_registry: DiffState.build_event_registry(vdom),
           next_id: next_id
       },
       assigned

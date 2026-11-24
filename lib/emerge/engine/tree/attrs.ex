@@ -49,10 +49,23 @@ defmodule Emerge.Engine.Tree.Attrs do
   @doc false
   def runtime_attrs, do: @runtime_attrs
 
+  # One Raven patch: an element's attrs rarely hold a runtime attr, so check
+  # its few keys before dropping all 21 (per node on every encode).
   @doc false
   def strip_runtime_attrs(attrs) when is_map(attrs) do
-    Map.drop(attrs, @runtime_attrs)
+    if any_runtime_attr?(Map.keys(attrs)),
+      do: Map.drop(attrs, @runtime_attrs),
+      else: attrs
   end
+
+  defp any_runtime_attr?([]), do: false
+  defp any_runtime_attr?([key | keys]), do: runtime_attr?(key) or any_runtime_attr?(keys)
+
+  for key <- @runtime_attrs do
+    defp runtime_attr?(unquote(key)), do: true
+  end
+
+  defp runtime_attr?(_key), do: false
 
   @doc false
   def attrs_hash(attrs) when is_map(attrs) do

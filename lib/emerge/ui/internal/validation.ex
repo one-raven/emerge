@@ -101,6 +101,36 @@ defmodule Emerge.UI.Internal.Validation do
                           ]
                       )
 
+  # One Raven patch: each attr key is classified by one function-clause
+  # dispatch (`attr_class/1`) instead of a chain of `MapSet.member?/2` calls
+  # per attr. The list is in the old cond's order; a key keeps its first class.
+  @attr_classes Enum.uniq_by(
+                  [{:id, :id}] ++
+                    Enum.map(@reserved_attr_keys, &{&1, :reserved}) ++
+                    Enum.map(@state_style_key_set, &{&1, :state_style}) ++
+                    [{:animate_change, :animate_change}] ++
+                    Enum.map([:animate, :animate_enter, :animate_exit], &{&1, :animation}) ++
+                    Enum.map([:on_key_down, :on_key_up, :on_key_press], &{&1, :key_listener}) ++
+                    [{:virtual_key, :virtual_key}] ++
+                    Enum.map(@public_attr_keys, &{&1, :public}),
+                  &elem(&1, 0)
+                )
+
+  for {key, class} <- @attr_classes do
+    defp attr_class(unquote(key)), do: unquote(class)
+  end
+
+  defp attr_class(_key), do: :other
+
+  # Public attrs whose value is checked but stored as given, with no merge
+  # rule (box shadows append, spacing and spacing_xy replace each other,
+  # nearby slots go to their own list).
+  @plain_attrs for {key, :public} <- @attr_classes,
+                   key not in [:box_shadow, :spacing, :spacing_xy] and
+                     key not in [:above, :below, :on_left, :on_right, :in_front, :behind],
+                   into: %{},
+                   do: {key, true}
+
   @override_warning_store_key :emerge_ui_override_warnings
 
   @type attrs_owner :: String.t()
@@ -121,41 +151,63 @@ defmodule Emerge.UI.Internal.Validation do
           {attrs_map(), [{atom(), Element.t()}]}
   @spec parse_attrs_with_nearby(attrs_list(), attrs_owner(), attrs_options()) ::
           {attrs_map(), [{atom(), Element.t()}]}
-  def parse_attrs_with_nearby(attrs, attrs_owner, opts \\ []) do
+  def parse_attrs_with_nearby(attrs, attrs_owner, opts \\ [])
+
+  # One Raven patch: one recursive pass over the attrs, with no option
+  # lookups or `MapSet` built per element for the common call without options.
+  def parse_attrs_with_nearby(attrs, attrs_owner, []) do
+    parse_entries(attrs, attrs_owner, [], true, %{}, [])
+  end
+
+  def parse_attrs_with_nearby(attrs, attrs_owner, opts) do
     warn_overrides = Keyword.get(opts, :warn_overrides, true)
-    extra_public_attr_keys = MapSet.new(Keyword.get(opts, :extra_public_attr_keys, []))
+    extra_public_attr_keys = Enum.uniq(Keyword.get(opts, :extra_public_attr_keys, []))
+    parse_entries(attrs, attrs_owner, extra_public_attr_keys, warn_overrides, %{}, [])
+  end
 
-    {attrs, nearby} =
-      Enum.reduce(attrs, {%{}, []}, fn attr, {acc, nearby} ->
-        case validate_attr_entry!(attrs_owner, attr, extra_public_attr_keys) do
-          :skip ->
-            {acc, nearby}
+  defp parse_entries([], attrs_owner, _extras, _warn_overrides, acc, nearby) do
+    {validate_attr_conflicts!(acc, attrs_owner), nearby}
+  end
 
-          {key, value} ->
-            case key do
-              :animate_change ->
-                acc =
-                  Enum.reduce(value, acc, fn {field, target, policy}, acc ->
-                    acc = put_attr(clear_change_policy(acc, field), field, target, warn_overrides)
-                    policies = Map.put(Map.get(acc, :animate_change, %{}), field, policy)
-                    Map.put(acc, :animate_change, policies)
-                  end)
+  # One Raven patch: the common attr (a plain public one, not yet set, on an
+  # element without change policies) is checked and stored in one step.
+  defp parse_entries([{key, value} | rest], attrs_owner, [], warn_overrides, acc, nearby)
+       when is_map_key(@plain_attrs, key) and value != nil and not is_map_key(acc, key) and
+              not is_map_key(acc, :animate_change) do
+    validate_public_attr_value!(attrs_owner, key, value)
+    parse_entries(rest, attrs_owner, [], warn_overrides, Map.put(acc, key, value), nearby)
+  end
 
-                {acc, nearby}
+  defp parse_entries([attr | rest], attrs_owner, extras, warn_overrides, acc, nearby) do
+    case validate_attr_entry!(attrs_owner, attr, extras) do
+      :skip ->
+        parse_entries(rest, attrs_owner, extras, warn_overrides, acc, nearby)
 
-              :box_shadow ->
-                {put_attr(clear_change_policy(acc, key), key, value, false), nearby}
+      {:animate_change, value} ->
+        acc =
+          Enum.reduce(value, acc, fn {field, target, policy}, acc ->
+            acc = put_attr(clear_change_policy(acc, field), field, target, warn_overrides)
+            policies = Map.put(Map.get(acc, :animate_change, %{}), field, policy)
+            Map.put(acc, :animate_change, policies)
+          end)
 
-              key when key in [:above, :below, :on_left, :on_right, :in_front, :behind] ->
-                {acc, nearby ++ [{key, value}]}
+        parse_entries(rest, attrs_owner, extras, warn_overrides, acc, nearby)
 
-              _ ->
-                {put_attr(clear_change_policy(acc, key), key, value, warn_overrides), nearby}
-            end
-        end
-      end)
+      {:box_shadow = key, value} ->
+        acc = put_attr(clear_change_policy(acc, key), key, value, false)
+        parse_entries(rest, attrs_owner, extras, warn_overrides, acc, nearby)
 
-    {validate_attr_conflicts!(attrs, attrs_owner), nearby}
+      {key, value} when key in [:above, :below, :on_left, :on_right, :in_front, :behind] ->
+        parse_entries(rest, attrs_owner, extras, warn_overrides, acc, nearby ++ [{key, value}])
+
+      {key, value} when not is_map_key(acc, :animate_change) ->
+        acc = put_attr(acc, key, value, warn_overrides)
+        parse_entries(rest, attrs_owner, extras, warn_overrides, acc, nearby)
+
+      {key, value} ->
+        acc = put_attr(clear_change_policy(acc, key), key, value, warn_overrides)
+        parse_entries(rest, attrs_owner, extras, warn_overrides, acc, nearby)
+    end
   end
 
   @spec parse_state_style_attrs(attrs_list(), state_style_key()) :: attrs_map()
@@ -241,6 +293,8 @@ defmodule Emerge.UI.Internal.Validation do
           "#{attrs_owner} expects an image source to be a binary, atom, ~m reference, {:id, id}, or {:path, path}, got: #{inspect(other)}"
   end
 
+  defp clear_change_policy(acc, _key) when not is_map_key(acc, :animate_change), do: acc
+
   defp clear_change_policy(acc, key) do
     case Map.get(acc, :animate_change) do
       nil ->
@@ -275,30 +329,29 @@ defmodule Emerge.UI.Internal.Validation do
         _ -> acc
       end
 
-    if warn_overrides do
-      maybe_warn_override(acc, key, value)
+    # One Raven patch: the override check costs a match unless the key repeats.
+    case acc do
+      %{^key => prev_value} when warn_overrides and prev_value != value ->
+        warn_override(key, prev_value, value)
+
+      _ ->
+        :ok
     end
 
     Map.put(acc, key, value)
   end
 
-  defp maybe_warn_override(acc, key, value) do
-    case Map.fetch(acc, key) do
-      {:ok, prev_value} when prev_value != value ->
-        signature = {:attrs, key, prev_value, value}
-        warned = Process.get(@override_warning_store_key, MapSet.new())
+  defp warn_override(key, prev_value, value) do
+    signature = {:attrs, key, prev_value, value}
+    warned = Process.get(@override_warning_store_key, MapSet.new())
 
-        if !MapSet.member?(warned, signature) do
-          Process.put(@override_warning_store_key, MapSet.put(warned, signature))
+    if !MapSet.member?(warned, signature) do
+      Process.put(@override_warning_store_key, MapSet.put(warned, signature))
 
-          IO.warn(
-            "Emerge.UI attribute #{inspect(key)} is set multiple times with different values " <>
-              "(#{inspect(prev_value)} -> #{inspect(value)}); last value wins"
-          )
-        end
-
-      _ ->
-        :ok
+      IO.warn(
+        "Emerge.UI attribute #{inspect(key)} is set multiple times with different values " <>
+          "(#{inspect(prev_value)} -> #{inspect(value)}); last value wins"
+      )
     end
   end
 
@@ -306,18 +359,28 @@ defmodule Emerge.UI.Internal.Validation do
 
   defp validate_attr_entry!(attrs_owner, {key, value}, extra_public_attr_keys)
        when is_atom(key) do
-    cond do
-      key == :id ->
+    case attr_class(key) do
+      :public when extra_public_attr_keys == [] ->
+        if value == nil do
+          :skip
+        else
+          validate_public_attr_value!(attrs_owner, key, value)
+          {key, value}
+        end
+
+      :id ->
         raise ArgumentError, "id is not supported; use key instead"
 
-      MapSet.member?(@reserved_attr_keys, key) ->
+      :reserved ->
         raise ArgumentError,
               "#{attrs_owner} does not allow internal attribute #{inspect(key)} in public attrs"
 
-      MapSet.member?(@state_style_key_set, key) ->
-        skip_nil_or(value, fn -> {key, AttrValidation.normalize_state_style!(key, value)} end)
+      :state_style ->
+        if value == nil,
+          do: :skip,
+          else: {key, AttrValidation.normalize_state_style!(key, value)}
 
-      key == :animate_change ->
+      :animate_change ->
         case value do
           {attrs, duration, curve} ->
             {:animate_change, AttrValidation.normalize_change!(attrs, duration, curve)}
@@ -329,33 +392,21 @@ defmodule Emerge.UI.Internal.Validation do
             raise ArgumentError, "change expects an attribute list, duration and curve"
         end
 
-      key in [:animate, :animate_enter, :animate_exit] ->
-        skip_nil_or(value, fn -> {key, AttrValidation.normalize_animation!(key, value)} end)
+      :animation ->
+        if value == nil,
+          do: :skip,
+          else: {key, AttrValidation.normalize_animation!(key, value)}
 
-      key in [:on_key_down, :on_key_up, :on_key_press] ->
-        skip_nil_or(value, fn -> {key, Event.normalize_key_listener_bindings!(key, value)} end)
+      :key_listener ->
+        if value == nil,
+          do: :skip,
+          else: {key, Event.normalize_key_listener_bindings!(key, value)}
 
-      key == :virtual_key ->
-        skip_nil_or(value, fn -> {key, Event.normalize_virtual_key!(value)} end)
+      :virtual_key ->
+        if value == nil, do: :skip, else: {key, Event.normalize_virtual_key!(value)}
 
-      key == :svg_color and MapSet.member?(extra_public_attr_keys, key) ->
-        skip_nil_or(value, fn ->
-          validate_public_attr_value!(attrs_owner, key, value)
-          {key, value}
-        end)
-
-      MapSet.member?(extra_public_attr_keys, key) ->
-        skip_nil_or(value, fn -> {key, value} end)
-
-      MapSet.member?(@public_attr_keys, key) ->
-        skip_nil_or(value, fn ->
-          validate_public_attr_value!(attrs_owner, key, value)
-          {key, value}
-        end)
-
-      true ->
-        raise ArgumentError,
-              "#{attrs_owner} does not support attribute #{inspect(key)}"
+      class ->
+        validate_public_or_extra!(attrs_owner, key, value, class, extra_public_attr_keys)
     end
   end
 
@@ -364,8 +415,24 @@ defmodule Emerge.UI.Internal.Validation do
           "#{attrs_owner} expects attributes to be {key, value} tuples, got: #{inspect(other)}"
   end
 
-  defp skip_nil_or(nil, _fun), do: :skip
-  defp skip_nil_or(_value, fun), do: fun.()
+  defp validate_public_or_extra!(attrs_owner, key, value, class, extras) do
+    cond do
+      value == nil and (class == :public or (extras != [] and key in extras)) ->
+        :skip
+
+      extras != [] and key in extras ->
+        if key == :svg_color, do: validate_public_attr_value!(attrs_owner, key, value)
+        {key, value}
+
+      class == :public ->
+        validate_public_attr_value!(attrs_owner, key, value)
+        {key, value}
+
+      true ->
+        raise ArgumentError,
+              "#{attrs_owner} does not support attribute #{inspect(key)}"
+    end
+  end
 
   defp validate_public_attr_value!(_attrs_owner, :key, _value), do: :ok
 
@@ -647,6 +714,17 @@ defmodule Emerge.UI.Internal.Validation do
     raise ArgumentError,
           "#{attrs_owner} expects #{inspect(key)} to be a {pid, message} tuple, got: #{inspect(value)}"
   end
+
+  # One Raven patch: an element with none of the attrs these rules are about
+  # (animations, change policies, virtual keys, both kinds of scale or rotate)
+  # passes with one guard.
+  defp validate_attr_conflicts!(attrs, _attrs_owner)
+       when not is_map_key(attrs, :animate_change) and not is_map_key(attrs, :virtual_key) and
+              not is_map_key(attrs, :animate) and not is_map_key(attrs, :animate_enter) and
+              not is_map_key(attrs, :animate_exit) and
+              not (is_map_key(attrs, :layout_scale) and is_map_key(attrs, :scale)) and
+              not (is_map_key(attrs, :layout_rotate) and is_map_key(attrs, :rotate)),
+       do: attrs
 
   defp validate_attr_conflicts!(attrs, attrs_owner) do
     AttrValidation.validate_change_attrs!(attrs)
