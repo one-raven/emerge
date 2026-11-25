@@ -1050,11 +1050,32 @@ pub fn text_surface_props() -> SurfaceProps {
     SurfaceProps::new(SurfacePropsFlags::default(), PixelGeometry::RGBH)
 }
 
+// One Raven patch: text edging is process-wide and switchable at runtime
+// (`EmergeSkia.set_text_antialias/1`). Subpixel (LCD) stays the default. Skia
+// only applies it where the destination surface declares a pixel geometry,
+// which the presenter's surface does and cached layers do not, so one screen
+// can mix LCD and grayscale text; grayscale draws every text the same way.
+static TEXT_GRAYSCALE: AtomicBool = AtomicBool::new(false);
+
+/// Draw text with grayscale antialiasing (`true`) or subpixel (`false`, the default)
+/// from the next font built; cached layers keep their pixels until redrawn.
+pub fn set_text_grayscale(grayscale: bool) {
+    TEXT_GRAYSCALE.store(grayscale, Ordering::Relaxed);
+}
+
 fn configure_text_font(font: &mut Font) {
+    configure_text_font_with(font, TEXT_GRAYSCALE.load(Ordering::Relaxed));
+}
+
+fn configure_text_font_with(font: &mut Font, grayscale: bool) {
     font.set_subpixel(true);
     font.set_linear_metrics(true);
     font.set_baseline_snap(true);
-    font.set_edging(FontEdging::SubpixelAntiAlias);
+    font.set_edging(if grayscale {
+        FontEdging::AntiAlias
+    } else {
+        FontEdging::SubpixelAntiAlias
+    });
     font.set_hinting(FontHinting::Normal);
 }
 
@@ -14185,6 +14206,22 @@ mod tests {
         assert!(font.is_baseline_snap());
         assert_eq!(font.edging(), FontEdging::SubpixelAntiAlias);
         assert_eq!(font.hinting(), FontHinting::Normal);
+    }
+
+    #[test]
+    fn grayscale_text_keeps_every_setting_but_the_edging() {
+        let (typeface, _) = resolve_typeface_with_fallback("default", 400, false);
+        let mut subpixel = Font::new(&*typeface, 16.0);
+        let mut grayscale = Font::new(&*typeface, 16.0);
+        configure_text_font_with(&mut subpixel, false);
+        configure_text_font_with(&mut grayscale, true);
+
+        assert_eq!(subpixel.edging(), FontEdging::SubpixelAntiAlias);
+        assert_eq!(grayscale.edging(), FontEdging::AntiAlias);
+        assert!(grayscale.is_subpixel());
+        assert!(grayscale.is_linear_metrics());
+        assert!(grayscale.is_baseline_snap());
+        assert_eq!(grayscale.hinting(), FontHinting::Normal);
     }
 
     #[test]

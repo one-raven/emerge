@@ -3864,6 +3864,14 @@ fn set_scroll_config(
 /// `phase` 0 down, 1 move, 2 up, 3 cancel, coordinates in logical pixels. A
 /// native thread paces the samples, so a measured gesture isn't perturbed by
 /// BEAM scheduling. For automation and benchmarks; ordinary input never uses it.
+/// One Raven patch: process-wide text edging, grayscale or subpixel (see
+/// `renderer::set_text_grayscale`). Text drawn after the call uses it.
+#[rustler::nif]
+fn set_text_grayscale(grayscale: bool) -> Atom {
+    renderer::set_text_grayscale(grayscale);
+    atoms::ok()
+}
+
 #[rustler::nif]
 fn inject_touch(
     renderer: ResourceArc<RendererResource>,

@@ -684,6 +684,27 @@ defmodule EmergeSkia do
   end
 
   # ===========================================================================
+  # Text
+  # ===========================================================================
+
+  @doc """
+  Set how text is antialiased in every renderer of this VM: `:subpixel` (LCD,
+  RGB horizontal; the default) or `:grayscale`.
+
+  Text drawn after the call uses the new mode; cached layers keep their pixels
+  until they are redrawn. Skia applies subpixel antialiasing only where the
+  surface declares a pixel geometry (the presenter's surface does, cached
+  layers don't), so `:subpixel` can mix both on one screen. Needs the native
+  library: on the macOS window backend, which renders in a separate process,
+  it raises.
+  """
+  # One Raven patch.
+  @spec set_text_antialias(:subpixel | :grayscale) :: :ok
+  def set_text_antialias(mode) when mode in [:subpixel, :grayscale] do
+    Native.set_text_grayscale(mode == :grayscale)
+  end
+
+  # ===========================================================================
   # Input Handling
   # ===========================================================================
 

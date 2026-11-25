@@ -401,6 +401,10 @@ defmodule EmergeSkia.Native do
   @doc false
   def set_scroll_config(_renderer, _config), do: :erlang.nif_error(:nif_not_loaded)
 
+  # One Raven patch: process-wide text edging (see `EmergeSkia.set_text_antialias/1`).
+  @doc false
+  def set_text_grayscale(_grayscale), do: :erlang.nif_error(:nif_not_loaded)
+
   # One Raven patch: replay a touch gesture natively (see `EmergeSkia.inject_touch/2`).
   @doc false
   def inject_touch(_renderer, _samples), do: :erlang.nif_error(:nif_not_loaded)
